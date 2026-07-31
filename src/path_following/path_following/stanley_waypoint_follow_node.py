@@ -698,6 +698,13 @@ class StanleyWaypointFollowNode(Node):
         closest_path_index: int,
         kappa_used: float,
         ff_term: float,
+        lat_m: float,
+        path_x: float,
+        path_y: float,
+        csv_lat_m: float,
+        veh_x: float,
+        veh_y: float,
+        veh_yaw: float,
     ) -> None:
         """Publish one coherent control-cycle snapshot.
 
@@ -707,7 +714,10 @@ class StanleyWaypointFollowNode(Node):
           5 raw command after saturation (FF+FB) [rad],
           6 command after smoothing/rate limiting [rad], 7 speed [m/s],
           8 closest path segment index [-],
-          9 kappa_used [1/m], 10 delta_ff [rad], 11 total_before_sat [rad].
+          9 kappa_used [1/m], 10 delta_ff [rad], 11 total_before_sat [rad],
+          12 lat to active path point [m], 13 path_x [m], 14 path_y [m],
+          15 lat to CSV raceline point [m],
+          16 veh_x [m], 17 veh_y [m], 18 veh_yaw [rad].
         """
         total_before_sat = ff_term + stanley_fb_sum
         msg = Float64MultiArray()
@@ -724,6 +734,13 @@ class StanleyWaypointFollowNode(Node):
             float(kappa_used),
             float(ff_term),
             float(total_before_sat),
+            float(lat_m),
+            float(path_x),
+            float(path_y),
+            float(csv_lat_m),
+            float(veh_x),
+            float(veh_y),
+            float(veh_yaw),
         ]
         self.stanley_debug_pub.publish(msg)
 
@@ -838,6 +855,8 @@ class StanleyWaypointFollowNode(Node):
         steering_cmd = self._rate_limit_steering(steering_smoothed)
 
         stanley_fb_sum = heading_term + cte_term
+        lat_m = math.hypot(x - path_x, y - path_y)
+        csv_lat_m = math.hypot(x - csv_x, y - csv_y)
         try:
             self._publish_stanley_debug(
                 cte,
@@ -851,6 +870,13 @@ class StanleyWaypointFollowNode(Node):
                 closest_path_index,
                 kappa_used,
                 ff_term,
+                lat_m,
+                path_x,
+                path_y,
+                csv_lat_m,
+                x,
+                y,
+                yaw,
             )
         except Exception as exc:
             # Telemetry is observational and must never interrupt /drive.

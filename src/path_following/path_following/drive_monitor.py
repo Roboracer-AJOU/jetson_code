@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-실차 주행 디버그 모니터 — 별도 터미널에서 2Hz 갱신.
+실차 회피/속도 디버그 모니터 — 별도 터미널에서 고정 레이아웃 + 숫자만 갱신.
 
-실행:
+실행 (런치와 다른 터미널):
   source install/setup.bash && ros2 run path_following drive_monitor
-  python3 src/path_following/scripts/drive_monitor.py
 """
 from __future__ import annotations
 
@@ -100,6 +99,31 @@ class DriveMonitor(Node):
         self._obs_nearest_xy = (0.0, 0.0)
         self.create_subscription(
             Float32MultiArray, "/static_obstacles", self._cb_obs, 10
+        )
+
+        self._st_dyn = TopicStamp()
+        self._dyn_count = 0
+        self._dyn_nearest_m = float("inf")
+        self._dyn_nearest_xy = (0.0, 0.0)
+        self._dyn_nearest_v = 0.0
+        self._dyn_nearest_vx = 0.0
+        self._dyn_nearest_vy = 0.0
+        self._dyn_nearest_closing = 0.0
+        self._dyn_tracks: list[tuple[int, float, float, float, float, float, float]] = []
+        self.create_subscription(
+            Float32MultiArray, "/dynamic_obstacles", self._cb_dyn, 10
+        )
+
+        self._st_v_act = TopicStamp()
+        self._v_act = 0.0
+        self.create_subscription(
+            Float64, "/vehicle/speed_mps", self._cb_v_act, 10
+        )
+
+        self._st_stanley = TopicStamp()
+        self._stanley: list[float] = []
+        self.create_subscription(
+            Float64MultiArray, "/stanley/debug", self._cb_stanley, 10
         )
 
         self._st_fgm = TopicStamp()
@@ -204,6 +228,51 @@ class DriveMonitor(Node):
         self._obs_nearest_m = nearest
         self._obs_nearest_xy = nxy
 
+    def _cb_dyn(self, msg: Float32MultiArray) -> None:
+        self._st_dyn.mark()
+        data = msg.data
+        n = len(data) // 6
+        self._dyn_count = n
+        nearest = float("inf")
+        nxy = (0.0, 0.0)
+        nv = nvx = nvy = nclose = 0.0
+        tracks: list[tuple[int, float, float, float, float, float, float]] = []
+        for i in range(n):
+            base = i * 6
+            oid = int(data[base])
+            x = float(data[base + 1])
+            y = float(data[base + 2])
+            vx = float(data[base + 3])
+            vy = float(data[base + 4])
+            r = float(data[base + 5])
+            speed = math.hypot(vx, vy)
+            rng = math.hypot(x, y)
+            closing = -(x * vx + y * vy) / rng if rng > 1e-3 else 0.0
+            tracks.append((oid, x, y, speed, vx, vy, closing))
+            d = math.hypot(x, y) - r
+            if d < nearest:
+                nearest = max(0.0, d)
+                nxy = (x, y)
+                nv, nvx, nvy, nclose = speed, vx, vy, closing
+        tracks.sort(key=lambda t: math.hypot(t[1], t[2]))
+        self._dyn_tracks = tracks[:4]
+        self._dyn_nearest_m = nearest
+        self._dyn_nearest_xy = nxy
+        self._dyn_nearest_v = nv
+        self._dyn_nearest_vx = nvx
+        self._dyn_nearest_vy = nvy
+        self._dyn_nearest_closing = nclose
+
+    def _cb_v_act(self, msg: Float64) -> None:
+        self._st_v_act.mark()
+        v = float(msg.data)
+        if math.isfinite(v):
+            self._v_act = abs(v)
+
+    def _cb_stanley(self, msg: Float64MultiArray) -> None:
+        self._st_stanley.mark()
+        self._stanley = list(msg.data)
+
     def _cb_fgm(self, msg: PointStamped) -> None:
         self._st_fgm.mark()
         self._fgm_x = float(msg.point.x)
@@ -298,128 +367,239 @@ class DriveMonitor(Node):
     def _refresh(self) -> None:
         self._update_tf()
         lines: list[str] = []
-        w = 72
+        w = 78
         lines.append("=" * w)
-        lines.append(" F1TENTH 실차 주행 모니터  (Ctrl+C 종료)")
+        lines.append(" F1TENTH 회피/속도 모니터  (Ctrl+C 종료)  — 숫자만 실시간 갱신")
         lines.append("=" * w)
 
         lines.append("[ 모드 ]")
-        lines.append(f"  차량 제어     : {self._control_mode_ko()}")
+        lines.append(f"  차량 제어(AUTO/MANUAL) : {self._control_mode_ko()}")
         if len(self._tel) >= 10:
             lines.append(
-                f"  RC CH5        : {self._tel[5]:.0f} us  "
-                f"(CH1={self._tel[8]:.0f} CH2={self._tel[9]:.0f})"
+                f"  RC CH5(모드 스위치)   : {self._tel[5]:.0f} us  "
+                f"(CH1조향={self._tel[8]:.0f} CH2쓰로틀={self._tel[9]:.0f})"
             )
         elif len(self._tel) >= 6:
-            lines.append(f"  RC CH5        : {self._tel[5]:.0f} us")
+            lines.append(f"  RC CH5(모드 스위치)   : {self._tel[5]:.0f} us")
         lines.append(
-            f"  Planner       : {self._planner_mode_ko()}  (override={self._override})"
+            f"  Planner(회피상태)     : {self._planner_mode_ko()}  "
+            f"(override={self._override})"
         )
-        lines.append(f"  Stanley 추종  : {self._stanley_follow_label()}")
         lines.append(
-            f"  local_path    : {self._local_path_n} pts  "
+            f"  Stanley 추종(경로선택): {self._stanley_follow_label()}"
+        )
+        lines.append(
+            f"  local_path(회피경로)  : {self._local_path_n} pts  "
             f"(age {_age_str(self._st_local_path.last_mono)})"
         )
 
         lines.append("")
-        lines.append("[ 속도 ]")
-        lines.append(
-            f"  /drive 명령   : {self._drive_speed:+.2f} m/s  "
-            f"(age {_age_str(self._st_drive.last_mono, stale=0.3)})"
+        lines.append("[ 속도 · 상대속도 ]")
+        v_ego = self._v_act
+        if self._st_v_act.last_mono is None and len(self._tel) >= 11:
+            v_ego = abs(float(self._tel[10]))
+        v_obs = self._dyn_nearest_v if self._dyn_count > 0 else 0.0
+        v_rel = self._dyn_nearest_closing if self._dyn_count > 0 else 0.0
+        threat = (
+            "APPROACH(가까워짐)"
+            if self._dyn_count > 0 and v_rel > 0.0
+            else ("RECEDE(멀어짐)" if self._dyn_count > 0 and v_rel < 0.0 else "—")
         )
-        if self._st_odom.last_mono is not None:
+        lines.append(
+            f"  v_ego(내차속도)       : {v_ego:6.2f} m/s  "
+            f"(age {_age_str(self._st_v_act.last_mono, stale=0.5)})"
+        )
+        if self._dyn_count > 0:
             lines.append(
-                f"  /odom 실측    : {self._odom_v:+.2f} m/s  "
-                f"(age {_age_str(self._st_odom.last_mono, stale=0.5)})"
+                f"  v_obs(장애물속력)     : {v_obs:6.2f} m/s  "
+                f"vx={self._dyn_nearest_vx:+.2f} vy={self._dyn_nearest_vy:+.2f}"
+            )
+            lines.append(
+                f"  v_rel(상대·가까워짐+) : {v_rel:+6.2f} m/s  "
+                f"(+가까움/-멀어짐)  threat={threat}"
             )
         else:
+            lines.append("  v_obs(장애물속력)     : — (동적 장애 없음)")
+            lines.append("  v_rel(접근속도)       : —")
+        if len(self._tel) >= 12:
             lines.append(
-                f"  TF 추정속도   : {self._tf_speed:.2f} m/s  "
-                f"({'TF OK' if self._tf_ok else 'TF 없음'})"
-            )
-        if len(self._tel) >= 4:
-            lines.append(
-                f"  VESC duty     : {self._tel[2]:+.3f}  (목표 {self._tel[3]:+.3f})  "
-                f"[telemetry age {_age_str(self._st_tel.last_mono)}]"
-            )
-        else:
-            lines.append("  VESC duty     : — (control_node /vehicle/telemetry 없음)")
-        if len(self._tel) >= 19:
-            lines.append(
-                f"  VESC 속도     : {self._tel[10]:+.2f} m/s  "
-                f"(target {self._tel[11]:.2f}, err {self._tel[12]:+.2f})"
-            )
-            lines.append(
-                f"  Speed PI      : ff {self._tel[13]:+.3f}, cmd {self._tel[14]:+.3f}, "
-                f"erpm {self._tel[15]:+.0f}"
-            )
-            lines.append(
-                f"  VESC 전원     : motor {self._tel[17]:+.2f} A, "
-                f"in {self._tel[16]:+.2f} A, {self._tel[18]:.1f} V"
+                f"  v_tgt(목표속도)/duty  : {self._tel[11]:.2f} m/s  "
+                f"duty={self._tel[2]:+.3f}"
             )
         lines.append(
-            f"  속도 배율     : strategy×{self._strategy_mul:.2f}  "
-            f"planner×{self._planner_speed_scale:.2f}  cond={self._speed_cond}"
+            f"  속도배율(감속배수)    : strategy×{self._strategy_mul:.2f}  "
+            f"planner×{self._planner_speed_scale:.2f}  "
+            f"cond(조건코드)={self._speed_cond}"
         )
 
         lines.append("")
-        lines.append("[ 조향 ]")
+        lines.append("[ Stanley ]")
+        s = self._stanley
+        if len(s) >= 11:
+            cte = s[0]
+            hdg_err = s[1]
+            hdg_term = s[2]
+            cte_term = s[3]
+            fb_sum = s[4]
+            steer_raw = s[5]
+            steer_filt = s[6]
+            v_ctrl = s[7]
+            closest_idx = int(s[8])
+            kappa = s[9]
+            ff = s[10]
+            total_pre = s[11] if len(s) >= 12 else (ff + fb_sum)
+            lat = s[12] if len(s) >= 13 else float("nan")
+            path_x = s[13] if len(s) >= 14 else float("nan")
+            path_y = s[14] if len(s) >= 15 else float("nan")
+            csv_lat = s[15] if len(s) >= 16 else float("nan")
+            lines.append(
+                f"  cte(횡방향오차·부호)  : {cte:+.3f} m  "
+                f"(age {_age_str(self._st_stanley.last_mono, stale=0.5)})"
+            )
+            if math.isfinite(lat):
+                lines.append(
+                    f"  lat(경로점까지거리)   : {lat:.3f} m  "
+                    f"← 현재 추종 경로점과의 거리"
+                )
+            if math.isfinite(csv_lat):
+                lines.append(
+                    f"  csv_lat(레이스라인거리): {csv_lat:.3f} m  "
+                    f"← CSV 레이스라인 최근접점"
+                )
+            if math.isfinite(path_x) and math.isfinite(path_y):
+                lines.append(
+                    f"  path(추종목표점)      : ({path_x:.2f}, {path_y:.2f}) m"
+                )
+            lines.append(
+                f"  hdg_err(헤딩오차)     : {_rad2deg(hdg_err):+.1f}°  "
+                f"({hdg_err:+.3f} rad)"
+            )
+            lines.append(
+                f"  cte_term(횡오차조향)  : {_rad2deg(cte_term):+.1f}°   "
+                f"hdg_term(헤딩조향) {_rad2deg(hdg_term):+.1f}°   "
+                f"ff(곡률피드포워드) {_rad2deg(ff):+.1f}°"
+            )
+            lines.append(
+                f"  fb_sum(피드백합)      : {_rad2deg(fb_sum):+.1f}°   "
+                f"total_pre_sat(포화전합) {_rad2deg(total_pre):+.1f}°"
+            )
+            lines.append(
+                f"  kappa(경로곡률)       : {kappa:+.3f} 1/m   "
+                f"closest_idx(최근접인덱스)={closest_idx}   "
+                f"v_ctrl(스탠리속도)={v_ctrl:.2f} m/s"
+            )
+            lines.append(
+                f"  steer_raw(조향원시)   : {_rad2deg(steer_raw):+.1f}°  "
+                f"→ filtered(필터후) {_rad2deg(steer_filt):+.1f}°  "
+                f"→ /drive {_rad2deg(self._drive_steer):+.1f}°"
+            )
+            lines.append(
+                f"  추종모드(경로소스)    : {self._stanley_follow_label()}"
+            )
+        else:
+            lines.append(
+                f"  /stanley/debug(없음)  : —  "
+                f"(age {_age_str(self._st_stanley.last_mono)})"
+            )
+
+        lines.append("")
+        lines.append("[ 조향 · VESC ]")
         lines.append(
-            f"  /drive 명령   : {_rad2deg(self._drive_steer):+.1f}°  "
+            f"  /drive(조향명령)      : {_rad2deg(self._drive_steer):+.1f}°  "
             f"({self._drive_steer:+.3f} rad)"
         )
         if len(self._tel) >= 5:
             esp = self._tel[4]
             lines.append(
-                f"  ESP S: 전송    : {esp:+.3f}  "
+                f"  ESP S(서보정규화)     : {esp:+.3f}  "
                 f"(서보 약 {_esp_steer_to_servo_deg(esp):.0f}°)"
             )
         else:
-            lines.append("  ESP S: 전송    : — (control_node 필요)")
+            lines.append("  ESP S(서보정규화)     : — (control_node 필요)")
+        if len(self._tel) >= 19:
+            lines.append(
+                f"  VESC PI(속도제어)     : "
+                f"v_act(실측)={self._tel[10]:+.2f}  "
+                f"v_tgt(목표)={self._tel[11]:.2f}  "
+                f"err(오차)={self._tel[12]:+.2f}  "
+                f"duty={self._tel[2]:+.3f}"
+            )
+            lines.append(
+                f"  VESC 전원             : "
+                f"motor {self._tel[17]:+.2f} A, "
+                f"in {self._tel[16]:+.2f} A, {self._tel[18]:.1f} V"
+            )
 
         lines.append("")
         lines.append("[ 위치 (map) ]")
         if self._tf_ok:
             lines.append(
-                f"  pose          : x={self._pose_x:.2f} y={self._pose_y:.2f}  "
+                f"  pose(차량위치·자세)   : "
+                f"x={self._pose_x:.2f} y={self._pose_y:.2f}  "
                 f"yaw={self._pose_yaw_deg:+.1f}°"
             )
         else:
-            lines.append("  pose          : TF map→base_link 없음")
+            lines.append("  pose(차량위치·자세)   : TF map→base_link 없음")
 
         lines.append("")
         lines.append("[ LiDAR / 장애물 ]")
         scan_hz = f"{self._st_scan.hz:.1f} Hz" if self._st_scan.hz > 0 else "—"
         lines.append(
-            f"  /scan         : {scan_hz}  n={self._scan_n}  "
+            f"  /scan(라이다)         : {scan_hz}  n={self._scan_n}  "
             f"age {_age_str(self._st_scan.last_mono, stale=0.3)}"
         )
         if math.isfinite(self._scan_min_m):
             lines.append(
-                f"  전방 최소거리 : {self._scan_min_m:.2f} m @ {self._scan_min_deg:+.0f}°"
+                f"  전방최소거리(±60°)    : "
+                f"{self._scan_min_m:.2f} m @ {self._scan_min_deg:+.0f}°"
             )
         else:
-            lines.append("  전방 최소거리 : —")
+            lines.append("  전방최소거리(±60°)    : —")
         if self._obs_count > 0:
             ox, oy = self._obs_nearest_xy
             lines.append(
-                f"  /static_obs   : {self._obs_count}개  "
-                f"최근접 {self._obs_nearest_m:.2f} m  laser({ox:+.2f},{oy:+.2f})  "
+                f"  static(정적장애)      : {self._obs_count}개  "
+                f"최근접 {self._obs_nearest_m:.2f} m  "
+                f"laser({ox:+.2f},{oy:+.2f})  "
                 f"age {_age_str(self._st_obs.last_mono)}"
             )
         else:
             lines.append(
-                f"  /static_obs   : 0 (인식 없음)  age {_age_str(self._st_obs.last_mono)}"
+                f"  static(정적장애)      : 0  "
+                f"age {_age_str(self._st_obs.last_mono)}"
+            )
+        if self._dyn_count > 0:
+            dx, dy = self._dyn_nearest_xy
+            lines.append(
+                f"  dynamic(동적장애)     : {self._dyn_count}개  "
+                f"최근접 {self._dyn_nearest_m:.2f} m  "
+                f"v={self._dyn_nearest_v:.2f}m/s  "
+                f"laser({dx:+.2f},{dy:+.2f})  "
+                f"age {_age_str(self._st_dyn.last_mono)}"
+            )
+            for oid, x, y, sp, vx, vy, closing in self._dyn_tracks:
+                lines.append(
+                    f"    · id={oid:<3d}  laser({x:+.2f},{y:+.2f})  "
+                    f"v={sp:.2f}  close={closing:+.2f}  "
+                    f"vx={vx:+.2f} vy={vy:+.2f}"
+                )
+        else:
+            lines.append(
+                f"  dynamic(동적장애)     : 0  "
+                f"age {_age_str(self._st_dyn.last_mono)}"
             )
         if math.isfinite(self._fgm_dist):
             lines.append(
-                f"  /fgm_target   : {self._fgm_dist:.2f} m  "
+                f"  /fgm_target(회피목표) : {self._fgm_dist:.2f} m  "
                 f"heading {self._fgm_heading_deg:+.0f}°  "
                 f"laser({self._fgm_x:.2f},{self._fgm_y:.2f})  "
                 f"age {_age_str(self._st_fgm.last_mono)}"
             )
         else:
-            lines.append(f"  /fgm_target   : —  age {_age_str(self._st_fgm.last_mono)}")
+            lines.append(
+                f"  /fgm_target(회피목표) : —  "
+                f"age {_age_str(self._st_fgm.last_mono)}"
+            )
 
         lines.append("")
         lines.append("=" * w)

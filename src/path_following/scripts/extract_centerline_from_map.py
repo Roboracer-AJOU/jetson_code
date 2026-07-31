@@ -12,6 +12,9 @@
 출력 좌표: map 프레임 x=origin_x+col*res, y=origin_y+(H-1-row)*res
 
 예:
+  # CFG map_name 만 고치고 실행
+  python3 extract_centerline_from_map.py
+  # 또는 CLI로 덮어쓰기
   python3 extract_centerline_from_map.py --map /path/to/map.yaml --out ../config/out.csv
 """
 from __future__ import annotations
@@ -42,6 +45,40 @@ try:
 except ImportError as e:
     print("Install scikit-image: pip install scikit-image", e, file=sys.stderr)
     sys.exit(1)
+
+
+# ============================================================
+# USER TUNING — 맵 바꿀 때 여기만 수정
+# ============================================================
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_WS_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
+_DEFAULT_MAP_DIR = os.path.join(_WS_ROOT, "maps")
+
+CFG = {
+    # maps/ 아래 yaml 파일명만 (절대경로 넣어도 됨)
+    "map_name": "cartographer_map_20260730_220058_rosmap.yaml",
+    "map_dir": _DEFAULT_MAP_DIR,
+    "out_csv": os.path.join(_SCRIPT_DIR, "..", "config", "centerline.csv"),
+}
+
+
+def resolve_map_yaml(map_name: str, map_dir: str = "") -> str:
+    """CFG map_name → 절대경로. 절대경로면 그대로."""
+    name = str(map_name).strip()
+    if not name:
+        raise ValueError("map_name is empty — CFG['map_name'] 에 yaml 파일명을 넣으세요.")
+    if os.path.isabs(name):
+        if not os.path.isfile(name):
+            raise FileNotFoundError(f"map yaml not found: {name}")
+        return os.path.abspath(name)
+    base = str(map_dir).strip() or _DEFAULT_MAP_DIR
+    cand = os.path.abspath(os.path.join(base, name))
+    if not os.path.isfile(cand):
+        raise FileNotFoundError(
+            f"map yaml not found: {cand}\n"
+            f"  CFG map_name={name!r}, map_dir={base}"
+        )
+    return cand
 
 
 def _resolve_map_image_path(yaml_path: str, image_field: str) -> str:
@@ -1103,19 +1140,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Robust centerline CSV from ROS map (any brightness / trinary)."
     )
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    ws_root = os.path.abspath(os.path.join(script_dir, "..", "..", ".."))
-    default_map = os.path.join(
-        ws_root, "maps", "cartographer_map_20260719_001538_rosmap.yaml"
-    )
+    default_map = resolve_map_yaml(CFG["map_name"], CFG["map_dir"])
     parser.add_argument(
         "--map",
         default=default_map,
-        help="Path to map.yaml (default: f1tenth_ajou/maps/200005)",
+        help=f"Path to map.yaml (default from CFG map_name={CFG['map_name']!r})",
     )
     parser.add_argument(
         "--out",
-        default=os.path.join(script_dir, "..", "config", "centerline.csv"),
+        default=os.path.abspath(CFG["out_csv"]),
     )
     parser.add_argument(
         "--invert-free",

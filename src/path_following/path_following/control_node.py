@@ -3,8 +3,8 @@
 실차 하드웨어 제어: /drive (AckermannDriveStamped) → ESP32 조향 + VESC duty.
 
 CH5 (PPM index [4] ONLY) 로 수동/자율:
-  - CH5 >= 1700 (2000, 자율): /drive.steering → ESP, 속도는 max_target_speed_mps PI→VESC
   - CH5 <= 1300 (1000, 수동): CH1→ESP, CH2→VESC
+  - CH5 >= 1700 (2000, 자율): /drive.speed 목표속도 PI→VESC + S:→ESP
 
 ESP → Jetson: RC,ch1_us,ch2_us,ch5_us,0  (raw PWM us, 1000~2000)
 
@@ -25,7 +25,7 @@ import rclpy
 import serial
 from ackermann_msgs.msg import AckermannDriveStamped
 from rclpy.node import Node
-from std_msgs.msg import Float64, Float64MultiArray
+from std_msgs.msg import Float32, Float64, Float64MultiArray
 
 
 # ============================================================
@@ -40,13 +40,15 @@ CFG = {
     # Stanley max_drive_speed / max_steering_angle 과 맞추면 1:1 스케일
     "max_speed_mps": 5.0,
     "max_steering_angle_rad": 0.6981,  # ±40° — ESP normToAngle: S±1 → 50°/130°
-    "max_duty": 0.5,           # MANUAL VESC duty 상한 50% (송신기 풀스틱)
+    "max_duty": 0.15,           # MANUAL mode CH2 duty limit
     "speed_scale": 1.0,         # 추가 감쇠 (1.0=끔)
-    "min_move_duty": 0.08,      # 정지마찰 극복용 최소 duty (speed>threshold 일 때)
-    "min_move_speed_mps": 0.10,
-    "debug_log_hz": 1.0,
-    "max_steer": 1.0,           # ESP 조향 명령 범위. 1.0 = 서보 ±40° 풀사용
-    "steer_rate_limit_per_sec": 4.0,
+    "min_move_duty": 0.06,      # 정지마찰 극복용 최소 duty (speed>threshold 일 때)
+    "manual_duty_rise_rate_per_sec": 0.25,
+    "manual_duty_fall_rate_per_sec": 0.10,
+    "min_move_speed_mps": 0.08,
+    "status_log_hz": 2.0,         # 터미널 속도/제어 STATUS (0=끔)
+    "max_steer": 0.55,          # ESP 조향 명령 범위. 1.0이면 서보 ±40°까지 사용
+    "steer_rate_limit_per_sec": 1.5,
     "steer_cmd_format": "prefixed",  # plain: "0.500\n" | prefixed: "S:0.500\n"
     "invert_speed": False,      # legacy AUTO sign flag; prefer auto_duty_output_sign
     # 원본 ESP normToAngle: S:-1→좌(50°), S:+1→우(130°) — INVERT_RC_STEER 미적용
@@ -58,32 +60,33 @@ CFG = {
     "enable_keyboard_estop": True,
     "estop_reset_key": "r",
     # RC (ESP -> RC,ch1_us,ch2_us,mode_us,0)  raw PWM us
-    "ch5_auto_us": 1700,          # CH5 >= 1700 자율(2000)
     "ch5_manual_us": 1300,        # CH5 <= 1300 수동(1000)
+    "ch5_auto_us": 1700,          # CH5 >= 1700 자율(2000)
     "rc_center_ch2": 1500,
     "rc_min_val": 0,
     "rc_max_val": 3000,
     "rc_deadzone": 30,
     "rc_timeout_sec": 0.30,
     "ch6_estop_us": 1700,         # ESP 다섯 번째 값이 CH6이면 >=1700 ESTOP latch
-    "invert_rc_throttle": True,   # 송신기 CH2: 앞=높은 us → 전진
+    "invert_rc_throttle": False,  # 송신기 CH2 전후진 duty 부호 (True면 반전)
     "auto_duty_ramp_sec": 1.0,    # AUTO: /drive duty → VESC (1초에 목표까지)
     "telemetry_topic": "/vehicle/telemetry",  # drive_monitor.py 구독
     "speed_topic": "/vehicle/speed_mps",
-    # AUTO closed-loop speed control (/drive.speed is target speed [m/s])
-    "max_auto_duty": 0.5, # 0.2 최대 5당 0.1
-    "max_target_speed_mps": 6.0, # m/s 속도 
-    "speed_ff_duty_per_mps": 1.0 / 14.2,  #듀티가 0.05늘때마다 1늘리기
-    "auto_duty_output_sign": -1.0,  # 이 차량은 전진 목표속도 -> 음수 VESC raw duty
-    "speed_kp": 0.04,
-    "speed_ki": 0.015,
-    "integral_limit": 0.5,
-    "duty_rate_limit_per_sec": 0.15,       # AUTO 가속 duty 변화율
-    "duty_decel_rate_limit_per_sec": 0.20, # AUTO 감속: 최대 duty→0 약 0.6초
-    "max_auto_brake_duty": 0.03,           # 속도 오버슈트 시 역방향 제동 duty 제한
+    # AUTO closed-loop speed control (max_target_speed_mps is target speed [m/s])
+    "max_auto_duty": 0.70,        # AUTO final safety duty limit
+    "max_target_speed_mps": 10.0,  # AUTO target speed
+    "target_speed_mps": 3.0,       # AUTO configured target speed
+    "auto_duty_output_sign": 1.0,
+    "speed_ff_duty_per_mps": 0.076,
+    "speed_kp": 0.15,
+    "speed_ki": 0.03,
+    "i_enable_error_mps": 0.5,
+    "target_decrease_i_scale": 0.5,
+    "target_change_threshold_mps": 0.1,
+    "duty_rate_limit_per_sec": 0.60,
     "vesc_telemetry_timeout_sec": 0.3,
     "vesc_poll_period_sec": 0.05,
-    "invert_speed_sign": True,
+    "invert_speed_sign": False,
     "pole_pairs": 2,
     "gear_ratio": 12.0,
     "wheel_diameter": 0.10,
@@ -102,8 +105,18 @@ class VehicleControlNode(Node):
         self._max_duty = float(CFG["max_duty"])
         self._speed_scale = self.clamp(float(CFG["speed_scale"]), 0.0, 1.0)
         self._min_move_duty = max(0.0, float(CFG["min_move_duty"]))
+        self._manual_duty_rise_rate = max(
+            0.0, float(CFG.get("manual_duty_rise_rate_per_sec", 0.25))
+        )
+        self._manual_duty_fall_rate = max(
+            0.0, float(CFG.get("manual_duty_fall_rate_per_sec", 0.10))
+        )
         self._min_move_speed_mps = max(0.0, float(CFG["min_move_speed_mps"]))
-        self._debug_log_hz = max(0.0, float(CFG["debug_log_hz"]))
+        self._status_log_hz = max(0.0, float(CFG.get("status_log_hz", 2.0)))
+        self._status_log_period = (
+            1.0 / self._status_log_hz if self._status_log_hz > 0.0 else 0.0
+        )
+        self._status_log_accum = 0.0
         self._max_steer = float(CFG["max_steer"])
         self._steer_rate_limit_per_sec = max(
             0.0, float(CFG.get("steer_rate_limit_per_sec", 1.5))
@@ -125,22 +138,32 @@ class VehicleControlNode(Node):
         self._invert_rc_throttle = bool(CFG.get("invert_rc_throttle", False))
         self._auto_duty_ramp_sec = max(0.0, float(CFG.get("auto_duty_ramp_sec", 1.0)))
         self._max_auto_duty = max(0.0, float(CFG.get("max_auto_duty", 0.30)))
+        self._max_auto_brake_duty = self.clamp(
+            max(0.0, float(CFG.get("max_auto_brake_duty", self._max_auto_duty))),
+            0.0,
+            self._max_auto_duty,
+        )
         self._max_target_speed_mps = max(0.0, float(CFG.get("max_target_speed_mps", 3.0)))
-        self._speed_ff_duty_per_mps = float(CFG.get("speed_ff_duty_per_mps", 1.0 / 14.2))
+        self._configured_target_speed_mps = self.clamp(
+            float(CFG["target_speed_mps"]),
+            0.0,
+            self._max_target_speed_mps,
+        )
         self._auto_duty_output_sign = -1.0 if float(
             CFG.get("auto_duty_output_sign", -1.0)
         ) < 0.0 else 1.0
+        self._speed_ff_duty_per_mps = float(CFG["speed_ff_duty_per_mps"])
         self._speed_kp = float(CFG.get("speed_kp", 0.04))
         self._speed_ki = float(CFG.get("speed_ki", 0.015))
-        self._integral_limit = max(0.0, float(CFG.get("integral_limit", 0.5)))
+        self._i_enable_error_mps = max(0.0, float(CFG["i_enable_error_mps"]))
+        self._target_decrease_i_scale = self.clamp(
+            float(CFG["target_decrease_i_scale"]), 0.0, 1.0
+        )
+        self._target_change_threshold_mps = max(
+            0.0, float(CFG["target_change_threshold_mps"])
+        )
         self._duty_rate_limit_per_sec = max(
             0.0, float(CFG.get("duty_rate_limit_per_sec", 0.15))
-        )
-        self._duty_decel_rate_limit_per_sec = max(
-            0.0, float(CFG.get("duty_decel_rate_limit_per_sec", 0.20))
-        )
-        self._max_auto_brake_duty = max(
-            0.0, float(CFG.get("max_auto_brake_duty", 0.03))
         )
         self._vesc_telemetry_timeout = max(
             0.0, float(CFG.get("vesc_telemetry_timeout_sec", 0.3))
@@ -164,18 +187,33 @@ class VehicleControlNode(Node):
         self._auto_steer = 0.0
         self._auto_steer_applied = 0.0
         self._target_speed_mps = 0.0
+        # [TEMP] straight_drive_publisher — MANUAL 전용 /drive.speed 목표
+        self._manual_drive_target_mps = 0.0
+        self._manual_drive_speed_active = False
+        self._manual_drive_invert_duty = False
+        self._last_manual_drive_cmd_time = 0.0
+        self._previous_auto_target_speed_mps = 0.0
         self._speed_error = 0.0
-        self._speed_integral = 0.0
-        self._duty_ff = 0.0
+        self._speed_ff_term = 0.0
+        self._speed_integral_duty = 0.0
+        self._speed_p_term = 0.0
+        self._speed_i_term = 0.0
+        self._raw_speed_duty_cmd = 0.0
+        self._limited_speed_duty_cmd = 0.0
         self._speed_duty_cmd = 0.0
+        self._auto_duty_limiter_active = False
+        self._i_integration_active = False
+        self._target_decrease_detected = False
         self._last_auto_duty_cmd = 0.0
         self.current_duty = 0.0
+        self._vesc_duty_now = 0.0
+        self._vesc_duty_feedback = 0.0
         self.current_steer = 0.0
         self._last_duty_int = None
         self._last_duty_packet = None
+        self._manual_duty_applied = 0.0
         self._last_speed_mps = 0.0
         self._last_steering_rad = 0.0
-        self._last_debug_log_time = 0.0
         self._last_vesc_poll_time = 0.0
         self._last_vesc_telemetry_time = 0.0
         self._vesc_rx_buffer = bytearray()
@@ -184,16 +222,16 @@ class VehicleControlNode(Node):
         self._current_motor = 0.0
         self._current_in = 0.0
         self._input_voltage = 0.0
-        self._vesc_duty_now = 0.0
-        self._vesc_temp = math.nan
-        self._motor_temp = math.nan
-        self._fault_code = 0
 
         self._rc_ch1 = 1497
         self._rc_ch2 = 1497
         self._rc_ch5 = 1000
         self._rc_ch6 = 0
         self._last_rc_time = 0.0
+        self.esp32_target_angle_deg = None
+        self.esp32_servo_command_deg = None
+        self.last_esp32_packet_time = None
+        self.last_esp32_steering_time = None
         self._esp_rx_buffer = bytearray()
         self._control_mode = "INIT"
 
@@ -220,17 +258,11 @@ class VehicleControlNode(Node):
         self._telemetry_pub = self.create_publisher(Float64MultiArray, tel_topic, 10)
         speed_topic = str(CFG.get("speed_topic", "/vehicle/speed_mps"))
         self._speed_pub = self.create_publisher(Float64, speed_topic, 10)
-        self._vesc_status_pub = self.create_publisher(
-            Float64MultiArray, "/vesc/status", 10
+        self.esp32_target_angle_pub = self.create_publisher(
+            Float32, "/esp32/target_angle_deg", 10
         )
-        self._rc_state_pub = self.create_publisher(
-            Float64MultiArray, "/rc/state", 10
-        )
-        self._control_state_pub = self.create_publisher(
-            Float64MultiArray, "/control/state", 10
-        )
-        self._safety_state_pub = self.create_publisher(
-            Float64MultiArray, "/safety/state", 10
+        self.esp32_servo_command_pub = self.create_publisher(
+            Float32, "/esp32/servo_command_deg", 10
         )
 
         if bool(CFG["enable_keyboard_estop"]):
@@ -245,17 +277,28 @@ class VehicleControlNode(Node):
         )
         self.get_logger().info("Output: ESP32 steering + VESC duty (CH5 mode switch)")
         self.get_logger().info(
-            f"RC auto: CH5>={self._ch5_auto_us} -> /drive->VESC + S:->ESP (auto), "
-            f"CH5<={self._ch5_manual_us} -> CH2->VESC (manual)"
+            f"RC manual: CH5<={self._ch5_manual_us} -> CH2->VESC, "
+            f"CH5>={self._ch5_auto_us} -> /drive->VESC + S:->ESP"
         )
         self.get_logger().info(
-            f"AUTO speed PI: target={self._max_target_speed_mps:.2f} m/s "
-            f"(/drive.speed ignore, steer-only), "
-            f"duty≤{self._max_auto_duty:.2f}, kp={self._speed_kp:.3f}, "
-            f"ki={self._speed_ki:.3f}, ff={self._speed_ff_duty_per_mps:.4f}, "
-            f"accel≤{self._duty_rate_limit_per_sec:.2f}/s, "
-            f"decel≤{self._duty_decel_rate_limit_per_sec:.2f}/s, "
-            f"brake duty≤{self._max_auto_brake_duty:.2f}"
+            f"max_duty = MANUAL CH2 duty limit: {self._max_duty:.2f}"
+        )
+        self.get_logger().info(
+            f"max_auto_duty = AUTO final safety limit: {self._max_auto_duty:.2f}"
+        )
+        self.get_logger().info(
+            f"max_target_speed_mps = AUTO target speed: "
+            f"{self._max_target_speed_mps:.2f}"
+        )
+        self.get_logger().info(
+            f"target_speed_mps = AUTO configured target: "
+            f"{self._configured_target_speed_mps:.2f}"
+        )
+        self.get_logger().info(
+            f"AUTO speed FF+PI: target≤{self._max_target_speed_mps:.2f} m/s, "
+            f"duty≤{self._max_auto_duty:.2f}, ff={self._speed_ff_duty_per_mps:.3f}, "
+            f"kp={self._speed_kp:.3f}, ki={self._speed_ki:.3f}, "
+            f"rate≤{self._duty_rate_limit_per_sec:.2f}/s"
         )
         if bool(CFG["enable_keyboard_estop"]) and sys.stdin.isatty():
             self.get_logger().info(
@@ -329,37 +372,78 @@ class VehicleControlNode(Node):
         if self._is_estop_latched():
             return
 
-        self.last_cmd_time = time.time()
-
-        # /drive 는 조향만. AUTO 목표속도 = max_target_speed_mps
-        target_speed_mps = self._max_target_speed_mps
+        cmd_speed = float(msg.drive.speed)
         steering_rad = float(msg.drive.steering_angle)
 
-        if self._invert_steer:
-            steering_rad = -steering_rad
+        if self._is_autonomous_mode():
+            self._manual_drive_speed_active = False
+            if not math.isfinite(cmd_speed):
+                return
 
-        steer_norm = self.clamp(
-            steering_rad / self._max_steering_angle_rad, -1.0, 1.0
-        )
+            self.last_cmd_time = time.time()
+            target_speed_mps = self._configured_target_speed_mps
 
-        self._target_speed_mps = target_speed_mps
-        self._last_speed_mps = target_speed_mps
-        self._last_steering_rad = steering_rad
-        self._auto_steer = steer_norm * self._max_steer
+            if self._invert_steer:
+                steering_rad = -steering_rad
+
+            steer_norm = self.clamp(
+                steering_rad / self._max_steering_angle_rad, -1.0, 1.0
+            )
+
+            self._target_speed_mps = target_speed_mps
+            self._last_speed_mps = target_speed_mps
+            self._last_steering_rad = steering_rad
+            self._auto_steer = steer_norm * self._max_steer
+            return
+
+        # MANUAL: [TEMP] straight_drive — AUTO용 last_cmd_time / _auto_steer 건드리지 않음
+        if math.isfinite(cmd_speed) and abs(cmd_speed) > 1e-6:
+            self._manual_drive_target_mps = self.clamp(
+                abs(cmd_speed), 0.0, self._max_target_speed_mps
+            )
+            self._manual_drive_invert_duty = cmd_speed < 0.0
+            self._manual_drive_speed_active = True
+            self._last_manual_drive_cmd_time = time.time()
+        else:
+            self._manual_drive_speed_active = False
+            self._manual_drive_invert_duty = False
 
     @staticmethod
     def _parse_rc_line(line: str):
-        parts = line.strip().split(",")
-        if len(parts) != 5 or parts[0] != "RC":
+        parts = [item.strip() for item in line.strip().split(",")]
+        if len(parts) < 5 or parts[0] != "RC":
             return None
         try:
             ch1 = int(parts[1])
             ch2 = int(parts[2])
             ch5 = int(parts[3])
             ch6 = int(parts[4])
-            return ch1, ch2, ch5, ch6
-        except ValueError:
+        except (ValueError, IndexError):
             return None
+
+        target_angle_deg = None
+        servo_command_deg = None
+        if len(parts) >= 7:
+            try:
+                parsed_target_angle_deg = float(parts[5])
+                parsed_servo_command_deg = float(parts[6])
+                if (
+                    math.isfinite(parsed_target_angle_deg)
+                    and math.isfinite(parsed_servo_command_deg)
+                ):
+                    target_angle_deg = parsed_target_angle_deg
+                    servo_command_deg = parsed_servo_command_deg
+            except (ValueError, IndexError):
+                pass
+
+        return (
+            ch1,
+            ch2,
+            ch5,
+            ch6,
+            target_angle_deg,
+            servo_command_deg,
+        )
 
     def _read_esp_rc(self) -> None:
         waiting = self.esp.in_waiting
@@ -379,12 +463,35 @@ class VehicleControlNode(Node):
             parsed = self._parse_rc_line(line)
             if parsed is None:
                 continue
-            ch1, ch2, ch5, ch6 = parsed
+            (
+                ch1,
+                ch2,
+                ch5,
+                ch6,
+                target_angle_deg,
+                servo_command_deg,
+            ) = parsed
+            packet_time = time.time()
             self._rc_ch1 = ch1
             self._rc_ch2 = ch2
             self._rc_ch5 = ch5
             self._rc_ch6 = ch6
-            self._last_rc_time = time.time()
+            self._last_rc_time = packet_time
+            self.last_esp32_packet_time = packet_time
+
+            if target_angle_deg is not None and servo_command_deg is not None:
+                self.esp32_target_angle_deg = target_angle_deg
+                self.esp32_servo_command_deg = servo_command_deg
+                self.last_esp32_steering_time = packet_time
+
+                target_msg = Float32()
+                target_msg.data = float(target_angle_deg)
+                self.esp32_target_angle_pub.publish(target_msg)
+
+                servo_msg = Float32()
+                servo_msg.data = float(servo_command_deg)
+                self.esp32_servo_command_pub.publish(servo_msg)
+
             if ch6 >= self._ch6_estop_us:
                 self._set_estop_latched(True)
 
@@ -394,12 +501,12 @@ class VehicleControlNode(Node):
         ch5 = self._rc_ch5
         if ch5 <= 0:
             return self._mode_auto_latched
-        if ch5 >= self._ch5_auto_us:
-            self._mode_auto_latched = True
-            return True
         if ch5 <= self._ch5_manual_us:
             self._mode_auto_latched = False
             return False
+        if ch5 >= self._ch5_auto_us:
+            self._mode_auto_latched = True
+            return True
         return self._mode_auto_latched
 
     def _rc_ch2_to_duty(self, ch2: int) -> float:
@@ -453,10 +560,18 @@ class VehicleControlNode(Node):
         return raw_speed_mps
 
     def _reset_speed_controller(self) -> None:
-        self._speed_integral = 0.0
+        self._previous_auto_target_speed_mps = 0.0
         self._speed_error = 0.0
-        self._duty_ff = 0.0
+        self._speed_ff_term = 0.0
+        self._speed_integral_duty = 0.0
+        self._speed_p_term = 0.0
+        self._speed_i_term = 0.0
+        self._raw_speed_duty_cmd = 0.0
+        self._limited_speed_duty_cmd = 0.0
         self._speed_duty_cmd = 0.0
+        self._auto_duty_limiter_active = False
+        self._i_integration_active = False
+        self._target_decrease_detected = False
         self._auto_duty = 0.0
         self._auto_duty_applied = 0.0
         self._last_auto_duty_cmd = 0.0
@@ -466,62 +581,37 @@ class VehicleControlNode(Node):
         self._auto_steer_applied = 0.0
 
     def _apply_duty_rate_limit(self, target_duty: float, dt: float) -> float:
-        decelerating = (
-            target_duty == 0.0
-            or target_duty * self._last_auto_duty_cmd < 0.0
-            or (
-                target_duty * self._last_auto_duty_cmd > 0.0
-                and abs(target_duty) < abs(self._last_auto_duty_cmd)
-            )
-        )
-        rate_limit = (
-            self._duty_decel_rate_limit_per_sec
-            if decelerating
-            else self._duty_rate_limit_per_sec
-        )
-        if rate_limit <= 0.0:
+        if self._duty_rate_limit_per_sec <= 0.0:
             return target_duty
         dt = self.clamp(dt, 1e-4, 0.1)
-        max_step = rate_limit * dt
+        max_step = self._duty_rate_limit_per_sec * dt
         diff = target_duty - self._last_auto_duty_cmd
         if abs(diff) <= max_step:
             return target_duty
         return self._last_auto_duty_cmd + math.copysign(max_step, diff)
 
-    def _coast_auto_duty_to_zero(self, dt: float) -> float:
-        """일반 정지 명령은 duty를 즉시 끊지 않고 감속 제한을 적용한다."""
-        duty_cmd = self._apply_duty_rate_limit(0.0, dt)
-        self._speed_integral = 0.0
-        self._speed_error = 0.0
-        self._duty_ff = 0.0
-        self._speed_duty_cmd = duty_cmd
-        self._last_auto_duty_cmd = duty_cmd
-        self._auto_duty = duty_cmd
-        self._auto_duty_applied = duty_cmd
-        return duty_cmd
-
     def _apply_manual_duty_rate_limit(self, target_duty: float, dt: float) -> float:
-        """수동 가속은 즉시 반영하고 중립/역방향 감속만 완만하게 제한한다."""
-        decelerating = (
-            target_duty == 0.0
-            or target_duty * self.current_duty < 0.0
-            or (
-                target_duty * self.current_duty > 0.0
-                and abs(target_duty) < abs(self.current_duty)
-            )
-        )
-        if not decelerating:
+        dt = self.clamp(dt, 1e-4, 0.1)
+        target_duty = self.clamp(target_duty, -self._max_duty, self._max_duty)
+
+        if self._manual_duty_rise_rate <= 0.0 and self._manual_duty_fall_rate <= 0.0:
+            self._manual_duty_applied = target_duty
             return target_duty
 
-        rate_limit = self._duty_decel_rate_limit_per_sec
-        if rate_limit <= 0.0:
-            return target_duty
-        dt = self.clamp(dt, 1e-4, 0.1)
-        max_step = rate_limit * dt
-        diff = target_duty - self.current_duty
+        diff = target_duty - self._manual_duty_applied
+        if diff > 0.0:
+            max_step = self._manual_duty_rise_rate * dt
+        elif diff < 0.0:
+            max_step = self._manual_duty_fall_rate * dt
+        else:
+            return self._manual_duty_applied
+
         if abs(diff) <= max_step:
-            return target_duty
-        return self.current_duty + math.copysign(max_step, diff)
+            self._manual_duty_applied = target_duty
+        else:
+            self._manual_duty_applied += math.copysign(max_step, diff)
+
+        return self._manual_duty_applied
 
     def _apply_steer_rate_limit(self, target_steer: float, dt: float) -> float:
         target_steer = self.clamp(target_steer, -self._max_steer, self._max_steer)
@@ -538,7 +628,7 @@ class VehicleControlNode(Node):
             self._auto_steer_applied += math.copysign(max_step, diff)
         return self._auto_steer_applied
 
-    def _update_speed_controller(
+    def _update_auto_speed_controller(
         self, target_speed: float, measured_speed: float, dt: float
     ) -> float:
         target_speed = self.clamp(target_speed, 0.0, self._max_target_speed_mps)
@@ -548,29 +638,77 @@ class VehicleControlNode(Node):
             self._reset_speed_controller()
             return 0.0
 
+        self._target_decrease_detected = (
+            self._previous_auto_target_speed_mps - target_speed
+            > self._target_change_threshold_mps
+        )
+        if self._target_decrease_detected:
+            self._speed_integral_duty *= self._target_decrease_i_scale
+        self._previous_auto_target_speed_mps = target_speed
+
         self._speed_error = target_speed - measured_speed
-        self._duty_ff = target_speed * self._speed_ff_duty_per_mps
-        self._speed_integral += self._speed_error * dt
-        self._speed_integral = self.clamp(
-            self._speed_integral, -self._integral_limit, self._integral_limit
+        if target_speed <= self._min_move_speed_mps:
+            self._speed_ff_term = 0.0
+        else:
+            self._speed_ff_term = self._speed_ff_duty_per_mps * target_speed
+
+        self._speed_p_term = self._speed_kp * self._speed_error
+
+        self._i_integration_active = (
+            abs(self._speed_error) <= self._i_enable_error_mps
+        )
+        if self._i_integration_active:
+            candidate_i_term = self._speed_integral_duty + (
+                self._speed_ki * self._speed_error * dt
+            )
+        else:
+            candidate_i_term = self._speed_integral_duty
+
+        raw_candidate_effort = (
+            self._speed_ff_term + self._speed_p_term + candidate_i_term
+        )
+        lower_limit = 0.0
+        upper_limit = self._max_auto_duty
+
+        accept_integral = (
+            lower_limit <= raw_candidate_effort <= upper_limit
+            or (raw_candidate_effort > upper_limit and self._speed_error < 0.0)
+            or (raw_candidate_effort < lower_limit and self._speed_error > 0.0)
+        )
+        if self._i_integration_active and accept_integral:
+            self._speed_integral_duty = self.clamp(
+                candidate_i_term,
+                -self._max_auto_duty,
+                upper_limit,
+            )
+
+        self._speed_i_term = self._speed_integral_duty
+        raw_control_effort = (
+            self._speed_ff_term + self._speed_p_term + self._speed_i_term
+        )
+        limited_control_effort = self.clamp(
+            raw_control_effort,
+            lower_limit,
+            upper_limit,
+        )
+        self._auto_duty_limiter_active = (
+            abs(raw_control_effort - limited_control_effort) > 1e-6
         )
 
-        duty_cmd = (
-            self._duty_ff
-            + self._speed_kp * self._speed_error
-            + self._speed_ki * self._speed_integral
-        )
-        duty_cmd *= self._auto_duty_output_sign
-        # 진행 duty와 반대 부호는 회생/제동 토크이므로 별도 상한을 적용한다.
-        if duty_cmd * self._auto_duty_output_sign < 0.0:
-            duty_cmd = self.clamp(
-                duty_cmd, -self._max_auto_brake_duty, self._max_auto_brake_duty
-            )
-        duty_cmd = self.clamp(duty_cmd, -self._max_auto_duty, self._max_auto_duty)
+        if (
+            target_speed > self._min_move_speed_mps
+            and measured_speed < self._min_move_speed_mps
+            and 0.0 < limited_control_effort < self._min_move_duty
+        ):
+            limited_control_effort = min(self._min_move_duty, self._max_auto_duty)
+
+        duty_cmd = limited_control_effort * self._auto_duty_output_sign
         duty_cmd = self._apply_duty_rate_limit(duty_cmd, dt)
         duty_cmd = self.clamp(duty_cmd, -self._max_auto_duty, self._max_auto_duty)
 
         self._last_auto_duty_cmd = duty_cmd
+        self._raw_speed_duty_cmd = raw_control_effort
+        self._limited_speed_duty_cmd = limited_control_effort
         self._speed_duty_cmd = duty_cmd
         self._auto_duty = duty_cmd
         self._auto_duty_applied = duty_cmd
@@ -629,11 +767,9 @@ class VehicleControlNode(Node):
             return
 
         try:
-            vesc_temp = struct.unpack(">h", payload[1:3])[0] / 10.0
-            motor_temp = struct.unpack(">h", payload[3:5])[0] / 10.0
             current_motor = struct.unpack(">i", payload[5:9])[0] / 100.0
             current_in = struct.unpack(">i", payload[9:13])[0] / 100.0
-            duty_now = struct.unpack(">h", payload[21:23])[0] / 1000.0
+            duty_feedback = struct.unpack(">h", payload[21:23])[0] / 1000.0
             erpm = float(struct.unpack(">i", payload[23:27])[0])
             input_voltage = struct.unpack(">h", payload[27:29])[0] / 10.0
         except struct.error:
@@ -643,10 +779,7 @@ class VehicleControlNode(Node):
         self._current_motor = current_motor
         self._current_in = current_in
         self._input_voltage = input_voltage
-        self._vesc_duty_now = duty_now
-        self._vesc_temp = vesc_temp
-        self._motor_temp = motor_temp if motor_temp > -200.0 else math.nan
-        self._fault_code = int(payload[53]) if len(payload) > 53 else 0
+        self._vesc_duty_feedback = duty_feedback
         self._measured_speed_mps = self._compute_speed_from_erpm(erpm)
         self._last_vesc_telemetry_time = now
 
@@ -665,14 +798,6 @@ class VehicleControlNode(Node):
         self._poll_vesc_telemetry(now)
         autonomous = self._is_autonomous_mode()
         self._control_mode = "AUTO" if autonomous else "MANUAL"
-        rc_fresh = (
-            self._last_rc_time > 0.0
-            and (now - self._last_rc_time) <= self._rc_timeout
-        )
-        timeout_active = (
-            (autonomous and now - self.last_cmd_time > self._cmd_timeout)
-            or (not autonomous and not rc_fresh)
-        )
 
         if self._is_estop_latched():
             self.current_duty = 0.0
@@ -680,6 +805,7 @@ class VehicleControlNode(Node):
             self._reset_speed_controller()
             self._reset_auto_steer()
         elif autonomous:
+            self._manual_drive_speed_active = False
             if now - self.last_cmd_time > self._cmd_timeout:
                 self._reset_speed_controller()
                 self._reset_auto_steer()
@@ -691,34 +817,93 @@ class VehicleControlNode(Node):
                 )
                 self.current_steer = self._apply_steer_rate_limit(self._auto_steer, dt)
                 if target_speed <= 1e-6:
-                    self.current_duty = self._coast_auto_duty_to_zero(dt)
+                    self.current_duty = 0.0
+                    self._reset_speed_controller()
                 elif not self._vesc_telemetry_fresh(now):
                     self.current_duty = 0.0
                     self._reset_speed_controller()
                 else:
-                    self.current_duty = self._update_speed_controller(
+                    self.current_duty = self._update_auto_speed_controller(
                         target_speed, self._measured_speed_mps, dt
                     )
             self.send_steering(self.current_steer)
         else:
-            self._reset_speed_controller()
             self._reset_auto_steer()
-            if rc_fresh:
-                manual_target_duty = self._rc_ch2_to_duty(self._rc_ch2)
-                self.current_duty = self._apply_manual_duty_rate_limit(
-                    manual_target_duty, dt
-                )
-            else:
-                # RC 통신이 끊긴 경우에는 감속감보다 안전 정지를 우선한다.
-                self.current_duty = 0.0
+            self._reset_speed_controller()
+            rc_fresh = (
+                self._last_rc_time > 0.0
+                and (time.time() - self._last_rc_time) <= self._rc_timeout
+            )
+            target_duty = (
+                self._rc_ch2_to_duty(self._rc_ch2) if rc_fresh else 0.0
+            )
+            self.current_duty = self._apply_manual_duty_rate_limit(target_duty, dt)
             self.current_steer = 0.0
-            # 수동: 조향은 ESP/RC CH1, Jetson은 UART 조향 안 보냄
 
         self.set_vesc_duty(self.current_duty)
         self._publish_telemetry(autonomous)
-        self._publish_state_topics(autonomous, timeout_active)
         self._publish_speed()
-        self._maybe_log_debug()
+        self._maybe_log_status(dt)
+
+    def _maybe_log_status(self, dt: float) -> None:
+        if self._status_log_period <= 0.0:
+            return
+        self._status_log_accum += max(0.0, dt)
+        if self._status_log_accum < self._status_log_period:
+            return
+        self._status_log_accum = 0.0
+
+        v_act = self._measured_speed_mps
+        vesc_fresh = self._vesc_telemetry_fresh(time.time())
+
+        if self._control_mode == "AUTO":
+            v_tgt = self.clamp(
+                self._target_speed_mps, 0.0, self._max_target_speed_mps
+            )
+            speed_part = (
+                f"v_tgt={v_tgt:.2f} v_act={v_act:.2f} "
+                f"err={self._speed_error:+.2f} "
+                f"ff={self._speed_ff_term:+.3f} "
+                f"p={self._speed_p_term:+.3f} i={self._speed_i_term:+.3f} "
+                f"raw={self._raw_speed_duty_cmd:+.3f} lim={self._limited_speed_duty_cmd:+.3f}"
+            )
+        else:
+            speed_part = f"v_act={v_act:.2f} | RC CH2"
+
+        duty_vesc = (
+            f" duty_vesc={self._vesc_duty_feedback:+.3f}"
+            if vesc_fresh
+            else " duty_vesc=—"
+        )
+        if (
+            self.esp32_target_angle_deg is not None
+            and self.esp32_servo_command_deg is not None
+            and self.last_esp32_steering_time is not None
+        ):
+            esp32_steering_age_ms = max(
+                0.0, (time.time() - self.last_esp32_steering_time) * 1000.0
+            )
+            esp32_steering = (
+                f"ESP32 RC: ch1={self._rc_ch1} ch2={self._rc_ch2} "
+                f"ch5={self._rc_ch5} ch6={self._rc_ch6} "
+                f"target_angle_deg={self.esp32_target_angle_deg:.2f} "
+                f"servo_command_deg={self.esp32_servo_command_deg:.2f} "
+                f"steering_age_ms={esp32_steering_age_ms:.0f}"
+            )
+        else:
+            esp32_steering = (
+                f"ESP32 RC: ch1={self._rc_ch1} ch2={self._rc_ch2} "
+                f"ch5={self._rc_ch5} ch6={self._rc_ch6} "
+                "target_angle_deg=— servo_command_deg=— steering_age_ms=—"
+            )
+
+        self.get_logger().info(
+            f"STATUS | {self._control_mode} | "
+            f"duty={self.current_duty:+.3f}{duty_vesc} | "
+            f"{speed_part} m/s | "
+            f"erpm={self._erpm:.0f} CH5={self._rc_ch5} | "
+            f"{esp32_steering}"
+        )
 
     def _publish_telemetry(self, autonomous: bool) -> None:
         msg = Float64MultiArray()
@@ -736,108 +921,38 @@ class VehicleControlNode(Node):
             float(self._measured_speed_mps),
             float(self._target_speed_mps),
             float(self._speed_error),
-            float(self._duty_ff),
+            0.0,
             float(self._speed_duty_cmd),
             float(self._erpm),
             float(self._current_in),
             float(self._current_motor),
             float(self._input_voltage),
+            float(self._speed_p_term),
+            float(self._speed_i_term),
+            float(self._raw_speed_duty_cmd),
+            float(self._limited_speed_duty_cmd),
+            1.0 if self._auto_duty_limiter_active else 0.0,
+            float(self._max_auto_duty),
+            float(self._vesc_duty_now),
+            float(self._target_speed_mps),
+            float(self._measured_speed_mps),
+            float(self._speed_error),
+            float(self._speed_ff_term),
+            float(self._speed_p_term),
+            float(self._speed_i_term),
+            float(self._raw_speed_duty_cmd),
+            float(self._limited_speed_duty_cmd),
+            float(self._speed_duty_cmd),
+            1.0 if self._auto_duty_limiter_active else 0.0,
+            1.0 if self._i_integration_active else 0.0,
+            1.0 if self._target_decrease_detected else 0.0,
         ]
         self._telemetry_pub.publish(msg)
-
-    def _publish_state_topics(
-        self, autonomous: bool, timeout_active: bool
-    ) -> None:
-        stamp = self.get_clock().now().nanoseconds * 1e-9
-
-        if self._last_vesc_telemetry_time > 0.0:
-            vesc_msg = Float64MultiArray()
-            vesc_msg.data = [
-                stamp,
-                float(self._input_voltage),
-                float(self._current_in),
-                float(self._current_motor),
-                float(self._vesc_duty_now),
-                float(self._erpm),
-                float(self._vesc_temp),
-                float(self._motor_temp),
-                float(self._fault_code),
-            ]
-            self._vesc_status_pub.publish(vesc_msg)
-
-        if self._last_rc_time > 0.0:
-            ch6 = self._rc_ch6 if self._rc_ch6 > 0 else -1
-            rc_estop = ch6 >= self._ch6_estop_us
-            rc_msg = Float64MultiArray()
-            rc_msg.data = [
-                stamp,
-                float(self._rc_ch1),
-                float(self._rc_ch2),
-                float(self._rc_ch5),
-                float(ch6),
-                0.0 if autonomous else 1.0,
-                1.0 if autonomous else 0.0,
-                1.0 if rc_estop else 0.0,
-            ]
-            self._rc_state_pub.publish(rc_msg)
-
-        control_msg = Float64MultiArray()
-        control_msg.data = [
-            stamp,
-            float(self._speed_duty_cmd),
-            float(self._last_steering_rad),
-        ]
-        self._control_state_pub.publish(control_msg)
-
-        estop_active = self._is_estop_latched()
-        manual_override = not autonomous
-        if estop_active:
-            reason_code = 1.0
-        elif timeout_active:
-            reason_code = 2.0
-        elif manual_override:
-            reason_code = 3.0
-        else:
-            reason_code = 0.0
-        safety_msg = Float64MultiArray()
-        safety_msg.data = [
-            stamp,
-            1.0 if estop_active else 0.0,
-            1.0 if manual_override else 0.0,
-            1.0 if timeout_active else 0.0,
-            0.0,  # TODO: duty limiter activation state
-            float(self._speed_duty_cmd),
-            float(self.current_duty),
-            float(self.current_duty),
-            float(self.current_steer),
-            reason_code,
-        ]
-        self._safety_state_pub.publish(safety_msg)
 
     def _publish_speed(self) -> None:
         msg = Float64()
         msg.data = float(self._measured_speed_mps)
         self._speed_pub.publish(msg)
-
-    def _maybe_log_debug(self) -> None:
-        if self._debug_log_hz <= 0.0:
-            return
-        now = time.time()
-        if now - self._last_debug_log_time < 1.0 / self._debug_log_hz:
-            return
-        self._last_debug_log_time = now
-        self.get_logger().info(
-            f"mode={self._control_mode} "
-            f"target_speed_mps={self._target_speed_mps:.2f} "
-            f"measured_speed_mps={self._measured_speed_mps:.2f} "
-            f"speed_error={self._speed_error:.2f} "
-            f"steer_rad={self._last_steering_rad:.3f} → "
-            f"duty_ff={self._duty_ff:.3f} duty_cmd={self.current_duty:.3f} "
-            f"erpm={self._erpm:.0f} current_motor={self._current_motor:.2f}A "
-            f"current_in={self._current_in:.2f}A input_voltage={self._input_voltage:.1f}V "
-            f"esp_steer={self.current_steer:.3f} "
-            f"RC CH1={self._rc_ch1} CH2={self._rc_ch2} CH5={self._rc_ch5}"
-        )
 
     def send_steering(self, steer: float) -> None:
         steer = self.clamp(steer, -self._max_steer, self._max_steer)
@@ -851,6 +966,7 @@ class VehicleControlNode(Node):
     def set_vesc_duty(self, duty: float) -> None:
         duty_limit = max(abs(self._max_duty), abs(self._max_auto_duty))
         duty = self.clamp(duty, -duty_limit, duty_limit)
+        self._vesc_duty_now = duty
         duty_int = int(duty * 100000)
 
         if duty_int == self._last_duty_int and self._last_duty_packet is not None:
@@ -902,6 +1018,7 @@ class VehicleControlNode(Node):
     def destroy_node(self) -> None:
         self._stop_keyboard_estop()
         self.get_logger().info("Stopping vehicle...")
+        self._reset_speed_controller()
         try:
             self.stop_vehicle()
             time.sleep(0.1)

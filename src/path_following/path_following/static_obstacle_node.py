@@ -23,23 +23,53 @@ from visualization_msgs.msg import Marker, MarkerArray
 from path_following.track_sliding import param_bool
 
 
+# maps/ 아래 yaml 파일명만 바꾸면 됨 (전체 경로 불필요)
+_DEFAULT_MAP_DIR = "/home/nvidia/f1tenth_ajou/maps"
+
+
+def resolve_map_yaml(map_name: str, map_dir: str = "") -> str:
+    """CFG map_name → 절대경로. 절대경로를 넣으면 그대로 사용."""
+    name = str(map_name).strip()
+    if not name:
+        raise ValueError("map_name is empty — CFG['map_name'] 에 yaml 파일명을 넣으세요.")
+    p = Path(name).expanduser()
+    if p.is_absolute():
+        if not p.is_file():
+            raise FileNotFoundError(f"map yaml not found: {p}")
+        return str(p.resolve())
+    base = Path(map_dir).expanduser() if str(map_dir).strip() else Path(_DEFAULT_MAP_DIR)
+    cand = (base / name).resolve()
+    if not cand.is_file():
+        raise FileNotFoundError(
+            f"map yaml not found: {cand}\n"
+            f"  CFG map_name={name!r}, map_dir={base}"
+        )
+    return str(cand)
+
+
 CFG = {
+    # ===== 맵 바꿀 때 여기만 수정 =====
+    "map_name": "cartographer_map_20260730_220058_rosmap.yaml",
+    "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
+    # =================================
     "laser_frame": "laser",  # 실차 (시뮬: ego_racecar/laser)
     "map_frame": "map",
     "scan_topic": "/scan",
     "obstacles_topic": "/static_obstacles",
     "markers_topic": "/visualization_marker_array",
-    "map_yaml": (
-        "/home/nvidia/f1tenth_ajou/maps/"
-        "cartographer_map_20260713_002437.yaml"
-    ),
-    # 실차 TF/맵 어긋남 여유 (시뮬 0.18 → 살짝 키워 벽을 잔차로 안 잡게)
-    "wall_match_radius_m": 0.28,
+    # 실차 TF/맵 어긋남 + 잔차 노이즈 (너무 키우면 실장애를 벽으로 흡수)
+    "wall_match_radius_m": 0.42,
     "tf_timeout_sec": 0.10,
     "cluster_gap_threshold_m": 0.28,
-    "min_cluster_points": 6,
+    "min_cluster_points": 10,
     "max_obstacle_size_m": 0.85,
-    "min_obstacle_size_m": 0.08,
+    "min_obstacle_size_m": 0.14,
+    "max_obstacle_range_m": 8.0,
+    "max_obstacle_lateral_m": 0.85,
+    # 단발 잔차 깜빡임 완화 (너무 크면 실장애 반응 지연)
+    "persist_min_hits": 4,
+    "persist_match_m": 0.55,
+    "persist_max_missed": 2,
     "log_detections": True,
     "log_throttle_sec": 2.0,
 }
@@ -143,6 +173,21 @@ class StaticObstacleNode(Node):
         self.min_obstacle_size_m = float(
             self.get_parameter("min_obstacle_size_m").value
         )
+        self.max_obstacle_range_m = max(
+            1.0, float(self.get_parameter("max_obstacle_range_m").value)
+        )
+        self.max_obstacle_lateral_m = max(
+            0.2, float(self.get_parameter("max_obstacle_lateral_m").value)
+        )
+        self.persist_min_hits = max(
+            1, int(self.get_parameter("persist_min_hits").value)
+        )
+        self.persist_match_m = max(
+            0.05, float(self.get_parameter("persist_match_m").value)
+        )
+        self.persist_max_missed = max(
+            0, int(self.get_parameter("persist_max_missed").value)
+        )
         self.tf_timeout = float(self.get_parameter("tf_timeout_sec").value)
         self.log_throttle_ns = int(
             max(0.1, float(self.get_parameter("log_throttle_sec").value)) * 1e9
@@ -150,8 +195,13 @@ class StaticObstacleNode(Node):
         self._log_detections = param_bool(self.get_parameter("log_detections").value)
         self._last_detect_log_ns = 0
         self._last_tf_warn_ns = 0
+        # [(x, y, r, hits, missed), ...]
+        self._persist: list[list[float]] = []
 
-        map_yaml = str(self.get_parameter("map_yaml").value)
+        map_yaml = resolve_map_yaml(
+            str(self.get_parameter("map_name").value),
+            str(self.get_parameter("map_dir").value),
+        )
         wall_r = max(0.0, float(self.get_parameter("wall_match_radius_m").value))
         self.static_map = StaticMap(map_yaml, wall_r)
 
@@ -258,6 +308,13 @@ class StaticObstacleNode(Node):
 
         r = ranges[valid]
         th = angle_min + idx[valid] * angle_inc
+        near = r <= self.max_obstacle_range_m
+        if not np.any(near):
+            self._persist = []
+            self._publish_empty_obstacles()
+            return
+        r = r[near]
+        th = th[near]
         lx = r * np.cos(th)
         ly = r * np.sin(th)
         mx, my = self._transform_xy(tf, lx, ly)
@@ -265,6 +322,7 @@ class StaticObstacleNode(Node):
         wall_hit = self.static_map.is_wall(mx, my)
         obs_mask = ~wall_hit
         if not np.any(obs_mask):
+            self._persist = []
             self._publish_empty_obstacles()
             return
 
@@ -272,7 +330,57 @@ class StaticObstacleNode(Node):
         oy = ly[obs_mask]
         clusters = self._cluster_xy(ox, oy)
         if not clusters:
-            self._publish_empty_obstacles()
+            # 검출 없음 — missed만 증가시키도록 빈 raw로 persistence 갱신
+            for p in self._persist:
+                p[4] += 1.0
+            self._persist = [
+                p for p in self._persist if p[4] <= float(self.persist_max_missed)
+            ]
+            if not self._persist:
+                self._publish_empty_obstacles()
+                return
+            # 아래 공통 publish 경로를 위해 raw_dets 비우고 계속할 수 없으므로
+            # 여기서 확정 트랙만 재발행
+            now_msg = self.get_clock().now().to_msg()
+            marker_array = MarkerArray()
+            delete_marker = Marker()
+            delete_marker.action = Marker.DELETEALL
+            marker_array.markers.append(delete_marker)
+            obstacle_data_list: list[float] = []
+            final_obstacle_count = 0
+            nearest_logic = None
+            for oid, p in enumerate(self._persist):
+                if p[3] < float(self.persist_min_hits):
+                    continue
+                logic_x, logic_y, radius = p[0], p[1], p[2]
+                obstacle_data_list.extend([float(oid), logic_x, logic_y, radius])
+                d = math.hypot(logic_x, logic_y)
+                if nearest_logic is None or d < nearest_logic[2]:
+                    nearest_logic = (logic_x, logic_y, d)
+                marker = Marker()
+                marker.header.frame_id = self._laser_frame
+                marker.header.stamp = now_msg
+                marker.ns = "obstacles"
+                marker.id = oid
+                marker.type = Marker.CUBE
+                marker.action = Marker.ADD
+                marker.pose.position.x = logic_x
+                marker.pose.position.y = logic_y
+                marker.pose.position.z = 0.0
+                marker.scale.x = max(radius * 2.0, 0.1)
+                marker.scale.y = max(radius * 2.0, 0.1)
+                marker.scale.z = 0.2
+                marker.color.a = 0.8
+                marker.color.r = 1.0
+                marker.color.g = 0.0
+                marker.color.b = 0.0
+                marker.lifetime = MsgDuration(sec=0, nanosec=200000000)
+                marker_array.markers.append(marker)
+                final_obstacle_count += 1
+            self.marker_pub.publish(marker_array)
+            obs_msg = Float32MultiArray()
+            obs_msg.data = obstacle_data_list
+            self.obstacle_pub.publish(obs_msg)
             return
 
         now_msg = self.get_clock().now().to_msg()
@@ -284,6 +392,7 @@ class StaticObstacleNode(Node):
         obstacle_data_list: list[float] = []
         final_obstacle_count = 0
         nearest_logic = None
+        raw_dets: list[tuple[float, float, float]] = []
 
         for cidx, (px_arr, py_arr) in enumerate(clusters):
             d2 = px_arr * px_arr + py_arr * py_arr
@@ -300,9 +409,44 @@ class StaticObstacleNode(Node):
             span_m = max(size_x, size_y)
             if span_m < self.min_obstacle_size_m:
                 continue
+            if abs(logic_y) > self.max_obstacle_lateral_m:
+                continue
 
             radius = span_m / 2.0
-            obstacle_data_list.extend([float(cidx), logic_x, logic_y, radius])
+            raw_dets.append((logic_x, logic_y, radius))
+
+        # 연속 히트 persistence — 단발 노이즈 깜빡임 억제
+        for p in self._persist:
+            p[4] += 1.0  # missed++
+        used: set[int] = set()
+        for dx, dy, dr in raw_dets:
+            best_i = -1
+            best_d = float("inf")
+            for i, p in enumerate(self._persist):
+                if i in used:
+                    continue
+                d = math.hypot(dx - p[0], dy - p[1])
+                if d < best_d and d <= self.persist_match_m:
+                    best_d = d
+                    best_i = i
+            if best_i >= 0:
+                p = self._persist[best_i]
+                p[0], p[1], p[2] = dx, dy, dr
+                p[3] += 1.0
+                p[4] = 0.0
+                used.add(best_i)
+            else:
+                self._persist.append([dx, dy, dr, 1.0, 0.0])
+
+        self._persist = [
+            p for p in self._persist if p[4] <= float(self.persist_max_missed)
+        ]
+
+        for oid, p in enumerate(self._persist):
+            if p[3] < float(self.persist_min_hits):
+                continue
+            logic_x, logic_y, radius = p[0], p[1], p[2]
+            obstacle_data_list.extend([float(oid), logic_x, logic_y, radius])
             d = math.hypot(logic_x, logic_y)
             if nearest_logic is None or d < nearest_logic[2]:
                 nearest_logic = (logic_x, logic_y, d)
@@ -311,14 +455,14 @@ class StaticObstacleNode(Node):
             marker.header.frame_id = self._laser_frame
             marker.header.stamp = now_msg
             marker.ns = "obstacles"
-            marker.id = cidx
+            marker.id = oid
             marker.type = Marker.CUBE
             marker.action = Marker.ADD
-            marker.pose.position.x = (min_x + max_x) / 2.0
-            marker.pose.position.y = (min_y + max_y) / 2.0
+            marker.pose.position.x = logic_x
+            marker.pose.position.y = logic_y
             marker.pose.position.z = 0.0
-            marker.scale.x = max(size_x, 0.1)
-            marker.scale.y = max(size_y, 0.1)
+            marker.scale.x = max(radius * 2.0, 0.1)
+            marker.scale.y = max(radius * 2.0, 0.1)
             marker.scale.z = 0.2
             marker.color.a = 0.8
             marker.color.r = 1.0

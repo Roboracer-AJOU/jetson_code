@@ -81,7 +81,7 @@ def generate_launch_description():
     maps_dir = '/home/nvidia/f1tenth_ajou/maps'
     default_pbstream = os.path.join(
         maps_dir,
-        'cartographer_map_20260719_001538.pbstream',
+        'cartographer_map_20260730_220058.pbstream',
     )
 
     return LaunchDescription([
@@ -158,7 +158,7 @@ def generate_launch_description():
             description='Launch RViz on this machine (needs DISPLAY; use false over SSH)',
         ),
         LogInfo(msg=(
-            '=== 001538 맵 localization (LiDAR-only) ===\n'
+            '=== localization: LiDAR only (no IMU/odom) ===\n'
             '  ros2 launch localization_layer cartographer_localization_launch.py\n'
             '  → origin에서 자동 start_trajectory (Localization OK 확인)\n'
             '  안 맞으면: wait_for_rviz_initial_pose:=true + RViz 2D Pose Estimate'

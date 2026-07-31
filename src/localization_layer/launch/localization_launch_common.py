@@ -251,8 +251,8 @@ def build_localization_cartographer_nodes(context):
 
     nodes = [
         LogInfo(msg=(
-            'Cartographer localization: LiDAR /scan 사용 (rangefinder ratio=1). '
-            'FixedRatioSampler 경고는 odom(미사용) 등에서 나올 수 있으며 LiDAR drop 아님.'
+            'Cartographer localization: LiDAR only (/scan). '
+            'IMU/odom 미사용. FixedRatioSampler 경고는 정상.'
         )),
         Node(
             package='cartographer_ros',

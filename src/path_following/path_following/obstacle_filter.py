@@ -6,7 +6,6 @@ from typing import List, Tuple
 
 from path_following.track_sliding import lateral_distance_to_closed_polyline
 
-
 def filter_obstacles_laser_frame(
     obstacle_data: list,
     *,
@@ -56,7 +55,6 @@ def filter_obstacles_laser_frame(
 
     return out
 
-
 def filter_obstacles_for_exit(
     obstacle_data: list,
     *,
@@ -103,6 +101,184 @@ def filter_obstacles_for_exit(
 
     return out
 
+def _pack_dynamic_as_static_gate(dynamic_data: list) -> list:
+    """/dynamic_obstacles [id,x,y,vx,vy,r,...] → [id,x,y,r,...] (거리 게이트용)."""
+    if len(dynamic_data) < 6:
+        return []
+    out: list = []
+    n = len(dynamic_data) // 6
+    for i in range(n):
+        base = 6 * i
+        out.extend(
+            [
+                float(dynamic_data[base]),
+                float(dynamic_data[base + 1]),
+                float(dynamic_data[base + 2]),
+                float(dynamic_data[base + 5]),
+            ]
+        )
+    return out
+
+def filter_dynamic_obstacles_laser_frame(
+    dynamic_data: list,
+    *,
+    forward_min_m: float,
+    forward_max_m: float,
+    lateral_abs_max_m: float,
+    corridor_enable: bool,
+    corridor_max_lat_m: float,
+    track_pts: List[Tuple[float, float]],
+    laser_to_map,
+    require_corridor_tf: bool = True,
+) -> list:
+    """
+    /dynamic_obstacles [id,x,y,vx,vy,r,...] (laser pos, map vel) → planner 게이트 통과분.
+    """
+    if len(dynamic_data) < 6:
+        return []
+
+    if corridor_enable and require_corridor_tf and laser_to_map is None:
+        return []
+
+    out: list = []
+    n = len(dynamic_data) // 6
+    for i in range(n):
+        base = 6 * i
+        oid = dynamic_data[base]
+        x = float(dynamic_data[base + 1])
+        y = float(dynamic_data[base + 2])
+        vx = float(dynamic_data[base + 3])
+        vy = float(dynamic_data[base + 4])
+        r = float(dynamic_data[base + 5])
+
+        if x < forward_min_m or x > forward_max_m:
+            continue
+        if abs(y) > lateral_abs_max_m:
+            continue
+
+        if corridor_enable and track_pts and laser_to_map is not None:
+            mapped = laser_to_map(x, y)
+            if mapped is None:
+                continue
+            mx, my = mapped
+            if lateral_distance_to_closed_polyline(mx, my, track_pts) > corridor_max_lat_m:
+                continue
+
+        out.extend([float(oid), x, y, vx, vy, r])
+
+    return out
+
+def filter_dynamic_obstacles_for_exit(
+    dynamic_data: list,
+    *,
+    pass_rear_x_m: float,
+    lateral_abs_max_m: float,
+    corridor_enable: bool,
+    corridor_max_lat_m: float,
+    track_pts: List[Tuple[float, float]],
+    laser_to_map,
+) -> list:
+    if len(dynamic_data) < 6:
+        return []
+    if corridor_enable and laser_to_map is None:
+        return []
+
+    out: list = []
+    n = len(dynamic_data) // 6
+    for i in range(n):
+        base = 6 * i
+        oid = dynamic_data[base]
+        x = float(dynamic_data[base + 1])
+        y = float(dynamic_data[base + 2])
+        vx = float(dynamic_data[base + 3])
+        vy = float(dynamic_data[base + 4])
+        r = float(dynamic_data[base + 5])
+
+        if abs(y) > lateral_abs_max_m:
+            continue
+        if (x - r) <= pass_rear_x_m:
+            continue
+
+        if corridor_enable and track_pts and laser_to_map is not None:
+            mapped = laser_to_map(x, y)
+            if mapped is None:
+                continue
+            mx, my = mapped
+            if lateral_distance_to_closed_polyline(mx, my, track_pts) > corridor_max_lat_m:
+                continue
+
+        out.extend([float(oid), x, y, vx, vy, r])
+
+    return out
+
+def closest_dynamic_obstacle_surface_m(
+    dynamic_data: list,
+    *,
+    forward_cone_rad: float | None = None,
+    min_forward_x_m: float = 0.0,
+    lateral_abs_max_m: float | None = None,
+    laser_to_base_x_m: float = 0.0,
+) -> float:
+    return closest_obstacle_surface_m(
+        _pack_dynamic_as_static_gate(dynamic_data),
+        forward_cone_rad=forward_cone_rad,
+        min_forward_x_m=min_forward_x_m,
+        lateral_abs_max_m=lateral_abs_max_m,
+        laser_to_base_x_m=laser_to_base_x_m,
+    )
+
+def closest_dynamic_obstacle_speed_mps(
+    dynamic_data: list,
+    *,
+    forward_cone_rad: float | None = None,
+    min_forward_x_m: float = 0.0,
+    lateral_abs_max_m: float | None = None,
+    laser_to_base_x_m: float = 0.0,
+) -> tuple[float, float, float]:
+    """
+    최근접 동적 장애: (표면거리 m, 속력 m/s, closing m/s).
+
+    vx,vy 는 laser-frame 상대속도.
+    closing = -(x*vx + y*vy)/r  (+면 가까워짐/위협, -면 멀어짐).
+    """
+    if len(dynamic_data) < 6:
+        return float("inf"), 0.0, 0.0
+
+    best_d = float("inf")
+    best_speed = 0.0
+    best_closing = 0.0
+    n = len(dynamic_data) // 6
+    for i in range(n):
+        base = 6 * i
+        x = float(dynamic_data[base + 1])
+        y = float(dynamic_data[base + 2])
+        vx = float(dynamic_data[base + 3])
+        vy = float(dynamic_data[base + 4])
+        r = float(dynamic_data[base + 5])
+        xb = x + laser_to_base_x_m
+        if xb < min_forward_x_m:
+            continue
+        if lateral_abs_max_m is not None and abs(y) > lateral_abs_max_m:
+            continue
+        if forward_cone_rad is not None:
+            if xb <= 0.0:
+                continue
+            angle = math.atan2(y, xb)
+            if abs(angle) > forward_cone_rad:
+                continue
+        d = math.hypot(xb, y) - r
+        if d < best_d:
+            best_d = max(0.0, d)
+            best_speed = math.hypot(vx, vy)
+            rng = math.hypot(x, y)
+            if rng > 1e-3:
+                best_closing = -(x * vx + y * vy) / rng
+            else:
+                best_closing = 0.0
+
+    if best_d == float("inf"):
+        return float("inf"), 0.0, 0.0
+    return best_d, best_speed, best_closing
 
 def closest_obstacle_surface_m(
     obstacle_data: list,
@@ -141,7 +317,6 @@ def closest_obstacle_surface_m(
             best = d
     return max(0.0, best) if best != float("inf") else float("inf")
 
-
 def obstacles_remain_for_avoid(
     obstacle_data: list,
     *,
@@ -164,7 +339,6 @@ def obstacles_remain_for_avoid(
         if (x - r) > pass_rear_x_m:
             return True
     return False
-
 
 def csv_path_blocked_by_obstacles(
     obstacle_data: list,

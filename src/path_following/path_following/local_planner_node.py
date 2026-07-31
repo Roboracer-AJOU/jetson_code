@@ -35,11 +35,16 @@ from geometry_msgs.msg import PointStamped, PoseStamped
 from tf2_ros import Buffer, TransformListener, TransformException
 
 from path_following.obstacle_filter import (
+    closest_dynamic_obstacle_speed_mps,
+    closest_dynamic_obstacle_surface_m,
     closest_obstacle_surface_m,
     csv_path_blocked_by_obstacles,
+    filter_dynamic_obstacles_for_exit,
+    filter_dynamic_obstacles_laser_frame,
     filter_obstacles_for_exit,
     filter_obstacles_laser_frame,
     obstacles_remain_for_avoid,
+    _pack_dynamic_as_static_gate,
 )
 from path_following.track_sliding import (
     LoopTrackSliding,
@@ -49,19 +54,18 @@ from path_following.track_sliding import (
     resolve_csv_path,
 )
 
-
 # ============================================================
 # USER TUNING — local_planner (실차: 장애·LOCAL_PATH·FGM 타이밍은 여기만)
 # ============================================================
 CFG = {
     "csv_path": "",
-    # 실차 CSV 방향 유지 (시뮬은 True일 수 있음 — 조향/트랙 방향 건드리지 않음)
     "reverse_track_direction": False,
     "static_obstacles_topic": "/static_obstacles",
+    "dynamic_obstacles_topic": "/dynamic_obstacles",
+    "ego_speed_topic": "/vehicle/speed_mps",  # control_node 실측 속도
     "fgm_target_topic": "/fgm_target",
     "local_path_topic": "/local_path",
     "planner_path_override_topic": "/planner_path_override_active",
-    # --- 장애물 게이트 (실차 TF/맵 오차 여유 — 벽은 코리도 밖으로) ---
     "raceline_corridor_enable": True,
     "corridor_max_lateral_from_raceline_m": 0.40,
     "obstacle_forward_min_m": 0.30,
@@ -69,8 +73,6 @@ CFG = {
     "obstacle_lateral_abs_max_m": 0.42,
     "obstacle_tf_timeout_sec": 0.15,
     "laser_to_base_x_m": 0.275,
-    # --- LOCAL_PATH 상태머신 ---
-    # AVOID→CSV: 전방 장애 통과 후에만 CTE≤0.2 로 복귀 (회피 중 CTE로 조기 복귀 금지)
     "use_fgm": True,
     "avoid_on_m": 2.0,
     "avoid_off_m": 3.6,
@@ -124,9 +126,9 @@ CFG = {
     "planner_speed_scale_out_topic": "/planner/speed_scale",
     "planner_speed_condition_out_topic": "/planner/speed_condition",
     "planner_mode_topic": "/planner/mode",
+    "status_log_hz": 2.0,  # ego/obs/rel 속도 STATUS (0=끔)
     "verbose_logs": False,
 }
-
 
 def _wrap_pi(a: float) -> float:
     while a > math.pi:
@@ -135,12 +137,10 @@ def _wrap_pi(a: float) -> float:
         a += 2.0 * math.pi
     return a
 
-
 def _quat_to_yaw(q) -> float:
     siny = 2.0 * (q.w * q.z + q.x * q.y)
     cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny, cosy)
-
 
 def _point_laser_to_map(
     px: float,
@@ -161,7 +161,6 @@ def _point_laser_to_map(
     my = sx * px + cx * py + ty
     return (mx, my)
 
-
 class LocalPlannerNode(Node):
     def __init__(self):
         super().__init__("local_planner_node")
@@ -173,6 +172,8 @@ class LocalPlannerNode(Node):
             self.get_parameter("csv_path").get_parameter_value().string_value
         )
         obs_topic = self.get_parameter("static_obstacles_topic").value
+        dyn_obs_topic = str(self.get_parameter("dynamic_obstacles_topic").value)
+        odom_topic = str(self.get_parameter("ego_speed_topic").value)
         fgm_topic = self.get_parameter("fgm_target_topic").value
         out_topic = self.get_parameter("local_path_topic").value
         self.publish_hz = float(self.get_parameter("publish_hz").value)
@@ -297,6 +298,14 @@ class LocalPlannerNode(Node):
             30, int(self.get_parameter("path_anchor_half_width").value)
         )
         self.verbose_logs = param_bool(self.get_parameter("verbose_logs").value)
+        self._status_log_hz = max(0.0, float(self.get_parameter("status_log_hz").value))
+        self._status_log_period = (
+            1.0 / self._status_log_hz if self._status_log_hz > 0.0 else 0.0
+        )
+        self._status_log_accum = 0.0
+        self._last_obs_speed_mps = 0.0
+        self._last_rel_speed_mps = 0.0
+        self._last_d_dyn_closest = float("inf")
 
         self.points: List[Tuple[float, float]] = []
 
@@ -321,6 +330,8 @@ class LocalPlannerNode(Node):
             f"window={self.path_window_size}, anchor_half_width={self.path_anchor_half_width}"
         )
         self._obstacle_data: list = []
+        self._dynamic_obstacle_data: list = []
+        self._ego_speed_mps: float = 0.0
         self._fgm_target: PointStamped | None = None
         self._last_obs_recv_ns: int = 0
         self._last_fgm_recv_ns: int = 0
@@ -331,6 +342,16 @@ class LocalPlannerNode(Node):
 
         self.sub_obs = self.create_subscription(
             Float32MultiArray, obs_topic, self.cb_static_obstacles, 10
+        )
+        if dyn_obs_topic:
+            self.sub_dyn_obs = self.create_subscription(
+                Float32MultiArray,
+                dyn_obs_topic,
+                self.cb_dynamic_obstacles,
+                10,
+            )
+        self.sub_ego_speed = self.create_subscription(
+            Float64, odom_topic, self.cb_ego_speed, 10
         )
         self.sub_fgm = self.create_subscription(
             PointStamped, fgm_topic, self.cb_fgm_target, 10
@@ -359,7 +380,6 @@ class LocalPlannerNode(Node):
         self._rejoin_path_msg: Path | None = None
         self._rejoin_target_s: float | None = None
         self._last_mode_log_ns = 0
-        self._last_avoid_path: Path | None = None
         self._last_avoid_warn_ns = 0
         self.create_subscription(Float64, st_mul, self._cb_strategy_multiplier, 10)
         self.create_subscription(UInt8, st_cond, self._cb_strategy_condition, 10)
@@ -427,6 +447,7 @@ class LocalPlannerNode(Node):
             f"{self._obstacle_forward_max_m}]m, "
             f"avoid_on≤{self.avoid_on_m}m avoid_off≥{self.avoid_off_m}m "
             f"fgm_enable≤{self.fgm_enable_m}m->{fgm_en_topic}, "
+            f"dynamic={dyn_obs_topic or 'OFF'}, ego_speed={odom_topic}, "
             f"cone={cone_deg}deg, rejoin={self.rejoin_enable}, use_fgm={self.use_fgm}"
             + dbg_bits
             + (
@@ -521,14 +542,103 @@ class LocalPlannerNode(Node):
             laser_to_map=laser_to_map if corridor_on else None,
         )
 
-    def _obstacles_remain(self, filtered: list) -> bool:
+    def _make_laser_to_map_fn(self, tf_lm):
+        tr = tf_lm.transform if tf_lm is not None else None
+
+        def laser_to_map(lx: float, ly: float):
+            if tr is None:
+                return None
+            return _point_laser_to_map(
+                lx,
+                ly,
+                tr.translation.x,
+                tr.translation.y,
+                tr.rotation.w,
+                tr.rotation.x,
+                tr.rotation.y,
+                tr.rotation.z,
+            )
+
+        return laser_to_map
+
+    def _filter_dynamic_for_planner(self, raw: list) -> list:
+        corridor_on = self._raceline_corridor_enable and len(self.points) >= 2
+        tf_lm = self._lookup_laser_to_map_transform() if corridor_on else None
+        if corridor_on and tf_lm is None:
+            return []
+
+        return filter_dynamic_obstacles_laser_frame(
+            raw,
+            forward_min_m=self._obstacle_forward_min_m,
+            forward_max_m=self._obstacle_forward_max_m,
+            lateral_abs_max_m=self._obstacle_lateral_abs_max_m,
+            corridor_enable=corridor_on,
+            corridor_max_lat_m=self._corridor_max_lat,
+            track_pts=self.points,
+            laser_to_map=self._make_laser_to_map_fn(tf_lm) if corridor_on else None,
+            require_corridor_tf=True,
+        )
+
+    def _filter_dynamic_for_exit(self, raw: list) -> list:
+        corridor_on = self._raceline_corridor_enable and len(self.points) >= 2
+        tf_lm = self._lookup_laser_to_map_transform() if corridor_on else None
+        if corridor_on and tf_lm is None:
+            return []
+
+        return filter_dynamic_obstacles_for_exit(
+            raw,
+            pass_rear_x_m=self.avoid_pass_rear_x_m,
+            lateral_abs_max_m=self.avoid_exit_lateral_abs_max_m,
+            corridor_enable=corridor_on,
+            corridor_max_lat_m=self._corridor_max_lat,
+            track_pts=self.points,
+            laser_to_map=self._make_laser_to_map_fn(tf_lm) if corridor_on else None,
+        )
+
+    def _dynamic_threat_metrics(
+        self, filtered_dynamic: list
+    ) -> tuple[float, float, float, float]:
         """
-        AVOID 유지용. 회피 중 옆으로 빠져도 장애를 놓치지 않도록
-        exit lateral 을 넓게 쓴다. 후방(pass_rear) 완전 통과 전엔 True.
+        Returns (d_closest_cone, d_gate, rel_speed_mps, obs_speed_mps)
+        for closest dynamic obstacle.
+
+        rel_speed = closing rate (+가까워짐 / -멀어짐).
+        |v_ego|-|v_obs| 가 아니라 laser-frame 거리 변화 기반.
         """
+        if len(filtered_dynamic) < 6:
+            return float("inf"), float("inf"), 0.0, 0.0
+
+        d_closest, obs_speed, closing = closest_dynamic_obstacle_speed_mps(
+            filtered_dynamic,
+            forward_cone_rad=self.forward_cone_rad,
+            min_forward_x_m=self.avoid_min_forward_x_m,
+            lateral_abs_max_m=self.avoid_trigger_lateral_abs_max_m,
+            laser_to_base_x_m=self.laser_to_base_x_m,
+        )
+        d_gate = closest_dynamic_obstacle_surface_m(
+            filtered_dynamic,
+            forward_cone_rad=None,
+            min_forward_x_m=self.avoid_min_forward_x_m,
+            lateral_abs_max_m=self._obstacle_lateral_abs_max_m,
+            laser_to_base_x_m=self.laser_to_base_x_m,
+        )
+        return d_closest, d_gate, closing, obs_speed
+
+    def _dynamic_obstacles_remain(self, filtered_dynamic: list, rel_speed: float) -> bool:
+        if rel_speed <= 0.0:
+            return False
+        exit_dyn = self._filter_dynamic_for_exit(self._dynamic_obstacle_data)
+        gate = _pack_dynamic_as_static_gate(exit_dyn)
+        if len(gate) < 4:
+            return False
+        return obstacles_remain_for_avoid(
+            gate,
+            pass_rear_x_m=self.avoid_pass_rear_x_m,
+            lateral_abs_max_m=self.avoid_exit_lateral_abs_max_m,
+        )
+
+    def _static_obstacles_remain(self) -> bool:
         exit_obs = self._filter_obstacles_for_exit(self._obstacle_data)
-        # exit 가 비면(전부 후방) → 통과. filtered 로 폴백하지 않음
-        # (폴백 시 옆이탈 장애가 게이트에서 빠져 조기 clear 됨)
         if len(exit_obs) < 4:
             return False
         return obstacles_remain_for_avoid(
@@ -536,6 +646,40 @@ class LocalPlannerNode(Node):
             pass_rear_x_m=self.avoid_pass_rear_x_m,
             lateral_abs_max_m=self.avoid_exit_lateral_abs_max_m,
         )
+
+    def _obstacles_remain(self, filtered: list) -> bool:
+        """
+        AVOID 유지용. 정적 + 동적(상대속도>0) 장애 후방 통과 전까지 True.
+        """
+        if self._static_obstacles_remain():
+            return True
+        filtered_dynamic = self._filter_dynamic_for_planner(self._dynamic_obstacle_data)
+        _, _, rel_speed, _ = self._dynamic_threat_metrics(filtered_dynamic)
+        return self._dynamic_obstacles_remain(filtered_dynamic, rel_speed)
+
+    def _static_wants_fgm_local_path(
+        self, filtered: list, d_closest: float, d_gate: float
+    ) -> bool:
+        if len(filtered) < 4:
+            return False
+        if self._static_obstacles_remain():
+            return True
+        if math.isfinite(d_gate) and d_gate <= self.fgm_enable_m:
+            return True
+        if math.isfinite(d_closest) and d_closest <= self.fgm_enable_m:
+            return True
+        return False
+
+    def _dynamic_wants_fgm_local_path(
+        self, filtered_dynamic: list, d_dyn_closest: float, rel_speed: float
+    ) -> bool:
+        if len(filtered_dynamic) < 6:
+            return False
+        if rel_speed <= 0.0:
+            return False
+        if not math.isfinite(d_dyn_closest):
+            return False
+        return d_dyn_closest <= self.avoid_on_m
 
     def _avoidance_fully_cleared(
         self, filtered: list, current_pose: PoseStamped | None
@@ -638,6 +782,14 @@ class LocalPlannerNode(Node):
     def cb_static_obstacles(self, msg: Float32MultiArray):
         self._obstacle_data = list(msg.data)
         self._last_obs_recv_ns = self.get_clock().now().nanoseconds
+
+    def cb_dynamic_obstacles(self, msg: Float32MultiArray):
+        self._dynamic_obstacle_data = list(msg.data)
+
+    def cb_ego_speed(self, msg: Float64) -> None:
+        speed = float(msg.data)
+        if math.isfinite(speed):
+            self._ego_speed_mps = abs(speed)
 
     def cb_fgm_target(self, msg: PointStamped):
         self._fgm_target = msg
@@ -991,7 +1143,6 @@ class LocalPlannerNode(Node):
     def _go_global(self) -> None:
         self.mode = "GLOBAL"
         self._rejoin_path_msg = None
-        self._last_avoid_path = None
         self._avoid_on_count = 0
         self._avoid_off_count = 0
 
@@ -1013,6 +1164,10 @@ class LocalPlannerNode(Node):
         d_gate: float,
         filtered: list,
         current_pose: PoseStamped | None,
+        filtered_dynamic: list,
+        d_dyn_closest: float,
+        d_dyn_gate: float,
+        rel_speed: float,
     ) -> None:
         if not self.use_fgm and self.mode == "AVOID":
             old_mode = self.mode
@@ -1021,7 +1176,14 @@ class LocalPlannerNode(Node):
                 self._log_mode_transition(old_mode, d_closest)
             return
 
-        obstacle_on = d_closest <= self.avoid_on_m
+        static_obstacle_on = d_closest <= self.avoid_on_m
+        dynamic_obstacle_on = (
+            len(filtered_dynamic) >= 6
+            and math.isfinite(d_dyn_closest)
+            and d_dyn_closest <= self.avoid_on_m
+            and rel_speed > 0.0
+        )
+        obstacle_on = static_obstacle_on or dynamic_obstacle_on
         still_blocking = self._obstacles_remain(filtered)
         fully_cleared = self._avoidance_fully_cleared(filtered, current_pose)
 
@@ -1039,13 +1201,23 @@ class LocalPlannerNode(Node):
                 self._rejoin_path_msg = None
 
         elif self.mode == "AVOID":
-            # 전방에 장애가 남아 있으면 CTE와 무관하게 AVOID 유지
-            # (회피 시작 직후 CTE≤0.2 라도 CSV로 조기 복귀 → 충돌 방지)
-            obstacle_still_ahead = still_blocking or (
-                math.isfinite(d_gate) and d_gate <= self.fgm_enable_m
-            ) or (
-                math.isfinite(d_closest) and d_closest <= self.fgm_enable_m
+            static_still_ahead = (
+                still_blocking
+                or (math.isfinite(d_gate) and d_gate <= self.fgm_enable_m)
+                or (math.isfinite(d_closest) and d_closest <= self.fgm_enable_m)
             )
+            dynamic_still_ahead = (
+                len(filtered_dynamic) >= 6
+                and rel_speed > 0.0
+                and (
+                    (math.isfinite(d_dyn_gate) and d_dyn_gate <= self.fgm_enable_m)
+                    or (
+                        math.isfinite(d_dyn_closest)
+                        and d_dyn_closest <= self.fgm_enable_m
+                    )
+                )
+            )
+            obstacle_still_ahead = static_still_ahead or dynamic_still_ahead
             if obstacle_still_ahead:
                 self._avoid_off_count = 0
             elif fully_cleared:
@@ -1063,7 +1235,6 @@ class LocalPlannerNode(Node):
                     <= self.rejoin_finish_lateral_m
                 )
                 if not cte_ok:
-                    # 통과했지만 CSV에서 멀면 FGM 유지 → CTE≤0.2 될 때 CSV
                     pass
                 elif current_pose is not None and self.rejoin_enable:
                     self._rejoin_path_msg = self._build_frenet_quintic_rejoin_path(
@@ -1080,7 +1251,7 @@ class LocalPlannerNode(Node):
                     self._go_global()
 
         elif self.mode == "REJOIN":
-            if (obstacle_on or still_blocking) and self.use_fgm:
+            if obstacle_on and self.use_fgm:
                 self.mode = "AVOID"
                 self._rejoin_path_msg = None
                 self._avoid_off_count = 0
@@ -1155,16 +1326,53 @@ class LocalPlannerNode(Node):
 
         return out
 
-    def _publish_fgm_enable(self, filtered: list, d_gate: float) -> None:
+    def _maybe_log_speed_status(
+        self,
+        d_static: float,
+        d_dyn: float,
+        obs_speed: float,
+        rel_speed: float,
+    ) -> None:
+        if self._status_log_period <= 0.0:
+            return
+        self._status_log_accum += 1.0 / max(self.publish_hz, 1.0)
+        if self._status_log_accum < self._status_log_period:
+            return
+        self._status_log_accum = 0.0
+
+        d_s = "inf" if not math.isfinite(d_static) else f"{d_static:.2f}"
+        d_d = "inf" if not math.isfinite(d_dyn) else f"{d_dyn:.2f}"
+        threat = "APPROACH" if rel_speed > 0.0 and math.isfinite(d_dyn) else "—"
+        self.get_logger().info(
+            f"SPEED_STATUS | mode={self.mode} | "
+            f"v_ego={self._ego_speed_mps:.2f} "
+            f"v_obs={obs_speed:.2f} "
+            f"v_rel(close)={rel_speed:+.2f} m/s | "
+            f"d_static={d_s} d_dyn={d_d} m | threat={threat}"
+        )
+
+    def _publish_fgm_enable(
+        self,
+        filtered: list,
+        d_gate: float,
+        filtered_dynamic: list,
+        d_dyn_gate: float,
+    ) -> None:
         """
         FGM = 회피 주체. AVOID 전 구간 켜 두고, 접근 중에도 미리 켠다.
-        GLOBAL(및 REJOIN) 에서는 끔 → Stanley CSV.
+        정적/동적 모두 fgm_enable_m(기본 6m) 이내면 enable.
         """
-        approaching = (
+        static_approaching = (
             len(filtered) >= 4
             and math.isfinite(d_gate)
             and d_gate <= self.fgm_enable_m
         )
+        dynamic_approaching = (
+            len(filtered_dynamic) >= 6
+            and math.isfinite(d_dyn_gate)
+            and d_dyn_gate <= self.fgm_enable_m
+        )
+        approaching = static_approaching or dynamic_approaching
         enable = self.use_fgm and (self.mode == "AVOID" or approaching)
         msg = Bool()
         msg.data = bool(enable)
@@ -1172,20 +1380,49 @@ class LocalPlannerNode(Node):
 
     def timer_publish(self):
         filtered = self._filter_obstacles_for_planner(self._obstacle_data)
+        filtered_dynamic = self._filter_dynamic_for_planner(self._dynamic_obstacle_data)
         d_closest = self._planner_closest_obstacle_m(filtered)
         d_gate = self._planner_gate_closest_m(filtered)
+        d_dyn_closest, d_dyn_gate, rel_speed, obs_speed = self._dynamic_threat_metrics(
+            filtered_dynamic
+        )
+        self._last_obs_speed_mps = obs_speed
+        self._last_rel_speed_mps = rel_speed
+        self._last_d_dyn_closest = d_dyn_closest
         current = self._get_current_pose_map()
 
-        self._update_mode(d_closest, d_gate, filtered, current)
+        self._update_mode(
+            d_closest,
+            d_gate,
+            filtered,
+            current,
+            filtered_dynamic,
+            d_dyn_closest,
+            d_dyn_gate,
+            rel_speed,
+        )
         self._publish_planner_speed_out()
         self.pub_planner_mode.publish(String(data=self.mode))
-        self._publish_fgm_enable(filtered, d_gate)
+        self._publish_fgm_enable(filtered, d_gate, filtered_dynamic, d_dyn_gate)
+        self._maybe_log_speed_status(
+            d_closest, d_dyn_closest, obs_speed, rel_speed
+        )
 
         if self.mode == "GLOBAL":
             self._publish_override_gate(False)
             return
 
         if self.mode == "AVOID":
+            static_path = self._static_wants_fgm_local_path(
+                filtered, d_closest, d_gate
+            )
+            dynamic_path = self._dynamic_wants_fgm_local_path(
+                filtered_dynamic, d_dyn_closest, rel_speed
+            )
+            if not static_path and not dynamic_path:
+                self._publish_override_gate(False)
+                return
+
             fgm_xy = self._get_fgm_target_in_map()
             if current is None or fgm_xy is None:
                 if not hasattr(self, "_last_avoid_warn_ns"):
@@ -1260,7 +1497,6 @@ class LocalPlannerNode(Node):
                 self.mode = "GLOBAL"
                 self._rejoin_path_msg = None
 
-
 def main(args=None):
     rclpy.init(args=args)
     node = LocalPlannerNode()
@@ -1271,7 +1507,6 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()

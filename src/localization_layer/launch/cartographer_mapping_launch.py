@@ -56,7 +56,7 @@ def _build_cartographer_stack(context):
   scan_topic_str = scan_topic.perform(context)
 
   return [
-    LogInfo(msg='=== mapping: starting Cartographer stack ==='),
+    LogInfo(msg='=== mapping: LiDAR only (no IMU/odom), starting Cartographer ==='),
     Node(
       package='cartographer_ros',
       executable='cartographer_node',
@@ -271,7 +271,7 @@ def generate_launch_description():
     DeclareLaunchArgument(
       'odom_topic',
       default_value='/odom',
-      description='Odometry topic used by Cartographer',
+      description='Unused (use_odometry=false); remapped away',
     ),
     DeclareLaunchArgument(
       'scan_topic',
@@ -351,7 +351,7 @@ def generate_launch_description():
     DeclareLaunchArgument(
       'use_wheel_odom_tf',
       default_value='false',
-      description='Run wheel odom TF when sensor bringup is enabled',
+      description='Must stay false: Cartographer mapping does not use wheel odom',
     ),
     DeclareLaunchArgument(
       'imu_startup_delay_sec',
@@ -385,8 +385,8 @@ def generate_launch_description():
     ),
     DeclareLaunchArgument(
       'cartographer_startup_delay_sec',
-      default_value='4.0',
-      description='Delay after network check before starting Cartographer',
+      default_value='6.0',
+      description='Delay so EBIMU Full stream is up before Cartographer (use_imu_data=true)',
     ),
     OpaqueFunction(function=_launch_setup),
   ])

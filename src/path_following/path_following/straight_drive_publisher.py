@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 """
-control_node 테스트용 /drive 발행기.
+[임시] MANUAL 직진 속도 실험용 /drive 발행기.
 
-localization / path_following 없이:
-  - 이 노드: /drive 에 AckermannDriveStamped 발행 (직진 기본)
-  - control_node: CH5 자율일 때만 /drive 조향 사용, 속도는 control_node CFG 가 통제
-  - CH5 수동: control_node 가 /drive 무시 → RC만 동작
+  - CH5 MANUAL 일 때만 /drive 발행 (AUTO 전환 시 즉시 발행 중지)
+  - control_node 와 동일 PI 목표속도
 
-사용 (젯슨):
+사용:
   ros2 run path_following control_node
-  ros2 run path_following straight_drive_publisher
-
-튜닝은 아래 CFG 또는:
-  ros2 param set /straight_drive_publisher steering_angle_rad 0.05
-  ros2 param set /straight_drive_publisher enabled false   # 발행 중지
+  ros2 run path_following straight_drive_publisher --ros-args -p target_speed_mps:=1.0
 """
 from __future__ import annotations
 
@@ -22,19 +16,19 @@ import math
 import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
 from rclpy.node import Node
+from std_msgs.msg import Float64, Float64MultiArray
 
 
-# ============================================================
-# USER TUNING — 여기만 수정
-# ============================================================
 CFG = {
     "drive_topic": "/drive",
-    "publish_hz": 40.0,           # control_node cmd_timeout(0.25s) 보다 충분히 빠름
+    "telemetry_topic": "/vehicle/telemetry",
+    "measured_speed_topic": "/vehicle/speed_mps",
+    "publish_hz": 40.0,
+    "status_log_hz": 2.0,
     "enabled": True,
-    # control_node AUTO 는 /drive.speed 를 무시하고 max_target_speed_mps 사용.
-    # 여기 speed 는 메시지/로그용 (나중에 control 이 speed 를 쓰면 그대로 활용).
-    "speed_mps": 1.0,
-    "steering_angle_rad": 0.0,    # 0 = 직진. + = 좌(Stanley 관례)
+    "target_speed_mps": 4.0,
+    "speed_sign": -1.0,           # 전진 duty 방향 (후진이면 1.0 으로 토글)
+    "steering_angle_rad": 0.0,
     "frame_id": "base_link",
 }
 
@@ -53,39 +47,94 @@ class StraightDrivePublisher(Node):
             self.declare_parameter(key, value)
 
         self._drive_topic = str(self.get_parameter("drive_topic").value)
+        self._telemetry_topic = str(self.get_parameter("telemetry_topic").value)
+        self._speed_topic = str(self.get_parameter("measured_speed_topic").value)
         self._frame_id = str(self.get_parameter("frame_id").value)
         hz = max(1.0, float(self.get_parameter("publish_hz").value))
+        self._status_log_hz = max(0.0, float(self.get_parameter("status_log_hz").value))
+        self._status_log_period = 1.0 / self._status_log_hz if self._status_log_hz > 0 else 0.0
+        self._status_log_accum = 0.0
+
+        self._v_act = 0.0
+        self._v_act_fresh = False
+        self._telemetry_fresh = False
+        self._autonomous = False
+        self._was_autonomous = False
 
         self._pub = self.create_publisher(AckermannDriveStamped, self._drive_topic, 10)
+        self.create_subscription(Float64, self._speed_topic, self._cb_speed, 10)
+        self.create_subscription(
+            Float64MultiArray, self._telemetry_topic, self._cb_telemetry, 10
+        )
         self.create_timer(1.0 / hz, self._tick)
 
+        sign = float(self.get_parameter("speed_sign").value)
+        if not math.isfinite(sign) or sign == 0.0:
+            sign = 1.0
+        tgt = float(self.get_parameter("target_speed_mps").value)
         self.get_logger().info(
-            f"straight_drive_publisher → `{self._drive_topic}` @ {hz:.0f}Hz | "
-            f"steer={float(self.get_parameter('steering_angle_rad').value):+.3f}rad "
-            f"speed_field={float(self.get_parameter('speed_mps').value):.2f}m/s "
-            f"(AUTO에서 실제 속도는 control_node max_target_speed_mps)"
+            f"[TEMP] straight_drive_publisher @ {hz:.0f}Hz | "
+            f"target={tgt:.2f} m/s speed_sign={sign:+.0f} | CH5 MANUAL 일 때만 발행"
         )
-        self.get_logger().info(
-            "MANUAL(CH5): control_node 가 /drive 무시. AUTO(CH5): 이 조향 명령 사용."
-        )
+
+    def _cb_telemetry(self, msg: Float64MultiArray) -> None:
+        if len(msg.data) <= 6:
+            return
+        self._telemetry_fresh = True
+        self._autonomous = float(msg.data[6]) > 0.5
+
+    def _cb_speed(self, msg: Float64) -> None:
+        v = float(msg.data)
+        if math.isfinite(v):
+            self._v_act = abs(v)
+            self._v_act_fresh = True
 
     def _tick(self) -> None:
         if not _param_bool(self.get_parameter("enabled").value):
             return
 
-        speed = float(self.get_parameter("speed_mps").value)
-        steer = float(self.get_parameter("steering_angle_rad").value)
-        if not math.isfinite(speed):
-            speed = 0.0
-        if not math.isfinite(steer):
-            steer = 0.0
+        if not self._telemetry_fresh:
+            return
+
+        if self._autonomous:
+            if not self._was_autonomous:
+                self.get_logger().info("AUTO 감지 — /drive 발행 중지")
+                self._was_autonomous = True
+            return
+
+        if self._was_autonomous:
+            self.get_logger().info("MANUAL 복귀 — /drive 발행 재개")
+            self._was_autonomous = False
+
+        target = float(self.get_parameter("target_speed_mps").value)
+        if not math.isfinite(target) or target < 0.0:
+            target = 0.0
+        sign = float(self.get_parameter("speed_sign").value)
+        if not math.isfinite(sign) or sign == 0.0:
+            sign = 1.0
 
         msg = AckermannDriveStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self._frame_id
-        msg.drive.speed = speed
-        msg.drive.steering_angle = steer
+        msg.drive.speed = target * sign
+        msg.drive.steering_angle = float(self.get_parameter("steering_angle_rad").value)
         self._pub.publish(msg)
+        self._maybe_log(target)
+
+    def _maybe_log(self, target: float) -> None:
+        if self._status_log_period <= 0.0:
+            return
+        self._status_log_accum += 1.0 / max(1.0, float(self.get_parameter("publish_hz").value))
+        if self._status_log_accum < self._status_log_period:
+            return
+        self._status_log_accum = 0.0
+        if self._v_act_fresh:
+            self.get_logger().info(
+                f"SPEED_TEST | target={target:.2f} v_act={self._v_act:.2f} "
+                f"err={target - self._v_act:+.2f} m/s"
+            )
+        else:
+            self.get_logger().info(f"SPEED_TEST | target={target:.2f} v_act=—")
 
 
 def main(args=None) -> None:

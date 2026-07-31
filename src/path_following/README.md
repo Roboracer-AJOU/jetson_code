@@ -429,7 +429,10 @@ ros2 launch localization_layer cartographer_localization_launch.py
 주행
 source /opt/ros/humble/setup.bash
 source /home/nvidia/f1tenth_ajou/install/setup.bash
+
 ros2 launch path_following path_follow_stanley_launch.py
+
+ros2 launch path_follow_static_dynamic_avoid_launch.py
 
 
 컨트롤

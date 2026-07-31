@@ -1,8 +1,7 @@
 include "map_builder_mapping.lua"
 include "trajectory_builder.lua"
 
--- 실차 맵핑: LiDAR 중심. 품질 우선(연산 소폭↑): scan 더 많이 쓰고, 벽 hit 강화, pose graph 자주 최적화.
--- use_imu_data=true 는 /imu/data 가 안정적으로 들어올 때만 (ebimu "Full IMU stream detected" 확인).
+-- 실차 맵핑: LiDAR only. 휠 odom / IMU 미사용.
 options = {
   map_builder = MAP_BUILDER,
   trajectory_builder = TRAJECTORY_BUILDER,

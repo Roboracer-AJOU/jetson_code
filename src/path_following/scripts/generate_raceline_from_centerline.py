@@ -11,7 +11,10 @@ centerline.csv + map.yaml → raceline.csv (맵 무관: 어떤 트랙이든 동�
   - 파라미터만 조정하면 좁은 트랙·넓은 트랙·S자·헤어핀 등 모두 대응.
 
 사용 예:
-  python3 scripts/generate_raceline_from_centerline.py --centerline <centerline.csv> --map <map.yaml> --out <raceline.csv> [--invert-free]
+  # CFG map_name 만 고치고 실행
+  python3 scripts/generate_raceline_from_centerline.py
+  # 또는 CLI
+  python3 scripts/generate_raceline_from_centerline.py --centerline <centerline.csv> --map <map.yaml> --out <raceline.csv>
 """
 import argparse
 import csv
@@ -30,11 +33,25 @@ except ImportError:
 
 # 기존 스크립트에서 재사용
 from extract_centerline_from_map import (
+    CFG as CENTERLINE_CFG,
     load_map,
     pixel_to_world,
     resample_polyline_by_arc_length,
+    resolve_map_yaml,
     smooth_polyline,
 )
+
+
+# ============================================================
+# USER TUNING — 맵 바꿀 때 여기만 수정
+# ============================================================
+CFG = {
+    # maps/ 아래 yaml 파일명만 (절대경로 넣어도 됨)
+    "map_name": "cartographer_map_20260730_220058_rosmap.yaml",
+    "map_dir": CENTERLINE_CFG["map_dir"],
+    "centerline_csv": os.path.join(script_dir, "..", "config", "centerline.csv"),
+    "out_csv": os.path.join(script_dir, "..", "config", "raceline.csv"),
+}
 
 
 def world_to_pixel(
@@ -520,21 +537,18 @@ def main():
     )
     parser.add_argument(
         "--centerline",
-        default=os.path.join(script_dir, "..", "config", "centerline.csv"),
+        default=os.path.abspath(CFG["centerline_csv"]),
         help="Input centerline CSV (x,y)",
     )
-    ws_root = os.path.abspath(os.path.join(script_dir, "..", "..", ".."))
-    default_map = os.path.join(
-        ws_root, "maps", "cartographer_map_20260719_001538_rosmap.yaml"
-    )
+    default_map = resolve_map_yaml(CFG["map_name"], CFG["map_dir"])
     parser.add_argument(
         "--map",
         default=default_map,
-        help="Map YAML path (default: f1tenth_ajou/maps/200005)",
+        help=f"Map YAML path (default from CFG map_name={CFG['map_name']!r})",
     )
     parser.add_argument(
         "--out",
-        default=os.path.join(script_dir, "..", "config", "raceline.csv"),
+        default=os.path.abspath(CFG["out_csv"]),
         help="Output raceline CSV path",
     )
     parser.add_argument(
