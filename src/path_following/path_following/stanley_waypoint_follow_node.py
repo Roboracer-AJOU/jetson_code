@@ -56,7 +56,10 @@ CFG = {
     "stanley_k": 0.5,
     "stanley_softening": 0.12,
     # |cte|가 클수록 heading_error 가중치↓ (직선 평행주행 시 상쇄 방지)
-    "stanley_heading_cte_blend_m": 0.08,
+    # 0.08 은 실주행 오차보다 훨씬 작아서(실측 |cte| p50=0.13, p95=0.40)
+    # 대부분의 시간을 하한 0.25 에 붙어 달렸다 — 곡선에서 밀릴수록 복구력이
+    # 약해지는 역효과. 하한 도달점을 p95 부근(0.375 m)으로 옮긴다.
+    "stanley_heading_cte_blend_m": 0.50,
     "stanley_heading_min_weight": 0.25,
     # LOCAL_PATH(회피) 전용.
     # heading_gain 은 "경로 헤딩 오차 → 조향" 배율. FGM 각도가 이미 필요한
@@ -68,12 +71,15 @@ CFG = {
     "local_path_lookahead_m": 0.70,      # heading 기준을 앞쪽 경로로
     "local_path_steering_smooth_alpha": 0.70,
     "local_path_steering_rate_limit_radps": 8.0,
-    # 횡가속 한계로 조향 상한 (≤0 이면 끔). 고속에서 물리적으로 불가능한
-    # 조향을 명령해 슬라이드/스핀 나는 것을 막는다. 저속에서는 걸리지 않음.
-    "max_lateral_accel_mps2": 7.0,
+    # 횡가속 한계 조향 상한 — LOCAL_PATH(회피)에만 적용 (≤0 이면 끔).
+    # CSV 추종은 낮은 stanley_k + 곡률 FF 조합으로 이미 튜닝돼 있어서
+    # 여기에 상한을 걸면 곡선에서 FF가 잘려 언더스티어가 난다.
+    # 5.0 은 IMU 실측 기준: 2.5~2.8 m/s 코너링에서 v·ω 피크가 4.84~5.59 였고
+    # 그 지점에서 이미 밀리고 있었다. 그 위를 명령해도 조향이 곡률로 바뀌지 않는다.
+    "max_lateral_accel_mps2": 5.0,
     # 곡률 피드포워드: δ = δ_ff(κ) + Stanley. 직선용 stanley_k 는 유지.
     "enable_steer_ff": True,
-    "ff_gain": 1.3,              # δ_ff = ff_gain * ff_sign * atan(L·κ)
+    "ff_gain": 2.0,              # δ_ff = ff_gain * ff_sign * atan(L·κ)
     "ff_sign": 1.0,              # 좌우 반대면 -1.0
     "ff_lookahead_m": 0.8,       # best_i 기준 앞쪽 평균 곡률 구간 [m]
     "ff_kappa_clip": 2.5,        # |κ| 상한 [1/m] (스파이크 방지)
@@ -692,7 +698,7 @@ class StanleyWaypointFollowNode(Node):
         return out
 
     def _limit_lateral_accel(self, steering: float, speed: float) -> float:
-        """a_lat = v²·tan(δ)/L 이 한계를 넘지 않도록 조향 상한.
+        """a_lat = v²·tan(δ)/L 이 한계를 넘지 않도록 조향 상한 (LOCAL_PATH 전용).
 
         저속에서는 상한이 max_steering 보다 커서 걸리지 않고, 고속에서만 조인다.
         """
@@ -963,10 +969,10 @@ class StanleyWaypointFollowNode(Node):
                 rate_limit_radps=self.local_path_steering_rate_limit_radps,
             )
         else:
+            # CSV 추종은 횡가속 상한을 걸지 않는다 — 곡선에서 곡률 FF 가 잘려
+            # 오히려 언더스티어가 난다 (FF 는 언더스티어 방지용으로 넣은 항).
             steering_smoothed = self._smooth_steering(steering_raw)
-            steering_cmd = self._rate_limit_steering(
-                self._limit_lateral_accel(steering_smoothed, control_speed)
-            )
+            steering_cmd = self._rate_limit_steering(steering_smoothed)
 
         stanley_fb_sum = heading_term + cte_term
         lat_m = math.hypot(x - path_x, y - path_y)

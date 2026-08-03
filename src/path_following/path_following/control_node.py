@@ -48,7 +48,9 @@ CFG = {
     "min_move_speed_mps": 0.08,
     "status_log_hz": 2.0,         # 터미널 속도/제어 STATUS (0=끔)
     "max_steer": 1.,          # ESP 조향 명령 범위. 1.0이면 서보 ±40°까지 사용
-    "steer_rate_limit_per_sec": 4.0,
+    # 0 = 끔. 조향 변화율은 Stanley 쪽 steering_rate_limit_radps 에서만 건다
+    # (여기서 한 번 더 자르면 회피용으로 올려둔 응답속도가 무효화된다).
+    "steer_rate_limit_per_sec": 0.0,
     "steer_cmd_format": "prefixed",  # plain: "0.500\n" | prefixed: "S:0.500\n"
     "invert_speed": False,      # legacy AUTO sign flag; prefer auto_duty_output_sign
     # 원본 ESP normToAngle: S:-1→좌(50°), S:+1→우(130°) — INVERT_RC_STEER 미적용
@@ -75,7 +77,7 @@ CFG = {
     # AUTO closed-loop speed control (max_target_speed_mps is target speed [m/s])
     "max_auto_duty": 0.70,        # AUTO final safety duty limit
     "max_target_speed_mps": 10.0,  # AUTO target speed
-    "target_speed_mps": 2.0,       # AUTO configured target speed
+    "target_speed_mps": 3.0,       # AUTO configured target speed
     "auto_duty_output_sign": 1.0,
     "speed_ff_duty_per_mps": 0.076,
     "speed_kp": 0.15,

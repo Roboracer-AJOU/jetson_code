@@ -2,6 +2,7 @@ import glob
 import math
 
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 import serial
 
@@ -44,10 +45,14 @@ class EbimuDriver(Node):
         self.declare_parameter("port", "auto")
         self.declare_parameter("baud", 115200)
         self.declare_parameter("accel_in_g", True)
+        # EBIMU 실측 평균 주기(초). 한 타이머 틱에 프레임이 여러 개 몰려 들어왔을 때
+        # 각 프레임에 이 간격만큼 역산한 timestamp를 매겨 burst를 보정하는 데 씀.
+        self.declare_parameter("imu_sample_period_s", 0.01)
 
         requested_port = self.get_parameter("port").value
         baud = self.get_parameter("baud").value
         self.accel_in_g = bool(self.get_parameter("accel_in_g").value)
+        self.nominal_period_s = float(self.get_parameter("imu_sample_period_s").value)
         port = self.resolve_port(requested_port)
         self.seen_full_imu_frame = False
         self.serial_buffer = ""
@@ -143,11 +148,12 @@ class EbimuDriver(Node):
         complete_frames = frames[1:-1]
         tail_frame = frames[-1]
 
-        for frame in complete_frames:
-            self.process_frame(frame)
+        # 한 틱에 여러 프레임이 밀려 들어와도 하나도 안 버리고 전부 publish하되,
+        # 실제 샘플링 간격만큼 역산한 timestamp를 매겨 burst를 보정한다.
+        self._process_frame_batch(complete_frames)
 
         if self.serial_buffer.endswith("\n") or self.serial_buffer.endswith("\r"):
-            self.process_frame(tail_frame)
+            self._process_frame_batch([tail_frame])
             self.serial_buffer = ""
         else:
             self.serial_buffer = "*" + tail_frame
@@ -164,10 +170,25 @@ class EbimuDriver(Node):
             else:
                 self.serial_buffer = line
 
-        for line in complete_lines:
-            self.process_frame(line)
+        # "*" 구분자 없는 스트림도 동일하게 batch 보정 적용.
+        self._process_frame_batch(complete_lines)
 
-    def process_frame(self, frame: str):
+    def _process_frame_batch(self, frames: list[str]) -> None:
+        """한 틱에 몰려 들어온 프레임들에 균등 간격 timestamp를 매겨 전부 publish.
+
+        프레임을 버리지 않고, 가장 오래된 프레임일수록 과거 시각을,
+        가장 최신 프레임은 지금 시각을 갖도록 역산한다.
+        """
+        if not frames:
+            return
+
+        now = self.get_clock().now()
+        n = len(frames)
+        for i, frame in enumerate(frames):
+            offset = Duration(seconds=self.nominal_period_s * (n - 1 - i))
+            self.process_frame(frame, stamp=now - offset)
+
+    def process_frame(self, frame: str, stamp=None):
         cleaned_line = frame.strip()
 
         if not cleaned_line:
@@ -208,7 +229,7 @@ class EbimuDriver(Node):
                         "Orientation-only IMU stream detected"
                     )
 
-            self.publish_imu(roll, pitch, yaw, gx, gy, gz, ax, ay, az, has_gyro_accel)
+            self.publish_imu(roll, pitch, yaw, gx, gy, gz, ax, ay, az, has_gyro_accel, stamp=stamp)
         except Exception as exc:
             self.bad_frame_count += 1
             if self.bad_frame_count % 20 == 1:
@@ -217,10 +238,10 @@ class EbimuDriver(Node):
                     f"'{cleaned_line[:120]}' ({exc})"
                 )
 
-    def publish_imu(self, roll, pitch, yaw, gx, gy, gz, ax, ay, az, has_gyro_accel):
+    def publish_imu(self, roll, pitch, yaw, gx, gy, gz, ax, ay, az, has_gyro_accel, stamp=None):
         imu_msg = Imu()
         imu_msg.header = Header()
-        now = self.get_clock().now()
+        now = stamp if stamp is not None else self.get_clock().now()
         imu_msg.header.stamp = now.to_msg()
         imu_msg.header.frame_id = "imu_link"
 

@@ -252,8 +252,8 @@ def build_localization_cartographer_nodes(context):
 
     nodes = [
         LogInfo(msg=(
-            'Cartographer localization: LiDAR main (/scan) + wheel odom (/odom). '
-            'IMU(자이로) 보조 사용. control_node가 /vehicle/speed_mps·서보각을 내야 함.'
+            'Cartographer localization: LiDAR main (/scan) + wheel odom (/odom, '
+            'speed=VESC + yaw=IMU gyro). control_node가 /vehicle/speed_mps를 내야 함.'
         )),
         Node(
             package='localization_layer',
@@ -261,23 +261,19 @@ def build_localization_cartographer_nodes(context):
             name='vesc_wheel_odom',
             output='screen',
             parameters=[{
-                'wheelbase_m': 0.33,
                 'speed_topic': '/vehicle/speed_mps',
-                'servo_feedback_deg_topic': '/esp32/target_angle_deg',
-                'servo_command_deg_topic': '/esp32/servo_command_deg',
-                'drive_topic': '/drive',
+                'imu_topic': imu_topic_str,
+                # gz/gy 중 어느 축이 실제 yaw인지 실측 확인 후 필요하면 'y'로 변경.
+                'imu_yaw_axis': 'z',
+                # 자이로 적분 + EBIMU(9-DOF) 지자기 융합 yaw로 느리게(5초) 보정하는
+                # 컴플리멘터리 방식. 순간 자기간섭엔 안 흔들리고 장기 드리프트만 교정됨.
+                'yaw_source': 'fused',
+                'yaw_fusion_tau_sec': 5.0,
                 'odom_topic': odom_topic_str,
-                'center_servo_deg': 90.0,
-                'servo_span_deg': 40.0,
-                'max_steer_rad': 0.45,
-                'steer_scale': 0.55,
-                'invert_steer': False,
-                'use_steer_for_yaw': True,
                 'min_speed_for_yaw_mps': 0.08,
                 'speed_scale': 1.0,
-                # Cartographer가 use_odometry=true라 odom 각속도로 예측을 갈아탄다.
-                # 급조향 순간 오차가 그대로 꽂히지 않게 낮은 통과 필터로 완충 (지속 회전은 따라감).
-                'yaw_filter_tau_sec': 0.55,
+                # IMU 자이로 실측이라 조향각 추정보다 신뢰도 높음 → 약하게만 눌러줌.
+                'yaw_filter_tau_sec': 0.1,
                 'publish_hz': 50.0,
             }],
         ),

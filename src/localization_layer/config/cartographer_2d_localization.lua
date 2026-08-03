@@ -27,8 +27,10 @@ TRAJECTORY_BUILDER_2D.min_range = 0.08
 TRAJECTORY_BUILDER_2D.max_range = 16.0
 TRAJECTORY_BUILDER_2D.voxel_filter_size = 0.08
 TRAJECTORY_BUILDER_2D.use_online_correlative_scan_matching = true
-TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 0.30
-TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window = math.rad(22.)
+-- [수정6] 고속(3m/s+) 코너에서 스캔 간 예측 오차가 탐색범위(구 0.30/22°)를
+-- 넘어서 스캔매칭이 엉뚱한 곳에 붙는 문제 → 탐색 여유를 넓힘.
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 0.42
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window = math.rad(30.)
 -- prior stickiness 완화 → 작은 오차를 스캔마다 깎음
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.translation_delta_cost_weight = 8.0
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.rotation_delta_cost_weight = 1.5
@@ -45,11 +47,13 @@ POSE_GRAPH.optimize_every_n_nodes = 30
 -- 0.003은 너무 낮아서 전역 재정합 기회 자체가 거의 없었음 → 로컬 탐색이 놓친
 -- 누적 편향(돌수록 점점 밀림)을 회수할 안전망이 사실상 꺼져 있던 셈.
 -- global_localization_min_score(0.72, 엄격)는 그대로라 엉뚱한 곳 스냅 위험은 낮음.
+-- [수정1] 트랙이 루프 형태라 넓게+느슨하게 찾을수록 다른 구간과 헷갈려
+-- 잘못된 constraint가 대량으로 잡히는 현상(부채꼴 시각화) 발견 → 다시 조임.
 POSE_GRAPH.global_sampling_ratio = 0.01
-POSE_GRAPH.constraint_builder.sampling_ratio = 0.2
-POSE_GRAPH.constraint_builder.min_score = 0.55
+POSE_GRAPH.constraint_builder.sampling_ratio = 0.1
+POSE_GRAPH.constraint_builder.min_score = 0.62
 POSE_GRAPH.constraint_builder.global_localization_min_score = 0.72
-POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.linear_search_window = 3.5
+POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.linear_search_window = 2.2
 POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.angular_search_window = math.rad(25.)
 POSE_GRAPH.global_constraint_search_after_n_seconds = 6.
 -- 2e5였던 건 loop-closure 제약(기본 ~1.1e4/1e5)보다 더 세게 로컬 궤적에 붙잡아서
