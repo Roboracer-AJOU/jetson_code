@@ -31,7 +31,7 @@ _DEFAULT_MAP_DIR = "/home/nvidia/f1tenth_ajou/maps"
 
 CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
-    "map_name": "cartographer_map_20260730_220058_rosmap.yaml",
+    "map_name": "cartographer_map_20260803_202601.yaml",
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",
@@ -48,14 +48,15 @@ CFG = {
     "max_obstacle_size_m": 0.85,
     "min_obstacle_size_m": 0.14,
     "max_obstacle_range_m": 8.0,
-    # 옆벽 잔차 컷 (전방 회피 장애는 보통 |y|가 더 작음)
-    "max_obstacle_lateral_m": 0.85,
+    # 옆벽 잔차 컷. 회피로 비켜나는 동안에도 장애물을 계속 봐야 해서
+    # 너무 좁으면 조향 도중 장애물이 사라져 경로가 되감긴다.
+    "max_obstacle_lateral_m": 1.40,
     "match_dist_m": 1.00,
-    # 5~7 m/s 주행: 프레임당 이동 ~0.15–0.2 m → 매칭/속도 여유
     "speed_threshold_mps": 0.45,
-    "publish_min_age": 6,  # ~0.15 s @40 Hz
-    "track_min_age": 8,  # ~0.2 s — dynamic 확정
-    "track_max_missed": 5,
+    # 확정/유지는 스캔 Hz와 무관하게 "초" 기준 (고속에서 지연이 곧 거리)
+    "confirm_time_s": 0.08,          # 발행 전 최소 관측 시간
+    "dynamic_confirm_time_s": 0.15,  # dynamic 분류 최소 관측 시간
+    "track_keep_time_s": 0.15,       # 미검출 시 트랙 유지 시간
     "vel_ema_alpha": 0.35,
     "max_track_speed_mps": 12.0,
     "log_detections": True,
@@ -85,8 +86,8 @@ class Track:
     vy_laser: float = 0.0
     speed: float = 0.0  # map-frame 속력 (static/dynamic 판정)
     closing_mps: float = 0.0  # +면 접근(거리 감소)
-    age: int = 1
-    missed: int = 0
+    age_s: float = 0.0
+    missed_s: float = 0.0
     matched: bool = False
 
 class IntegratedObstacleNode(Node):
@@ -116,12 +117,14 @@ class IntegratedObstacleNode(Node):
         self.speed_threshold_mps = max(
             0.0, float(self.get_parameter("speed_threshold_mps").value)
         )
-        self.publish_min_age = max(
-            1, int(self.get_parameter("publish_min_age").value)
+        self.confirm_time_s = max(
+            0.0, float(self.get_parameter("confirm_time_s").value)
         )
-        self.track_min_age = max(1, int(self.get_parameter("track_min_age").value))
-        self.track_max_missed = max(
-            1, int(self.get_parameter("track_max_missed").value)
+        self.dynamic_confirm_time_s = max(
+            0.0, float(self.get_parameter("dynamic_confirm_time_s").value)
+        )
+        self.track_keep_time_s = max(
+            0.0, float(self.get_parameter("track_keep_time_s").value)
         )
         self.vel_ema_alpha = float(
             max(0.05, min(1.0, float(self.get_parameter("vel_ema_alpha").value)))
@@ -171,8 +174,8 @@ class IntegratedObstacleNode(Node):
             f"walls={self.static_map.yaml_path} "
             f"frame={self._map_frame}←{self._laser_frame} "
             f"speed_th={self.speed_threshold_mps:.2f}m/s "
-            f"publish_age≥{self.publish_min_age} "
-            f"dyn_age≥{self.track_min_age}"
+            f"confirm≥{self.confirm_time_s:.2f}s "
+            f"dyn_confirm≥{self.dynamic_confirm_time_s:.2f}s"
         )
 
     def _lookup_laser_to_map(self):
@@ -314,7 +317,7 @@ class IntegratedObstacleNode(Node):
                     best_idx = idx
 
             if best_idx < 0:
-                track.missed += 1
+                track.missed_s += dt
                 continue
 
             det = detections[best_idx]
@@ -348,8 +351,8 @@ class IntegratedObstacleNode(Node):
                 ) / rng
             else:
                 track.closing_mps = 0.0
-            track.age += 1
-            track.missed = 0
+            track.age_s += dt
+            track.missed_s = 0.0
             track.matched = True
 
         for idx, det in enumerate(detections):
@@ -363,17 +366,19 @@ class IntegratedObstacleNode(Node):
                     laser_x=det.laser_x,
                     laser_y=det.laser_y,
                     radius=det.radius,
+                    age_s=dt,
+                    matched=True,
                 )
             )
             self._next_id += 1
 
         self._tracks = [
-            t for t in self._tracks if t.missed <= self.track_max_missed
+            t for t in self._tracks if t.missed_s <= self.track_keep_time_s
         ]
 
     @staticmethod
-    def _is_dynamic(track: Track, speed_threshold: float, track_min_age: int) -> bool:
-        return track.age >= track_min_age and track.speed >= speed_threshold
+    def _is_dynamic(track: Track, speed_threshold: float, min_age_s: float) -> bool:
+        return track.age_s >= min_age_s and track.speed >= speed_threshold
 
     def _publish_empty(self) -> None:
         delete = MarkerArray()
@@ -420,12 +425,14 @@ class IntegratedObstacleNode(Node):
         dynamic_count = 0
 
         for track in self._tracks:
-            if track.missed > 0:
+            if not track.matched:
                 continue
             # 단발/짧은 트랙은 노이즈로 보고 미발행 (너무 길면 실장애 반응 늦음)
-            if track.age < self.publish_min_age:
+            if track.age_s < self.confirm_time_s:
                 continue
-            if self._is_dynamic(track, self.speed_threshold_mps, self.track_min_age):
+            if self._is_dynamic(
+                track, self.speed_threshold_mps, self.dynamic_confirm_time_s
+            ):
                 dynamic_data.extend(
                     [
                         float(track.track_id),
@@ -479,10 +486,10 @@ class IntegratedObstacleNode(Node):
             if now_ns - self._last_detect_log_ns >= self.log_throttle_ns:
                 dyn_parts = []
                 for track in self._tracks:
-                    if track.missed > 0:
+                    if not track.matched:
                         continue
                     if self._is_dynamic(
-                        track, self.speed_threshold_mps, self.track_min_age
+                        track, self.speed_threshold_mps, self.dynamic_confirm_time_s
                     ):
                         dyn_parts.append(
                             f"id={track.track_id} "

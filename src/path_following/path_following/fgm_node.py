@@ -20,7 +20,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point, PointStamped
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, Float64
 from visualization_msgs.msg import Marker
 
 
@@ -33,37 +33,37 @@ CFG = {
     "scan_topic": "/scan",
     "laser_frame": "laser",  # 실차 (시뮬: ego_racecar/laser)
     "obstacle_topic": "/static_obstacles",
+    "dynamic_obstacle_topic": "/dynamic_obstacles",
     "fgm_enable_topic": "/planner/fgm_enable",
+    "ego_speed_topic": "/vehicle/speed_mps",
     # True면 local_planner 의 /planner/fgm_enable 이 True 일 때만 갭 계산
     "require_planner_enable": True,
-    # False면 enable 중 스캔만으로 갭 추종 (장애 목록 없어도 AVOID 유지)
-    "require_static_obstacles": False,
     "target_topic": "/fgm_target",
     "publish_debug_scan": False,
     # 스캔 전처리·갭 (알고리즘)
     # 정면(레이저 +x) 기준 ±fov_half_deg 만 사용. ≤0 이면 스캔 전체.
     # Slamtec 0~360° 스캔도 wrap 후 정면 기준으로 자름.
     "fov_half_deg": 80.0,
-    "preprocess_max_range_m": 2.0,
-    # 세이프티 버블: 최근접 스캔/static 장애에 각도 팽창 (차폭 여유). 지금은 최소.
-    "bubble_radius_m": 0.15,
-    "obstacle_bubble_trigger_dist_m": 0.7,
+    # 고속에선 멀리까지 봐야 갭이 미리 보임 (목표점 거리보다 넉넉하게)
+    "scan_max_range_m": 4.0,
+    # 세이프티 버블: 장애 각도 섹터를 차폭+여유만큼 통째로 막는다.
+    # 차 반폭 0.15 m + 여유 → 이 값이 작으면 갭이 거의 안 갈라져 회피가 소극적.
+    "bubble_radius_m": 0.30,
     "gap_threshold_primary_m": 1.5,
     "gap_threshold_fallback_m": 0.5,
-    "min_gap_width_bins": 4,
+    # 빔 개수가 아니라 각폭 기준 (라이다 분해능 바뀌어도 동일 동작)
+    "min_gap_width_deg": 6.0,
     "gap_hysteresis_len_ratio": 0.78,
-    # 목표점 (레이저 프레임, 갭 방향 거리 [m])
-    "target_distance_m": 0.5,
-    "gap_lateral_gain": 1.0,
-    # ≤0 → 목표 각도 클램프 없음 (FOV 안 갭 각도 그대로)
-    "max_avoid_heading_deg": 0.0,
-    # 목표 스무딩
-    "target_smooth_alpha": 0.36,
-    "target_max_step_m": 0.17,
-    "max_raw_target_step_m": 0.6,
-    "target_smooth_beta": 0.46,
-    "target_output_damping": 0.14,
-    "target_out_max_step_m": 0.13,
+    # 갭 안에서 목표 각도를 가장자리로부터 얼마나 안쪽에 둘지.
+    # 버블이 이미 차폭+여유를 먹고 있어 크게 줄 필요 없다 (각도라서 멀수록 과해짐).
+    "gap_edge_inset_deg": 3.0,
+    # 목표점 거리 = clamp(ego_speed * lead_time, min, max) [m, 레이저 프레임]
+    "target_lead_time_s": 0.55,
+    "target_min_m": 0.9,
+    "target_max_m": 3.0,
+    # 목표 스무딩: EMA 1단 + 이동 속도 제한 [m/s] (고속일수록 자동 완화)
+    "target_smooth_alpha": 0.5,
+    "target_max_rate_mps": 2.5,
     # RViz V자 갭 마커 (주행과 무관, 표시만)
     "gap_marker_arm_scale": 1.5,
     "gap_marker_max_arm_m": 2.0,
@@ -98,14 +98,23 @@ class FGMNode(Node):
         self.require_planner_enable = _param_bool(
             self.get_parameter("require_planner_enable").value
         )
-        self.require_static_obstacles = _param_bool(
-            self.get_parameter("require_static_obstacles").value
-        )
         fgm_en_t = str(self.get_parameter("fgm_enable_topic").value)
 
         self.scan_sub = self.create_subscription(LaserScan, scan_t, self.scan_callback, 10)
         self.obstacle_sub = self.create_subscription(
             Float32MultiArray, obs_t, self.obstacle_callback, 10
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            str(self.get_parameter("dynamic_obstacle_topic").value),
+            self.dynamic_obstacle_callback,
+            10,
+        )
+        self.create_subscription(
+            Float64,
+            str(self.get_parameter("ego_speed_topic").value),
+            self.speed_callback,
+            10,
         )
         self._fgm_enabled = not self.require_planner_enable
         if self.require_planner_enable:
@@ -117,10 +126,10 @@ class FGMNode(Node):
         self.debug_scan_pub = self.create_publisher(LaserScan, "/fgm_debug_scan", 10)
         self.gap_marker_pub = self.create_publisher(Marker, "/fgm_gap_marker", 10)
 
-        self.preprocess_dist = float(self.get_parameter("preprocess_max_range_m").value)
+        self.preprocess_dist = float(self.get_parameter("scan_max_range_m").value)
         self.bubble_radius = float(self.get_parameter("bubble_radius_m").value)
-        self.obstacle_bubble_trigger_dist_m = float(
-            self.get_parameter("obstacle_bubble_trigger_dist_m").value
+        self.gap_edge_inset_rad = math.radians(
+            max(0.0, float(self.get_parameter("gap_edge_inset_deg").value))
         )
         self.publish_debug_scan = _param_bool(self.get_parameter("publish_debug_scan").value)
 
@@ -129,33 +138,26 @@ class FGMNode(Node):
         self._use_full_scan_fov = float(self.get_parameter("fov_half_deg").value) <= 0.0
         self.gap_thr_primary = float(self.get_parameter("gap_threshold_primary_m").value)
         self.gap_thr_fallback = float(self.get_parameter("gap_threshold_fallback_m").value)
-        self.target_dist_default = float(self.get_parameter("target_distance_m").value)
-        self.min_gap_bins = max(2, int(self.get_parameter("min_gap_width_bins").value))
+        self.target_lead_time_s = max(
+            0.0, float(self.get_parameter("target_lead_time_s").value)
+        )
+        self.target_min_m = max(0.2, float(self.get_parameter("target_min_m").value))
+        self.target_max_m = max(
+            self.target_min_m, float(self.get_parameter("target_max_m").value)
+        )
+        self.min_gap_width_rad = math.radians(
+            max(0.0, float(self.get_parameter("min_gap_width_deg").value))
+        )
+        self.min_gap_bins = 2
         self.hyst_ratio = min(
             0.999,
             max(0.3, float(self.get_parameter("gap_hysteresis_len_ratio").value)),
         )
         self.smooth_alpha = min(
-            1.0, max(0.0, float(self.get_parameter("target_smooth_alpha").value))
+            1.0, max(0.05, float(self.get_parameter("target_smooth_alpha").value))
         )
-        self.max_step_m = max(0.0, float(self.get_parameter("target_max_step_m").value))
-        self.max_raw_step_m = max(0.0, float(self.get_parameter("max_raw_target_step_m").value))
-        self.smooth_beta = min(
-            1.0, max(0.0, float(self.get_parameter("target_smooth_beta").value))
-        )
-        self.output_damping = min(
-            0.95, max(0.0, float(self.get_parameter("target_output_damping").value))
-        )
-        self.out_max_step_m = max(0.0, float(self.get_parameter("target_out_max_step_m").value))
-
-        self.gap_lateral_gain = min(
-            1.0, max(0.05, float(self.get_parameter("gap_lateral_gain").value))
-        )
-        _max_hdg = float(self.get_parameter("max_avoid_heading_deg").value)
-        self.max_avoid_heading_rad = (
-            None
-            if _max_hdg <= 0.0
-            else math.radians(max(5.0, min(179.0, _max_hdg)))
+        self.target_max_rate_mps = max(
+            0.0, float(self.get_parameter("target_max_rate_mps").value)
         )
 
         self.gap_marker_arm_scale = max(
@@ -165,30 +167,44 @@ class FGMNode(Node):
         self.gap_marker_max_arm_m = _gmax if _gmax > 0.0 else None
 
         self.latest_obstacles: list = []
+        self.latest_dynamic_obstacles: list = []
         self._last_gap_center_idx: int | None = None
         self._filt_x: float | None = None
         self._filt_y: float | None = None
-        self._out_x: float | None = None
-        self._out_y: float | None = None
-        self._prev_pub_x: float | None = None
-        self._prev_pub_y: float | None = None
-        self._last_raw_x: float | None = None
-        self._last_raw_y: float | None = None
+        self._ego_speed = 0.0
+        self._last_scan_ns: int | None = None
 
         self.get_logger().info(
             f"FGM started (sim algorithm) | frame={self._laser_frame}, "
-            f"target={self.target_dist_default}m, "
-            f"preprocess={self.preprocess_dist}m, "
-            f"bubble={self.bubble_radius}m≤{self.obstacle_bubble_trigger_dist_m}m, "
+            f"target=v*{self.target_lead_time_s}s "
+            f"[{self.target_min_m}~{self.target_max_m}]m, "
+            f"scan_max={self.preprocess_dist}m, "
+            f"bubble={self.bubble_radius}m, "
+            f"edge_inset={math.degrees(self.gap_edge_inset_rad):.0f}°, "
             f"planner_enable={self.require_planner_enable}({fgm_en_t}), "
-            f"require_obs={self.require_static_obstacles}, "
             f"fov={'FULL' if self._use_full_scan_fov else f'±{math.degrees(self.fov_angle):.0f}°'}, "
-            f"hdg_limit={'OFF' if self.max_avoid_heading_rad is None else f'{math.degrees(self.max_avoid_heading_rad):.0f}°'}, "
             f"marker scale={self.gap_marker_arm_scale} max={_gmax}m"
         )
 
     def obstacle_callback(self, msg: Float32MultiArray) -> None:
         self.latest_obstacles = list(msg.data)
+
+    def dynamic_obstacle_callback(self, msg: Float32MultiArray) -> None:
+        self.latest_dynamic_obstacles = list(msg.data)
+
+    def _obstacle_sectors(self) -> list[tuple[float, float, float]]:
+        """차단할 장애물 (x, y, radius) 목록 — 정적 [id,x,y,r], 동적 [id,x,y,vx,vy,r]."""
+        out: list[tuple[float, float, float]] = []
+        s = self.latest_obstacles
+        for i in range(len(s) // 4):
+            out.append((float(s[4 * i + 1]), float(s[4 * i + 2]), float(s[4 * i + 3])))
+        d = self.latest_dynamic_obstacles
+        for i in range(len(d) // 6):
+            out.append((float(d[6 * i + 1]), float(d[6 * i + 2]), float(d[6 * i + 5])))
+        return out
+
+    def speed_callback(self, msg: Float64) -> None:
+        self._ego_speed = abs(float(msg.data))
 
     def fgm_enable_callback(self, msg: Bool) -> None:
         was = self._fgm_enabled
@@ -201,9 +217,6 @@ class FGMNode(Node):
         if not keep_gap_hysteresis:
             self._last_gap_center_idx = None
         self._filt_x = self._filt_y = None
-        self._out_x = self._out_y = None
-        self._prev_pub_x = self._prev_pub_y = None
-        self._last_raw_x = self._last_raw_y = None
 
     def _publish_gap_marker_delete(self) -> None:
         m = Marker()
@@ -213,17 +226,6 @@ class FGMNode(Node):
         m.id = 0
         m.action = Marker.DELETE
         self.gap_marker_pub.publish(m)
-
-    def _clamp_raw_target(self, tx: float, ty: float) -> tuple[float, float]:
-        if self.max_raw_step_m <= 0.0 or self._last_raw_x is None:
-            return tx, ty
-        dx, dy = tx - self._last_raw_x, ty - self._last_raw_y
-        d = math.hypot(dx, dy)
-        if d > self.max_raw_step_m and d > 1e-9:
-            s = self.max_raw_step_m / d
-            tx = self._last_raw_x + dx * s
-            ty = self._last_raw_y + dy * s
-        return tx, ty
 
     def _select_gap(self, gaps: list, max_len: int) -> np.ndarray | None:
         if not gaps:
@@ -248,68 +250,43 @@ class FGMNode(Node):
 
         return max(wide, key=lambda g: len(g))
 
-    def _first_stage_smooth(self, tx: float, ty: float) -> tuple[float, float]:
-        """1차 EMA + 스텝 제한 (내부 상태 _filt_*)."""
+    def _smooth_target(self, tx: float, ty: float, dt: float) -> tuple[float, float]:
+        """EMA 1단 + 이동 속도 제한.
+
+        제한을 [m/frame] 대신 [m/s] 로 두어 스캔 Hz 변화에 영향받지 않고,
+        고속 주행 시 갭이 빨리 흐르는 만큼 허용치도 함께 커진다.
+        """
         if self._filt_x is None:
             self._filt_x, self._filt_y = tx, ty
             return float(tx), float(ty)
 
         px, py = self._filt_x, self._filt_y
         a = self.smooth_alpha
-        if a <= 0.0:
-            nx, ny = tx, ty
-        else:
-            nx = px + a * (tx - px)
-            ny = py + a * (ty - py)
+        nx = px + a * (tx - px)
+        ny = py + a * (ty - py)
 
+        max_step = (self.target_max_rate_mps + self._ego_speed) * max(dt, 1e-3)
         dx, dy = nx - px, ny - py
         dist = math.hypot(dx, dy)
-        if self.max_step_m > 0.0 and dist > self.max_step_m and dist > 1e-9:
-            s = self.max_step_m / dist
+        if max_step > 0.0 and dist > max_step:
+            s = max_step / dist
             nx = px + dx * s
             ny = py + dy * s
 
         self._filt_x, self._filt_y = nx, ny
         return float(nx), float(ny)
 
-    def _second_stage_and_damp(self, fx: float, fy: float) -> tuple[float, float]:
-        """2차 EMA + 출력 감쇠 + 출력 스텝 제한. 발행 좌표는 여기서 확정."""
-        b = self.smooth_beta
-        if b <= 0.0 or self._out_x is None:
-            ox, oy = fx, fy
-            self._out_x, self._out_y = ox, oy
-        else:
-            self._out_x += b * (fx - self._out_x)
-            self._out_y += b * (fy - self._out_y)
-            ox, oy = self._out_x, self._out_y
-
-        dmp = self.output_damping
-        if dmp > 0.0 and self._prev_pub_x is not None and self._prev_pub_y is not None:
-            ox -= dmp * (ox - self._prev_pub_x)
-            oy -= dmp * (oy - self._prev_pub_y)
-
-        if self.out_max_step_m > 0.0 and self._prev_pub_x is not None and self._prev_pub_y is not None:
-            dx, dy = ox - self._prev_pub_x, oy - self._prev_pub_y
-            dist = math.hypot(dx, dy)
-            if dist > self.out_max_step_m and dist > 1e-9:
-                s = self.out_max_step_m / dist
-                ox = self._prev_pub_x + dx * s
-                oy = self._prev_pub_y + dy * s
-
-        self._out_x, self._out_y = ox, oy
-        self._prev_pub_x, self._prev_pub_y = ox, oy
-        return float(ox), float(oy)
-
     def scan_callback(self, scan_msg: LaserScan) -> None:
         # 갭 마커는 항상 계산·발행. /fgm_target 은 planner enable 일 때만.
         publish_target = (not self.require_planner_enable) or self._fgm_enabled
-        if (
-            self.require_static_obstacles
-            and len(self.latest_obstacles) < 4
-            and publish_target
-        ):
-            self._reset_fgm_filter_state(keep_gap_hysteresis=True)
-            # 마커는 스캔만으로 계속 계산
+
+        now_ns = self.get_clock().now().nanoseconds
+        dt = 0.025
+        if self._last_scan_ns is not None:
+            d = (now_ns - self._last_scan_ns) * 1e-9
+            if 0.0 < d < 1.0:
+                dt = d
+        self._last_scan_ns = now_ns
 
         ranges = np.array(scan_msg.ranges, dtype=np.float64)
         ranges = np.where(np.isinf(ranges), self.preprocess_dist, ranges)
@@ -339,30 +316,21 @@ class FGMNode(Node):
             min_dist_idx = int(valid_indices[np.argmin(ranges[valid_indices])])
             min_dist = float(ranges[min_dist_idx])
             if min_dist < self.preprocess_dist:
-                self.create_bubble(ranges, min_dist_idx, min_dist, angle_inc)
+                self._block_sector(
+                    ranges, wrapped, float(wrapped[min_dist_idx]), min_dist, 0.0
+                )
 
-        if len(self.latest_obstacles) > 0:
-            num_obs = len(self.latest_obstacles) // 4
-            for i in range(num_obs):
-                obs_x = self.latest_obstacles[4 * i + 1]
-                obs_y = self.latest_obstacles[4 * i + 2]
-                obs_r = self.latest_obstacles[4 * i + 3]
-                obs_dist = math.sqrt(obs_x**2 + obs_y**2)
-                if obs_dist > self.obstacle_bubble_trigger_dist_m:
-                    continue
-                obs_angle = math.atan2(obs_y, obs_x)
-                if (not self._use_full_scan_fov) and abs(obs_angle) > self.fov_angle:
-                    continue
-                obs_idx = int(np.argmin(np.abs(wrapped - _wrap_pi(obs_angle))))
-                if 0 <= obs_idx < len(ranges) and fov_mask[obs_idx]:
-                    effective_radius = self.bubble_radius + obs_r
-                    self.create_bubble(
-                        ranges,
-                        obs_idx,
-                        obs_dist,
-                        angle_inc,
-                        radius_override=effective_radius,
-                    )
+        # 검출된 장애물(정적+동적)은 거리와 무관하게 각도 섹터를 통째로 차단.
+        # 거리 임계만 쓰면 gap_threshold 보다 먼 장애물이 "빈 공간"으로 남아
+        # 갭 중심이 거의 안 밀리고 회피가 소극적으로 나온다.
+        for obs_x, obs_y, obs_r in self._obstacle_sectors():
+            obs_dist = math.hypot(obs_x, obs_y)
+            if obs_dist < 1e-3 or obs_dist > self.preprocess_dist:
+                continue
+            obs_angle = math.atan2(obs_y, obs_x)
+            if (not self._use_full_scan_fov) and abs(obs_angle) > self.fov_angle + 0.3:
+                continue
+            self._block_sector(ranges, wrapped, obs_angle, obs_dist, obs_r)
 
         # 인덱스 공간이 아니라 정면 기준 각도 순서로 갭 탐색
         # (Slamtec 0~360°에서 ±80°가 인덱스상 두 조각으로 갈라지는 문제 방지)
@@ -372,6 +340,7 @@ class FGMNode(Node):
         order = np.argsort(wrapped[fov_idx])
         sorted_orig = fov_idx[order]
         work = ranges[sorted_orig].copy()
+        work_angles = wrapped[sorted_orig]
 
         gap_threshold = self.gap_thr_primary
         threshold_indices = np.where(work > gap_threshold)[0]
@@ -386,6 +355,7 @@ class FGMNode(Node):
         if not gaps:
             return
 
+        self.min_gap_bins = max(2, int(self.min_gap_width_rad / abs(angle_inc)))
         max_len = max(len(g) for g in gaps)
         chosen = self._select_gap(gaps, max_len)
         if chosen is None or len(chosen) == 0:
@@ -395,12 +365,10 @@ class FGMNode(Node):
         center_work = int(chosen[len(chosen) // 2])
         gap_start_orig = int(sorted_orig[int(chosen[0])])
         gap_end_orig = int(sorted_orig[int(chosen[-1])])
-        best_orig = int(sorted_orig[center_work])
         self._last_gap_center_idx = center_work
 
         gap_start_angle = float(wrapped[gap_start_orig])
         gap_end_angle = float(wrapped[gap_end_orig])
-        raw_angle = float(wrapped[best_orig])
         viz_stamp = self.get_clock().now().to_msg()
 
         self.publish_gap_marker_angles(
@@ -428,20 +396,34 @@ class FGMNode(Node):
         if not publish_target:
             return
 
-        eff_angle = raw_angle * self.gap_lateral_gain
-        ma = self.max_avoid_heading_rad
-        if ma is not None and abs(eff_angle) > ma:
-            eff_angle = math.copysign(ma, eff_angle)
+        # 갭 "중심"이 아니라 갭 안에서 정면(0°)에 가장 가까운 각도를 노린다.
+        # 버블이 이미 차폭+여유를 먹고 있으므로 가장자리에서 inset 만 들어가면
+        # 장애물을 확실히 비껴가면서도 필요 이상으로 크게 틀지 않는다.
+        lo = min(gap_start_angle, gap_end_angle)
+        hi = max(gap_start_angle, gap_end_angle)
+        inset = self.gap_edge_inset_rad
+        if hi - lo > 2.0 * inset:
+            lo += inset
+            hi -= inset
+        else:
+            lo = hi = 0.5 * (lo + hi)
+        eff_angle = min(hi, max(lo, 0.0))
 
-        target_dist = self.target_dist_default
+        # 목표점을 속도에 비례해 앞으로: 고속에서 0.5 m 앞은 조향이 즉시 되감긴다
+        target_dist = min(
+            self.target_max_m,
+            max(self.target_min_m, self._ego_speed * self.target_lead_time_s),
+        )
+        # 그 방향으로 실제 뚫린 거리보다 멀리 찍지 않도록 제한
+        aim_orig = int(sorted_orig[int(np.argmin(np.abs(work_angles - eff_angle)))])
+        gap_range = float(ranges[aim_orig])
+        if gap_range > 0.1:
+            target_dist = min(target_dist, max(self.target_min_m, gap_range * 0.9))
+
         target_x = target_dist * math.cos(eff_angle)
         target_y = target_dist * math.sin(eff_angle)
 
-        rx, ry = self._clamp_raw_target(target_x, target_y)
-        self._last_raw_x, self._last_raw_y = rx, ry
-
-        fx, fy = self._first_stage_smooth(rx, ry)
-        ox, oy = self._second_stage_and_damp(fx, fy)
+        ox, oy = self._smooth_target(target_x, target_y, dt)
 
         point_msg = PointStamped()
         point_msg.header.stamp = viz_stamp
@@ -530,22 +512,25 @@ class FGMNode(Node):
             stamp_msg,
         )
 
-    def create_bubble(
+    def _block_sector(
         self,
         ranges: np.ndarray,
-        center_idx: int,
+        wrapped: np.ndarray,
+        center_angle: float,
         dist: float,
-        angle_inc: float,
-        radius_override: float | None = None,
+        obstacle_radius: float,
     ) -> None:
-        radius = radius_override if radius_override is not None else self.bubble_radius
-        safe_theta = math.atan(radius / (dist + 0.001))
-        idx_radius = int(safe_theta / angle_inc)
+        """장애물 각폭 + 차폭 여유만큼 각도 섹터를 0 으로.
 
-        start_idx = max(0, center_idx - idx_radius)
-        end_idx = min(len(ranges), center_idx + idx_radius)
-
-        ranges[start_idx:end_idx] = 0.0
+        인덱스 창이 아니라 wrap 각도 마스크라 0/360° 경계에서도 잘리지 않는다.
+        """
+        half_width = obstacle_radius + self.bubble_radius
+        if dist <= half_width:
+            half_angle = math.pi / 2.0
+        else:
+            half_angle = math.asin(half_width / dist)
+        blocked = np.abs(_wrap_pi_np(wrapped - center_angle)) <= half_angle
+        ranges[blocked] = 0.0
 
 
 def main(args=None):

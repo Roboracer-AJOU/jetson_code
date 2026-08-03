@@ -49,7 +49,7 @@ def resolve_map_yaml(map_name: str, map_dir: str = "") -> str:
 
 CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
-    "map_name": "cartographer_map_20260730_220058_rosmap.yaml",
+    "map_name": "cartographer_map_20260803_202601.yaml",
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",  # 실차 (시뮬: ego_racecar/laser)
@@ -65,11 +65,11 @@ CFG = {
     "max_obstacle_size_m": 0.85,
     "min_obstacle_size_m": 0.14,
     "max_obstacle_range_m": 8.0,
-    "max_obstacle_lateral_m": 0.85,
-    # 단발 잔차 깜빡임 완화 (너무 크면 실장애 반응 지연)
-    "persist_min_hits": 4,
+    "max_obstacle_lateral_m": 1.40,
+    # 단발 잔차 깜빡임 완화 — 스캔 Hz와 무관하게 "초" 기준
     "persist_match_m": 0.55,
-    "persist_max_missed": 2,
+    "confirm_time_s": 0.08,  # 발행 전 최소 관측 시간
+    "keep_time_s": 0.10,     # 미검출 시 유지 시간
     "log_detections": True,
     "log_throttle_sec": 2.0,
 }
@@ -179,15 +179,11 @@ class StaticObstacleNode(Node):
         self.max_obstacle_lateral_m = max(
             0.2, float(self.get_parameter("max_obstacle_lateral_m").value)
         )
-        self.persist_min_hits = max(
-            1, int(self.get_parameter("persist_min_hits").value)
-        )
         self.persist_match_m = max(
             0.05, float(self.get_parameter("persist_match_m").value)
         )
-        self.persist_max_missed = max(
-            0, int(self.get_parameter("persist_max_missed").value)
-        )
+        self.confirm_time_s = max(0.0, float(self.get_parameter("confirm_time_s").value))
+        self.keep_time_s = max(0.0, float(self.get_parameter("keep_time_s").value))
         self.tf_timeout = float(self.get_parameter("tf_timeout_sec").value)
         self.log_throttle_ns = int(
             max(0.1, float(self.get_parameter("log_throttle_sec").value)) * 1e9
@@ -195,8 +191,10 @@ class StaticObstacleNode(Node):
         self._log_detections = param_bool(self.get_parameter("log_detections").value)
         self._last_detect_log_ns = 0
         self._last_tf_warn_ns = 0
-        # [(x, y, r, hits, missed), ...]
+        # [(x, y, r, age_s, missed_s), ...]
         self._persist: list[list[float]] = []
+        self._last_scan_ns: int | None = None
+        self._dt: float = 0.025
 
         map_yaml = resolve_map_yaml(
             str(self.get_parameter("map_name").value),
@@ -282,6 +280,13 @@ class StaticObstacleNode(Node):
         return clusters
 
     def listener_callback(self, msg: LaserScan) -> None:
+        scan_ns = self.get_clock().now().nanoseconds
+        if self._last_scan_ns is not None:
+            dt = (scan_ns - self._last_scan_ns) * 1e-9
+            if 0.0 < dt < 1.0:
+                self._dt = dt
+        self._last_scan_ns = scan_ns
+
         ranges = np.asarray(msg.ranges, dtype=np.float64)
         if ranges.size == 0:
             self._publish_empty_obstacles()
@@ -332,10 +337,8 @@ class StaticObstacleNode(Node):
         if not clusters:
             # 검출 없음 — missed만 증가시키도록 빈 raw로 persistence 갱신
             for p in self._persist:
-                p[4] += 1.0
-            self._persist = [
-                p for p in self._persist if p[4] <= float(self.persist_max_missed)
-            ]
+                p[4] += self._dt
+            self._persist = [p for p in self._persist if p[4] <= self.keep_time_s]
             if not self._persist:
                 self._publish_empty_obstacles()
                 return
@@ -350,7 +353,7 @@ class StaticObstacleNode(Node):
             final_obstacle_count = 0
             nearest_logic = None
             for oid, p in enumerate(self._persist):
-                if p[3] < float(self.persist_min_hits):
+                if p[3] < self.confirm_time_s:
                     continue
                 logic_x, logic_y, radius = p[0], p[1], p[2]
                 obstacle_data_list.extend([float(oid), logic_x, logic_y, radius])
@@ -417,7 +420,7 @@ class StaticObstacleNode(Node):
 
         # 연속 히트 persistence — 단발 노이즈 깜빡임 억제
         for p in self._persist:
-            p[4] += 1.0  # missed++
+            p[4] += self._dt  # 미검출 누적 시간
         used: set[int] = set()
         for dx, dy, dr in raw_dets:
             best_i = -1
@@ -432,18 +435,16 @@ class StaticObstacleNode(Node):
             if best_i >= 0:
                 p = self._persist[best_i]
                 p[0], p[1], p[2] = dx, dy, dr
-                p[3] += 1.0
+                p[3] += self._dt
                 p[4] = 0.0
                 used.add(best_i)
             else:
-                self._persist.append([dx, dy, dr, 1.0, 0.0])
+                self._persist.append([dx, dy, dr, self._dt, 0.0])
 
-        self._persist = [
-            p for p in self._persist if p[4] <= float(self.persist_max_missed)
-        ]
+        self._persist = [p for p in self._persist if p[4] <= self.keep_time_s]
 
         for oid, p in enumerate(self._persist):
-            if p[3] < float(self.persist_min_hits):
+            if p[3] < self.confirm_time_s:
                 continue
             logic_x, logic_y, radius = p[0], p[1], p[2]
             obstacle_data_list.extend([float(oid), logic_x, logic_y, radius])

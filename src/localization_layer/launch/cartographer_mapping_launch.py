@@ -54,9 +54,34 @@ def _build_cartographer_stack(context):
 
   imu_topic_str = imu_topic.perform(context)
   scan_topic_str = scan_topic.perform(context)
+  odom_topic_str = odom_topic.perform(context)
 
   return [
-    LogInfo(msg='=== mapping: LiDAR only (no IMU/odom), starting Cartographer ==='),
+    LogInfo(msg=(
+      '=== mapping: LiDAR main + weak wheel odom (/odom) + IMU(gyro) ==='
+    )),
+    Node(
+      package='localization_layer',
+      executable='vesc_wheel_odom.py',
+      name='vesc_wheel_odom',
+      output='screen',
+      parameters=[{
+        'wheelbase_m': 0.33,
+        'speed_topic': '/vehicle/speed_mps',
+        'servo_feedback_deg_topic': '/esp32/target_angle_deg',
+        'servo_command_deg_topic': '/esp32/servo_command_deg',
+        'drive_topic': '/drive',
+        'odom_topic': odom_topic_str,
+        'center_servo_deg': 90.0,
+        'servo_span_deg': 40.0,
+        'max_steer_rad': 0.45,
+        'steer_scale': 1.0,
+        'invert_steer': False,
+        'use_steer_for_yaw': False,
+        'min_speed_for_yaw_mps': 0.05,
+        'publish_hz': 50.0,
+      }],
+    ),
     Node(
       package='cartographer_ros',
       executable='cartographer_node',
@@ -68,7 +93,7 @@ def _build_cartographer_stack(context):
       ],
       remappings=[
         ('imu', imu_topic_str),
-        ('odom', '/unused_odom'),
+        ('odom', odom_topic_str),
         ('scan', scan_topic_str),
       ],
     ),
@@ -271,7 +296,7 @@ def generate_launch_description():
     DeclareLaunchArgument(
       'odom_topic',
       default_value='/odom',
-      description='Unused (use_odometry=false); remapped away',
+      description='Wheel odometry topic (vesc_wheel_odom -> Cartographer, weak aux)',
     ),
     DeclareLaunchArgument(
       'scan_topic',
@@ -351,7 +376,7 @@ def generate_launch_description():
     DeclareLaunchArgument(
       'use_wheel_odom_tf',
       default_value='false',
-      description='Must stay false: Cartographer mapping does not use wheel odom',
+      description='Must stay false: wheel odom is /odom topic only (no TF from tf_manager)',
     ),
     DeclareLaunchArgument(
       'imu_startup_delay_sec',

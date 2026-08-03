@@ -387,7 +387,7 @@ source install/setup.bash
 | `stanley_waypoint_follow_node` | `max_steering_angle` ±40°, `stanley_k` 1.5, `max_drive_speed` 1.5 |
 | `local_planner_node` | `avoid_on_m` 1.8, `avoid_pass_rear_x_m` -0.35, 직진 leg 30×0.15 m |
 | `drive_strategy_node` | 직선 `speed_straight_mul` 2.0, 곡선 `speed_curve_mul` 0.5 |
-| `fgm_node` | `target_distance_m` 0.5, `max_avoid_heading_deg` 45 |
+| `fgm_node` | 목표점 = `target_lead_time_s` 0.55 × 속도 (0.9~3.0 m), `bubble_radius_m` 0.30, `gap_edge_inset_deg` 3 |
 | `static_obstacle_node` | `max_obstacle_size_m` 0.6, `min_obstacle_size_m` 0.1 |
 | `control_node` | `max_duty` 0.20, `invert_steer` false |
 
@@ -429,10 +429,9 @@ ros2 launch localization_layer cartographer_localization_launch.py
 주행
 source /opt/ros/humble/setup.bash
 source /home/nvidia/f1tenth_ajou/install/setup.bash
-
 ros2 launch path_following path_follow_stanley_launch.py
+ros2 launch path_following path_follow_static_dynamic_avoid_launch.py
 
-ros2 launch path_follow_static_dynamic_avoid_launch.py
 
 
 컨트롤

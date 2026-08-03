@@ -33,7 +33,7 @@ from path_following.track_sliding import (
 # ============================================================
 CFG = {
     "csv_path": "",
-    "reverse_track_direction": False,  # 200005 raceline: False (True면 hdg_err ~140° 반대)
+    "reverse_track_direction": True,  # 200005 raceline: False (True면 hdg_err ~140° 반대)
     "path_window_size": 140,
     "path_anchor_half_width": 120,
     "map_frame": "map",
@@ -51,13 +51,26 @@ CFG = {
     "tracked_path_topic": "/waypoint_tracked_path",
     "timer_period_ms": 30,
     "max_steering_angle": 0.6981,  # ±40° — control_node / ESP S±1.0 과 동일
-    "steering_smooth_alpha": 0.35,
+    "steering_smooth_alpha": 0.45,
     "wheelbase": 0.33,
     "stanley_k": 0.5,
     "stanley_softening": 0.12,
     # |cte|가 클수록 heading_error 가중치↓ (직선 평행주행 시 상쇄 방지)
     "stanley_heading_cte_blend_m": 0.08,
     "stanley_heading_min_weight": 0.25,
+    # LOCAL_PATH(회피) 전용.
+    # heading_gain 은 "경로 헤딩 오차 → 조향" 배율. FGM 각도가 이미 필요한
+    # 회피량을 담고 있어서 1.0 을 넘기면 목표점을 지나쳐 과회피가 된다.
+    # 목표점 추종(pure pursuit) 등가 게인은 2L/Ld ≈ 0.7 수준.
+    "local_path_stanley_k": 1.0,
+    "local_path_heading_gain": 0.8,
+    "local_path_cte_speed_cap_mps": 1.2,  # 고속에서 cte_term 약화 방지
+    "local_path_lookahead_m": 0.70,      # heading 기준을 앞쪽 경로로
+    "local_path_steering_smooth_alpha": 0.70,
+    "local_path_steering_rate_limit_radps": 8.0,
+    # 횡가속 한계로 조향 상한 (≤0 이면 끔). 고속에서 물리적으로 불가능한
+    # 조향을 명령해 슬라이드/스핀 나는 것을 막는다. 저속에서는 걸리지 않음.
+    "max_lateral_accel_mps2": 7.0,
     # 곡률 피드포워드: δ = δ_ff(κ) + Stanley. 직선용 stanley_k 는 유지.
     "enable_steer_ff": True,
     "ff_gain": 1.3,              # δ_ff = ff_gain * ff_sign * atan(L·κ)
@@ -67,7 +80,7 @@ CFG = {
     "stanley_debug_log_hz": 2.0,
     "status_log_hz": 2.0,
     "planner_gate_stale_sec": 0.15,  # override False 미수신 시 빠르게 CSV 복귀
-    "steering_rate_limit_radps": 5.0,
+    "steering_rate_limit_radps": 6.5,
     "publish_tracked_path": True,
 }
 
@@ -166,6 +179,27 @@ class StanleyWaypointFollowNode(Node):
         self.stanley_heading_min_weight = max(
             0.0,
             min(1.0, float(self.get_parameter("stanley_heading_min_weight").value)),
+        )
+        self.local_path_stanley_k = max(
+            0.05, float(self.get_parameter("local_path_stanley_k").value)
+        )
+        self.local_path_heading_gain = max(
+            0.1, float(self.get_parameter("local_path_heading_gain").value)
+        )
+        self.local_path_cte_speed_cap_mps = max(
+            0.2, float(self.get_parameter("local_path_cte_speed_cap_mps").value)
+        )
+        self.local_path_lookahead_m = max(
+            0.0, float(self.get_parameter("local_path_lookahead_m").value)
+        )
+        self.local_path_steering_smooth_alpha = float(
+            self.get_parameter("local_path_steering_smooth_alpha").value
+        )
+        self.local_path_steering_rate_limit_radps = max(
+            0.1, float(self.get_parameter("local_path_steering_rate_limit_radps").value)
+        )
+        self.max_lateral_accel_mps2 = float(
+            self.get_parameter("max_lateral_accel_mps2").value
         )
         self.enable_steer_ff = param_bool(self.get_parameter("enable_steer_ff").value)
         self.ff_gain = float(self.get_parameter("ff_gain").value)
@@ -421,36 +455,51 @@ class StanleyWaypointFollowNode(Node):
         ax, ay = path[best_i]
         bx, by = path[min(best_i + 1, len(path) - 1)]
 
-        path_yaw = math.atan2(by - ay, bx - ax)
+        closest_yaw = math.atan2(by - ay, bx - ax)
+        path_yaw = closest_yaw
+
+        # LOCAL_PATH: 최근접이 아니라 전방 lookahead 구간의 헤딩을 따라 강하게 추종
+        if mode == "LOCAL_PATH" and self.local_path_lookahead_m > 1e-3:
+            path_yaw = self._path_yaw_at_lookahead(
+                path, best_i, best_qx, best_qy, self.local_path_lookahead_m
+            )
 
         heading_error = wrap_pi(path_yaw - yaw)
 
         dx = px - best_qx
         dy = py - best_qy
 
-        # CTE>0: 경로 기준 오른쪽 (ROS map +y=좌)
-        right_x = math.sin(path_yaw)
-        right_y = -math.cos(path_yaw)
+        # CTE는 최근접 세그먼트 기준으로 유지
+        right_x = math.sin(closest_yaw)
+        right_y = -math.cos(closest_yaw)
         cte = dx * right_x + dy * right_y
 
-        cte_term = math.atan2(
-            self.stanley_k * cte,
-            abs(speed) + self.stanley_softening,
-        )
-
-        cte_abs = abs(cte)
-        hdg_w = max(
-            self.stanley_heading_min_weight,
-            1.0 - cte_abs / self.stanley_heading_cte_blend_m,
-        )
-        # 조향 부호 (실차 ESP 서보 실측과 동일, 추가 반전 없음):
-        #   +steering = 좌, -steering = 우
-        # cte>0(경로 오른쪽) → 좌회전(+)으로 복귀
-        heading_term = hdg_w * heading_error
+        if mode == "LOCAL_PATH":
+            k = self.local_path_stanley_k
+            eff_speed = min(abs(speed), self.local_path_cte_speed_cap_mps)
+            cte_term = math.atan2(
+                k * cte,
+                eff_speed + self.stanley_softening,
+            )
+            heading_term = self.local_path_heading_gain * heading_error
+        else:
+            cte_term = math.atan2(
+                self.stanley_k * cte,
+                abs(speed) + self.stanley_softening,
+            )
+            cte_abs = abs(cte)
+            hdg_w = max(
+                self.stanley_heading_min_weight,
+                1.0 - cte_abs / self.stanley_heading_cte_blend_m,
+            )
+            # 조향 부호 (실차 ESP 서보 실측과 동일, 추가 반전 없음):
+            #   +steering = 좌, -steering = 우
+            # cte>0(경로 오른쪽) → 좌회전(+)으로 복귀
+            heading_term = hdg_w * heading_error
 
         kappa_used = 0.0
         ff_term = 0.0
-        if self.enable_steer_ff:
+        if self.enable_steer_ff and mode != "LOCAL_PATH":
             kappa_used = self._lookahead_curvature(path, best_i)
             # 자전거 모델: δ_ff = atan(L·κ). +κ(좌로 휨) → +조향(좌).
             ff_term = (
@@ -586,20 +635,74 @@ class StanleyWaypointFollowNode(Node):
             f"steer={steer_deg:+.1f}° mode={mode}"
         )
 
-    def _smooth_steering(self, target: float) -> float:
-        alpha = max(0.0, min(1.0, self.steering_smooth_alpha))
-        if alpha <= 0.0:
-            return target
-        return self._last_steering_cmd + alpha * (target - self._last_steering_cmd)
+    def _path_yaw_at_lookahead(
+        self,
+        path: List[Tuple[float, float]],
+        best_i: int,
+        best_qx: float,
+        best_qy: float,
+        lookahead_m: float,
+    ) -> float:
+        """Walk forward from closest projection by lookahead_m; return that segment yaw."""
+        if len(path) < 2:
+            return 0.0
+        i = max(0, min(best_i, len(path) - 2))
+        cx, cy = best_qx, best_qy
+        remain = lookahead_m
+        while i < len(path) - 1 and remain > 1e-6:
+            nx, ny = path[i + 1]
+            seg = math.hypot(nx - cx, ny - cy)
+            if seg < 1e-6:
+                i += 1
+                cx, cy = nx, ny
+                continue
+            if remain <= seg:
+                return math.atan2(ny - cy, nx - cx)
+            remain -= seg
+            cx, cy = nx, ny
+            i += 1
+        ax, ay = path[-2]
+        bx, by = path[-1]
+        return math.atan2(by - ay, bx - ax)
 
-    def _rate_limit_steering(self, target: float) -> float:
-        max_step = self.steering_rate_limit_radps * self.timer_period
+    def _smooth_steering(self, target: float, *, alpha: float | None = None) -> float:
+        a = self.steering_smooth_alpha if alpha is None else alpha
+        a = max(0.0, min(1.0, a))
+        if a <= 0.0:
+            return target
+        return self._last_steering_cmd + a * (target - self._last_steering_cmd)
+
+    def _rate_limit_steering(
+        self, target: float, *, rate_limit_radps: float | None = None
+    ) -> float:
+        rate = (
+            self.steering_rate_limit_radps
+            if rate_limit_radps is None
+            else rate_limit_radps
+        )
+        max_step = max(0.0, rate) * self.timer_period
         diff = target - self._last_steering_cmd
-        diff = max(-max_step, min(max_step, diff))
-        out = self._last_steering_cmd + diff
+        if max_step <= 0.0:
+            out = target
+        else:
+            diff = max(-max_step, min(max_step, diff))
+            out = self._last_steering_cmd + diff
         out = max(-self.max_steering, min(self.max_steering, out))
         self._last_steering_cmd = out
         return out
+
+    def _limit_lateral_accel(self, steering: float, speed: float) -> float:
+        """a_lat = v²·tan(δ)/L 이 한계를 넘지 않도록 조향 상한.
+
+        저속에서는 상한이 max_steering 보다 커서 걸리지 않고, 고속에서만 조인다.
+        """
+        a_max = self.max_lateral_accel_mps2
+        v = abs(speed)
+        if a_max <= 0.0 or v < 0.5:
+            return steering
+        kappa_max = a_max / (v * v)
+        delta_max = math.atan(self.wheelbase * kappa_max)
+        return max(-delta_max, min(delta_max, steering))
 
     def _compute_path_curvature(
         self, path: List[Tuple[float, float]], nearest_idx: int
@@ -851,8 +954,19 @@ class StanleyWaypointFollowNode(Node):
         self._last_ff_term = ff_term
         self._last_kappa_used = kappa_used
 
-        steering_smoothed = self._smooth_steering(steering_raw)
-        steering_cmd = self._rate_limit_steering(steering_smoothed)
+        if mode == "LOCAL_PATH":
+            steering_smoothed = self._smooth_steering(
+                steering_raw, alpha=self.local_path_steering_smooth_alpha
+            )
+            steering_cmd = self._rate_limit_steering(
+                self._limit_lateral_accel(steering_smoothed, control_speed),
+                rate_limit_radps=self.local_path_steering_rate_limit_radps,
+            )
+        else:
+            steering_smoothed = self._smooth_steering(steering_raw)
+            steering_cmd = self._rate_limit_steering(
+                self._limit_lateral_accel(steering_smoothed, control_speed)
+            )
 
         stanley_fb_sum = heading_term + cte_term
         lat_m = math.hypot(x - path_x, y - path_y)

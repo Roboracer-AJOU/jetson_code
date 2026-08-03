@@ -81,7 +81,7 @@ def generate_launch_description():
     maps_dir = '/home/nvidia/f1tenth_ajou/maps'
     default_pbstream = os.path.join(
         maps_dir,
-        'cartographer_map_20260730_220058.pbstream',
+        'cartographer_map_20260803_202601.pbstream',
     )
 
     return LaunchDescription([
@@ -99,7 +99,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'odom_topic',
             default_value='/odom',
-            description='Odometry topic used by Cartographer (unused when use_odometry=false)',
+            description='Wheel odometry topic (vesc_wheel_odom -> Cartographer)',
         ),
         DeclareLaunchArgument(
             'scan_topic',
@@ -158,9 +158,9 @@ def generate_launch_description():
             description='Launch RViz on this machine (needs DISPLAY; use false over SSH)',
         ),
         LogInfo(msg=(
-            '=== localization: LiDAR only (no IMU/odom) ===\n'
+            '=== localization: LiDAR main + wheel odom + IMU(gyro) ===\n'
             '  ros2 launch localization_layer cartographer_localization_launch.py\n'
-            '  → origin에서 자동 start_trajectory (Localization OK 확인)\n'
+            '  → control_node 먼저 (speed/servo) 후 Localization OK 확인\n'
             '  안 맞으면: wait_for_rviz_initial_pose:=true + RViz 2D Pose Estimate'
         )),
         OpaqueFunction(function=_launch_setup),

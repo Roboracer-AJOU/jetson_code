@@ -30,7 +30,7 @@ def sensor_launch_arguments() -> list:
         DeclareLaunchArgument(
             'use_ebimu',
             default_value='true',
-            description='Run EBIMU node when sensor bringup is enabled',
+            description='Run EBIMU node for IMU-assisted localization (requires EBIMU on ebimu_port)',
         ),
         DeclareLaunchArgument(
             'lidar_channel_type',
@@ -69,8 +69,8 @@ def sensor_launch_arguments() -> list:
         ),
         DeclareLaunchArgument(
             'lidar_scan_frequency',
-            default_value='40.0',
-            description='LiDAR scan frequency in Hz (localization default 40)',
+            default_value='20.0',
+            description='LiDAR Hz for localization (20 keeps Cartographer realtime stable on Jetson)',
         ),
         DeclareLaunchArgument(
             'use_wheel_odom_tf',
@@ -248,12 +248,39 @@ def build_localization_cartographer_nodes(context):
 
     imu_topic_str = imu_topic.perform(context)
     scan_topic_str = scan_topic.perform(context)
+    odom_topic_str = odom_topic.perform(context)
 
     nodes = [
         LogInfo(msg=(
-            'Cartographer localization: LiDAR only (/scan). '
-            'IMU/odom 미사용. FixedRatioSampler 경고는 정상.'
+            'Cartographer localization: LiDAR main (/scan) + wheel odom (/odom). '
+            'IMU(자이로) 보조 사용. control_node가 /vehicle/speed_mps·서보각을 내야 함.'
         )),
+        Node(
+            package='localization_layer',
+            executable='vesc_wheel_odom.py',
+            name='vesc_wheel_odom',
+            output='screen',
+            parameters=[{
+                'wheelbase_m': 0.33,
+                'speed_topic': '/vehicle/speed_mps',
+                'servo_feedback_deg_topic': '/esp32/target_angle_deg',
+                'servo_command_deg_topic': '/esp32/servo_command_deg',
+                'drive_topic': '/drive',
+                'odom_topic': odom_topic_str,
+                'center_servo_deg': 90.0,
+                'servo_span_deg': 40.0,
+                'max_steer_rad': 0.45,
+                'steer_scale': 0.55,
+                'invert_steer': False,
+                'use_steer_for_yaw': True,
+                'min_speed_for_yaw_mps': 0.08,
+                'speed_scale': 1.0,
+                # Cartographer가 use_odometry=true라 odom 각속도로 예측을 갈아탄다.
+                # 급조향 순간 오차가 그대로 꽂히지 않게 낮은 통과 필터로 완충 (지속 회전은 따라감).
+                'yaw_filter_tau_sec': 0.55,
+                'publish_hz': 50.0,
+            }],
+        ),
         Node(
             package='cartographer_ros',
             executable='cartographer_node',
@@ -268,7 +295,7 @@ def build_localization_cartographer_nodes(context):
             ],
             remappings=[
                 ('imu', imu_topic_str),
-                ('odom', '/dev/null_odom'),
+                ('odom', odom_topic_str),
                 ('scan', scan_topic_str),
             ],
         ),

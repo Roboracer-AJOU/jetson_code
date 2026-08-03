@@ -74,15 +74,16 @@ CFG = {
     "obstacle_tf_timeout_sec": 0.15,
     "laser_to_base_x_m": 0.275,
     "use_fgm": True,
-    "avoid_on_m": 2.0,
-    "avoid_off_m": 3.6,
-    "fgm_enable_m": 6.0,
+    # 더 일찍 회피 진입 (기존 on=2.0 / fgm=6.0)
+    "avoid_on_m": 3.5,
+    "avoid_off_m": 5.0,
+    "fgm_enable_m": 8.0,
     "fgm_enable_topic": "/planner/fgm_enable",
-    "avoid_on_count_th": 2,
+    "avoid_on_count_th": 1,
     "avoid_off_count_th": 4,
-    "forward_cone_deg": 70.0,
+    "forward_cone_deg": 75.0,
     "avoid_min_forward_x_m": 0.2,
-    "avoid_trigger_lateral_abs_max_m": 0.48,
+    "avoid_trigger_lateral_abs_max_m": 0.55,
     "fgm_target_stale_sec": 0.25,
     "avoid_exit_use_passed": True,
     "avoid_pass_rear_x_m": -1.20,
@@ -1278,6 +1279,32 @@ class LocalPlannerNode(Node):
         p0.pose = current.pose
         out.poses.append(p0)
 
+        # FGM 방향으로 연장 (차량 heading 직진이면 Stanley hdg_err≈0 되어 조향이 약해짐)
+        cx = float(current.pose.position.x)
+        cy = float(current.pose.position.y)
+        dx = float(fgm_x) - cx
+        dy = float(fgm_y) - cy
+        span = math.hypot(dx, dy)
+        if span > 1e-3:
+            fx = dx / span
+            fy = dy / span
+        else:
+            yaw = _quat_to_yaw(current.pose.orientation)
+            fx = math.cos(yaw)
+            fy = math.sin(yaw)
+
+        # 차량 → FGM 목표 구간 촘촘히 (목표점이 멀어져도 Stanley 최근접/전방주시가 정확)
+        n_lead = int(span / self.avoid_forward_step_m)
+        for k in range(1, n_lead + 1):
+            s = k * self.avoid_forward_step_m
+            q = PoseStamped()
+            q.header = out.header
+            q.pose.position.x = float(cx + fx * s)
+            q.pose.position.y = float(cy + fy * s)
+            q.pose.position.z = 0.0
+            q.pose.orientation.w = 1.0
+            out.poses.append(q)
+
         p1 = PoseStamped()
         p1.header = out.header
         p1.pose.position.x = fgm_x
@@ -1285,12 +1312,6 @@ class LocalPlannerNode(Node):
         p1.pose.position.z = 0.0
         p1.pose.orientation.w = 1.0
         out.poses.append(p1)
-
-        # 시뮬과 동일: FGM 목표 이후는 차량 heading 직진
-        # (갭 방향 연장은 좁은 트랙에서 벽으로 꽂히는 경우가 많음)
-        yaw = _quat_to_yaw(current.pose.orientation)
-        fx = math.cos(yaw)
-        fy = math.sin(yaw)
         for k in range(1, self.avoid_forward_num_points + 1):
             s = k * self.avoid_forward_step_m
             q = PoseStamped()

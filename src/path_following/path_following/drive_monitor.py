@@ -17,9 +17,12 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import PointStamped
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Bool, Float32MultiArray, Float64, Float64MultiArray, String, UInt8
 from tf2_ros import Buffer, TransformListener
+
+
+_WHEELBASE_M = 0.33  # stanley_waypoint_follow_node / control_node 와 동일
 
 
 def _rad2deg(r: float) -> float:
@@ -167,6 +170,14 @@ class DriveMonitor(Node):
             UInt8, "/planner/speed_condition", self._cb_speed_cond, 10
         )
 
+        self._st_imu = TopicStamp()
+        self._imu_yaw_rate = 0.0
+        self._imu_a_lat = 0.0
+        self._peak_a_lat_imu = 0.0
+        self._peak_a_lat_kin = 0.0
+        self._peak_yaw_rate = 0.0
+        self.create_subscription(Imu, "/imu/data", self._cb_imu, 20)
+
         self._last_tf_xy: tuple[float, float] | None = None
         self._last_tf_mono: float | None = None
         self._tf_speed = 0.0
@@ -186,6 +197,19 @@ class DriveMonitor(Node):
     def _cb_odom(self, msg: Odometry) -> None:
         self._st_odom.mark()
         self._odom_v = float(msg.twist.twist.linear.x)
+
+    def _cb_imu(self, msg: Imu) -> None:
+        self._st_imu.mark()
+        self._imu_yaw_rate = float(msg.angular_velocity.z)
+        self._imu_a_lat = float(msg.linear_acceleration.y)
+        # 최대치 유지 — 그립 한계(max_lateral_accel_mps2) 튜닝 근거
+        v = abs(self._v_act)
+        if v >= 0.5:
+            self._peak_a_lat_imu = max(self._peak_a_lat_imu, abs(self._imu_a_lat))
+            self._peak_a_lat_kin = max(
+                self._peak_a_lat_kin, abs(v * self._imu_yaw_rate)
+            )
+            self._peak_yaw_rate = max(self._peak_yaw_rate, abs(self._imu_yaw_rate))
 
     def _cb_telemetry(self, msg: Float64MultiArray) -> None:
         self._st_tel.mark()
@@ -528,6 +552,45 @@ class DriveMonitor(Node):
                 f"  VESC 전원             : "
                 f"motor {self._tel[17]:+.2f} A, "
                 f"in {self._tel[16]:+.2f} A, {self._tel[18]:.1f} V"
+            )
+
+        lines.append("")
+        lines.append("[ 그립 · 요레이트 (IMU) ]")
+        if self._st_imu.last_mono is None:
+            lines.append("  /imu/data             : 미수신 (localization 런치 확인)")
+        else:
+            v = abs(self._v_act)
+            # 자전거 모델 기대 요레이트: ω = v·tanδ/L
+            w_exp = v * math.tan(self._drive_steer) / _WHEELBASE_M
+            w_meas = self._imu_yaw_rate
+            if abs(w_exp) > 0.15:
+                ratio = w_meas / w_exp
+                if ratio < 0.6:
+                    verdict = "언더스티어(안돌아감·감속필요)"
+                elif ratio > 1.4:
+                    verdict = "오버스티어(뒤가흐름)"
+                else:
+                    verdict = "정상추종"
+                ratio_s = f"{ratio:.2f}  {verdict}"
+            else:
+                ratio_s = "— (조향/속도 작음)"
+            lines.append(
+                f"  요레이트 실측/기대     : {w_meas:+.2f} / {w_exp:+.2f} rad/s"
+                f"   age {_age_str(self._st_imu.last_mono, stale=0.3)}"
+            )
+            lines.append(f"  추종비(실측÷기대)     : {ratio_s}")
+            lines.append(
+                f"  횡가속 IMU/운동학      : {self._imu_a_lat:+.2f} / "
+                f"{v * w_meas:+.2f} m/s²   ← 운동학 = v×요레이트"
+            )
+            lines.append(
+                f"  횡가속 최대(누적)      : IMU {self._peak_a_lat_imu:.2f}  "
+                f"운동학 {self._peak_a_lat_kin:.2f} m/s²  "
+                f"(요레이트 최대 {self._peak_yaw_rate:.2f} rad/s)"
+            )
+            lines.append(
+                f"  → max_lateral_accel_mps2 는 운동학 최대의 0.8배 권장 "
+                f"({self._peak_a_lat_kin * 0.8:.1f})"
             )
 
         lines.append("")

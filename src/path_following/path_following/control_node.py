@@ -38,17 +38,17 @@ CFG = {
     "esp_baud": 115200,         # esp32_steer_rc_uart.ino (RC 텔레메트리 + S: 동일 UART)
     "vesc_baud": 115200,
     # Stanley max_drive_speed / max_steering_angle 과 맞추면 1:1 스케일
-    "max_speed_mps": 5.0,
+    "max_speed_mps": 10.0,
     "max_steering_angle_rad": 0.6981,  # ±40° — ESP normToAngle: S±1 → 50°/130°
-    "max_duty": 0.15,           # MANUAL mode CH2 duty limit
+    "max_duty": 0.3,           # MANUAL mode CH2 duty limit
     "speed_scale": 1.0,         # 추가 감쇠 (1.0=끔)
     "min_move_duty": 0.06,      # 정지마찰 극복용 최소 duty (speed>threshold 일 때)
     "manual_duty_rise_rate_per_sec": 0.25,
     "manual_duty_fall_rate_per_sec": 0.10,
     "min_move_speed_mps": 0.08,
     "status_log_hz": 2.0,         # 터미널 속도/제어 STATUS (0=끔)
-    "max_steer": 0.55,          # ESP 조향 명령 범위. 1.0이면 서보 ±40°까지 사용
-    "steer_rate_limit_per_sec": 1.5,
+    "max_steer": 1.,          # ESP 조향 명령 범위. 1.0이면 서보 ±40°까지 사용
+    "steer_rate_limit_per_sec": 4.0,
     "steer_cmd_format": "prefixed",  # plain: "0.500\n" | prefixed: "S:0.500\n"
     "invert_speed": False,      # legacy AUTO sign flag; prefer auto_duty_output_sign
     # 원본 ESP normToAngle: S:-1→좌(50°), S:+1→우(130°) — INVERT_RC_STEER 미적용
@@ -75,7 +75,7 @@ CFG = {
     # AUTO closed-loop speed control (max_target_speed_mps is target speed [m/s])
     "max_auto_duty": 0.70,        # AUTO final safety duty limit
     "max_target_speed_mps": 10.0,  # AUTO target speed
-    "target_speed_mps": 3.0,       # AUTO configured target speed
+    "target_speed_mps": 2.0,       # AUTO configured target speed
     "auto_duty_output_sign": 1.0,
     "speed_ff_duty_per_mps": 0.076,
     "speed_kp": 0.15,
