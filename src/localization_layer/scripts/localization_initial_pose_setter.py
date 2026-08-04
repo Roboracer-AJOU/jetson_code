@@ -177,9 +177,11 @@ class LocalizationInitialPoseSetter(Node):
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('relative_to_trajectory_id', 0)
         self.declare_parameter('service_retry_sec', 0.15)
-        self.declare_parameter('finish_settle_sec', 0.4)
+        self.declare_parameter('finish_settle_sec', 1.0)
         self.declare_parameter('start_trajectory_max_attempts', 5)
         self.declare_parameter('refine_min_score', 0.4)
+        # 2D Pose Estimate 연속 클릭 시 finish/start가 TF를 폭주시키므로 쿨다운.
+        self.declare_parameter('initialpose_cooldown_sec', 3.0)
 
         self._config_dir = self.get_parameter('configuration_directory').get_parameter_value().string_value
         self._config_base = self.get_parameter('configuration_basename').get_parameter_value().string_value
@@ -195,6 +197,8 @@ class LocalizationInitialPoseSetter(Node):
         self._refine_min_score = float(self.get_parameter('refine_min_score').value)
         self._finish_settle = float(self.get_parameter('finish_settle_sec').value)
         self._start_max_attempts = int(self.get_parameter('start_trajectory_max_attempts').value)
+        self._initialpose_cooldown = float(self.get_parameter('initialpose_cooldown_sec').value)
+        self._last_restart_mono = 0.0
 
         pbstream = self.get_parameter('pbstream_filename').get_parameter_value().string_value
         if pbstream and not os.path.isfile(pbstream):
@@ -291,6 +295,13 @@ class LocalizationInitialPoseSetter(Node):
         frame = msg.header.frame_id
         if frame and frame not in ('map', ''):
             self.get_logger().warn(f'Ignoring /initialpose frame_id={frame!r}')
+            return
+        now = time.monotonic()
+        if (now - self._last_restart_mono) < self._initialpose_cooldown:
+            self.get_logger().warn(
+                f'Ignoring /initialpose (쿨다운 {self._initialpose_cooldown:.1f}s — '
+                '연속 클릭하면 TF가 튀고 Cartographer가 꼬임)'
+            )
             return
         pose = msg.pose.pose
         self._queue_pose(
@@ -449,6 +460,8 @@ class LocalizationInitialPoseSetter(Node):
                 )
 
         ok = self._restart_localization(x, y, yaw)
+        if ok:
+            self._last_restart_mono = time.monotonic()
         if not ok:
             with self._lock:
                 self._apply_pose = (x, y, yaw)

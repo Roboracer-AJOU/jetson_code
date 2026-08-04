@@ -379,6 +379,10 @@ public:
             start_scan_time = this->now();
             op_result = drv->grabScanDataHq(nodes, count);
             end_scan_time = this->now();
+            // publish_scan()에 end_scan_time을 header.stamp로 넘김: cartographer_ros는
+            // LaserScan.header.stamp를 "마지막 포인트" 시각으로 해석하는데, start_scan_time을
+            // 쓰면 한 회전 주기(스캔당 ~25ms@40Hz)만큼 과거로 찍혀 IMU/odom과 어긋남
+            // → 회전 중에만 heading 오차가 도드라지는 원인이었음(실측: /imu 지연 ~1ms vs /scan ~25ms).
             scan_duration = (end_scan_time - start_scan_time).seconds();
 
             if (op_result == SL_RESULT_OK) {
@@ -419,7 +423,7 @@ public:
                         }
     
                         publish_scan(scan_pub, angle_compensate_nodes, angle_compensate_nodes_count,
-                                start_scan_time, scan_duration, inverted,
+                                end_scan_time, scan_duration, inverted,
                                 angle_min, angle_max, angle_offset, max_distance,
                                 frame_id);
 
@@ -441,7 +445,7 @@ public:
                         angle_max = DEG2RAD(getAngle(nodes[end_node]));
 
                         publish_scan(scan_pub, &nodes[start_node], end_node-start_node +1,
-                                start_scan_time, scan_duration, inverted,
+                                end_scan_time, scan_duration, inverted,
                                 angle_min, angle_max, angle_offset, max_distance,
                                 frame_id);
                     }
@@ -450,7 +454,7 @@ public:
                     float angle_min = DEG2RAD(0.0f);
                     float angle_max = DEG2RAD(359.0f);
                     publish_scan(scan_pub, nodes, count,
-                                start_scan_time, scan_duration, inverted,
+                                end_scan_time, scan_duration, inverted,
                                 angle_min, angle_max, angle_offset, max_distance,
                                 frame_id);
                 }

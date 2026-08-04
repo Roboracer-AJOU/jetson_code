@@ -11,6 +11,7 @@ _LAUNCH_DIR = os.path.dirname(os.path.abspath(__file__))
 if _LAUNCH_DIR not in sys.path:
     sys.path.insert(0, _LAUNCH_DIR)
 
+from local_cpu_policy import cpu_policy_actions, ensure_policy_script_executable, local_cpu_prefix
 from localization_launch_common import (
     delayed_cartographer_stack,
     is_enabled,
@@ -18,6 +19,8 @@ from localization_launch_common import (
     sensor_bringup_include,
     sensor_launch_arguments,
 )
+
+_LOCAL_CPU = local_cpu_prefix()
 
 
 def _launch_setup(context, *args, **kwargs):
@@ -48,11 +51,14 @@ def _launch_setup(context, *args, **kwargs):
                         executable='rviz2',
                         name='rviz2',
                         output='screen',
+                        prefix=_LOCAL_CPU,
                         arguments=['-d', rviz_config],
                     ),
                 ],
             )
         )
+
+    policy = cpu_policy_actions(apply_delay_sec=max(cartographer_delay + 2.0, 4.0), start_daemon=True)
 
     def _after_network(context):
         return [
@@ -60,6 +66,7 @@ def _launch_setup(context, *args, **kwargs):
             sensor_bringup_include(),
             *delayed_cartographer_stack(context, cartographer_delay),
             *rviz_actions,
+            *policy,
         ]
 
     if enable_sensor_bringup and enable_lidar_network_setup:
@@ -71,17 +78,22 @@ def _launch_setup(context, *args, **kwargs):
             sensor_bringup_include(),
             *delayed_cartographer_stack(context, cartographer_delay),
             *rviz_actions,
+            *policy,
         ]
 
     from localization_launch_common import localization_stack_with_map
-    return localization_stack_with_map(context, 0.0)
+    return [
+        *localization_stack_with_map(context, 0.0),
+        *policy,
+    ]
 
 
 def generate_launch_description():
+    ensure_policy_script_executable()
     maps_dir = '/home/nvidia/f1tenth_ajou/maps'
     default_pbstream = os.path.join(
         maps_dir,
-        'cartographer_map_20260803_202601.pbstream',
+        'cartographer_map_20260804_190909.pbstream',
     )
 
     return LaunchDescription([

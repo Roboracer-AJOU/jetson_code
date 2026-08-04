@@ -2,7 +2,10 @@
 # path_follow_stanley_launch.py 와 동일 구성 — 정적 전용임을 명확히 한 별칭 런치.
 #
 #   ros2 launch path_following path_follow_static_avoid_launch.py
-#   ros2 run path_following control_node
+#   bash ~/f1tenth_ajou/scripts/run_control_node.sh
+
+import os
+import sys
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -11,10 +14,18 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
+_LAUNCH_DIR = os.path.dirname(os.path.abspath(__file__))
+if _LAUNCH_DIR not in sys.path:
+    sys.path.insert(0, _LAUNCH_DIR)
+
+from path_cpu_policy import cpu_policy_actions, ensure_policy_script_executable, path_cpu_prefix
+
 _QUIET = ["--ros-args", "--log-level", "warn"]
+_CPU = path_cpu_prefix()
 
 
 def generate_launch_description():
+    ensure_policy_script_executable()
     enable_vehicle_control = LaunchConfiguration("enable_vehicle_control")
     status_log_hz = LaunchConfiguration("status_log_hz")
     verbose_logs = LaunchConfiguration("verbose_logs")
@@ -41,6 +52,7 @@ def generate_launch_description():
                 executable="static_obstacle_node",
                 name="static_obstacle_node",
                 output="screen",
+                prefix=_CPU,
                 arguments=_QUIET,
             ),
             Node(
@@ -48,6 +60,7 @@ def generate_launch_description():
                 executable="fgm_node",
                 name="fgm_node",
                 output="screen",
+                prefix=_CPU,
                 arguments=_QUIET,
             ),
             Node(
@@ -55,6 +68,7 @@ def generate_launch_description():
                 executable="local_planner_node",
                 name="local_planner_node",
                 output="screen",
+                prefix=_CPU,
                 arguments=_QUIET,
                 parameters=[
                     {
@@ -69,6 +83,7 @@ def generate_launch_description():
                 executable="stanley_waypoint_follow_node",
                 name="stanley_waypoint_follow_node",
                 output="screen",
+                prefix=_CPU,
                 parameters=[
                     {
                         "status_log_hz": ParameterValue(
@@ -83,6 +98,7 @@ def generate_launch_description():
                 executable="stack_status_node",
                 name="stack_status_node",
                 output="screen",
+                prefix=_CPU,
                 parameters=[{"period_s": 1.0}],
             ),
             Node(
@@ -90,8 +106,10 @@ def generate_launch_description():
                 executable="control_node",
                 name="vehicle_control_node",
                 output="screen",
+                prefix=_CPU,
                 condition=IfCondition(enable_vehicle_control),
                 arguments=_QUIET,
             ),
+            *cpu_policy_actions(apply_delay_sec=2.0, start_daemon=True),
         ]
     )

@@ -1,6 +1,7 @@
 """Shared helpers for localization_layer launch files."""
 
 import os
+import sys
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, LogInfo, RegisterEventHandler, Shutdown, TimerAction
@@ -8,6 +9,14 @@ from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+_LAUNCH_DIR = os.path.dirname(os.path.abspath(__file__))
+if _LAUNCH_DIR not in sys.path:
+    sys.path.insert(0, _LAUNCH_DIR)
+
+from local_cpu_policy import local_cpu_prefix
+
+_LOCAL_CPU = local_cpu_prefix()
 
 
 def is_enabled(value: str) -> bool:
@@ -30,7 +39,7 @@ def sensor_launch_arguments() -> list:
         DeclareLaunchArgument(
             'use_ebimu',
             default_value='true',
-            description='Run EBIMU node for IMU-assisted localization (requires EBIMU on ebimu_port)',
+            description='EBIMU on for Cartographer use_imu_data (must stay connected or queue stalls)',
         ),
         DeclareLaunchArgument(
             'lidar_channel_type',
@@ -69,8 +78,8 @@ def sensor_launch_arguments() -> list:
         ),
         DeclareLaunchArgument(
             'lidar_scan_frequency',
-            default_value='20.0',
-            description='LiDAR Hz for localization (20 keeps Cartographer realtime stable on Jetson)',
+            default_value='40.0',
+            description='LiDAR Hz for localization (40: 장애물 인지용 해상도 확보, Jetson 부하 확인 필요)',
         ),
         DeclareLaunchArgument(
             'use_wheel_odom_tf',
@@ -260,14 +269,16 @@ def build_localization_cartographer_nodes(context):
             executable='vesc_wheel_odom.py',
             name='vesc_wheel_odom',
             output='screen',
+            prefix=_LOCAL_CPU,
             parameters=[{
                 'speed_topic': '/vehicle/speed_mps',
                 'imu_topic': imu_topic_str,
                 # gz/gy 중 어느 축이 실제 yaw인지 실측 확인 후 필요하면 'y'로 변경.
                 'imu_yaw_axis': 'z',
-                # 자이로 적분 + EBIMU(9-DOF) 지자기 융합 yaw로 느리게(5초) 보정하는
-                # 컴플리멘터리 방식. 순간 자기간섭엔 안 흔들리고 장기 드리프트만 교정됨.
-                'yaw_source': 'fused',
+                # 모터/VESC 근처 지자기 간섭으로 EBIMU orientation 자체가 정지 중에도
+                # 계속 도는 게 실측 확인됨(fused였을 때 odom이 제자리에서 계속 회전) →
+                # 지자기 보정 경로를 끄고 순수 자이로 적분만 사용.
+                'yaw_source': 'gyro',
                 'yaw_fusion_tau_sec': 5.0,
                 'odom_topic': odom_topic_str,
                 'min_speed_for_yaw_mps': 0.08,
@@ -282,6 +293,7 @@ def build_localization_cartographer_nodes(context):
             executable='cartographer_node',
             name='cartographer_node',
             output='screen',
+            prefix=_LOCAL_CPU,
             arguments=[
                 '-configuration_directory', config_dir,
                 '-configuration_basename', config_basename,
@@ -307,6 +319,7 @@ def build_localization_cartographer_nodes(context):
                         executable='localization_initial_pose_setter.py',
                         name='localization_initial_pose_setter',
                         output='screen',
+                        prefix=_LOCAL_CPU,
                         parameters=[{
                             'pbstream_filename': pbstream_path,
                             'configuration_directory': config_dir,
@@ -345,6 +358,7 @@ def build_static_map_publisher_nodes(context):
             executable='static_map_publisher.py',
             name='static_map_publisher',
             output='screen',
+            prefix=_LOCAL_CPU,
             parameters=[{
                 'yaml_filename': map_yaml,
                 'topic': '/map',

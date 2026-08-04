@@ -36,6 +36,9 @@ options = {
 MAP_BUILDER.use_trajectory_builder_2d = true
 
 TRAJECTORY_BUILDER_2D.use_imu_data = true
+-- 기본 10초라 지속적인 원 운동(원돌이) 중 구심가속도로 쏠린 가속도계 "중력" 방향에
+-- 오래 끌려가며 헤딩이 계속 새는 원인이었음 → 60초로 늘려 자이로 적분을 더 오래 신뢰.
+TRAJECTORY_BUILDER_2D.imu_gravity_time_constant = 60.0
 TRAJECTORY_BUILDER_2D.min_range = 0.08
 TRAJECTORY_BUILDER_2D.max_range = 30.0
 -- 짧게: no-return ray로 free를 과하게 깔지 않음 (얇은 벽 끊김 완화)

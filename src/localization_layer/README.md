@@ -9,6 +9,9 @@ ros2 launch localization_layer cartographer_localization_launch.py
 
 ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765
 
+ros2 launch path_following path_follow_static_dynamic_avoid_launch.py
+
+
 
 
 # localization_layer 수정 기록
@@ -282,3 +285,94 @@ git checkout -- src/localization_layer/scripts/vesc_wheel_odom.py \
 git diff HEAD -- src/localization_layer/config/cartographer_2d_localization.lua
 ```
 위 표의 "이전" 값으로 되돌리면 됨.
+
+---
+
+## 수정 7 — 2026-08-04 (시간축/타임스탬프 버그)
+
+**패키지 위치**: `src/sllidar_ros2/src/sllidar_node.cpp` (라이다 드라이버 원본,
+localization_layer 아님 — 로컬라이제이션이 이 타임스탬프를 직접 쓰기 때문에 여기 같이 남김)
+
+**증상**: 수정 4/6을 거쳐도 고속 코너에서 위치 틀어짐이 계속 남아있었음.
+
+**원인**: `publish_scan()`에 LaserScan의 `header.stamp`로 "스캔 **시작** 시각"
+(`start_scan_time`)을 넘기고 있었음. Cartographer는 이 타임스탬프를 "스캔 **마지막
+포인트** 시각"으로 해석하기 때문에, 실제로는 한 바퀴 스캔 시간(약 25ms@40Hz)만큼
+과거로 찍히는 셈이었음. IMU는 지연이 거의 없이(~1ms) 들어오는데 라이다만 이렇게
+늦게 찍히니, 둘을 시간 맞춰 비교(스캔매칭/pose 예측)할 때마다 어긋남 발생.
+직선에서는 위치 변화가 적어 안 보이지만, **코너에서는 방향이 빠르게 바뀌니 이
+시간 오차가 곧바로 헤딩 오차로 증폭**됨 — 지금까지 봐온 "고속 코너에서만 유독
+틀어지는" 증상과 정확히 일치.
+
+**수정**: `publish_scan()` 호출 3곳 전부 `start_scan_time` → `end_scan_time`으로 변경.
+
+**관련 후속 조치**: 라이다 드라이버 레벨의 근본 타이밍 버그였던 거라, CPU 부담
+때문에 미뤄뒀던 40Hz 복귀도 다시 시도 중 (`lidar_scan_frequency`: 20 → 40,
+`mapping_sensor_bringup_launch.py` + `localization_launch_common.py`). 근본
+원인이 이 타임스탬프였다면 40Hz에서도 안정적일 가능성이 있음 — Jetson 부하 확인 필요.
+
+**⚠️ 빌드 필요**: 이건 C++ 코드라 lua/launch 파일과 다르게 **꼭 빌드해야 반영돼요**:
+```bash
+colcon build --packages-select sllidar_ros2
+```
+
+**확인 필요**: 빌드 후 재시작해서 고속 코너 재테스트, `ros2 topic hz /scan`으로
+40Hz 유지되는지, CPU 여유(`tegrastats`) 확인.
+
+**되돌리는 법**:
+```bash
+git diff HEAD -- src/sllidar_ros2/src/sllidar_node.cpp \
+  src/localization_layer/launch/mapping_sensor_bringup_launch.py \
+  src/localization_layer/launch/localization_launch_common.py
+```
+
+---
+
+## 수정 8 — 2026-08-04 (검색범위 되돌림 + 코어 재조정) → **되돌림 (아래 참고)**
+
+**⚠️ 적용 후 바로 원상복구함**: 적용 직후 "초기 위치를 아예 못 잡는다"는 증상이
+나와서 사용자가 원복 요청. 근데 실제로 로그 확인해보니 원인은 이 수정이
+아니라 **Foxglove의 Display Frame이 `map`이 아니라 `base_link`로 설정돼 있어서
+`/initialpose`가 계속 거부되고 있던 것**(`Ignoring /initialpose frame_id='base_link'`)
+— 예전에 한 번 겪었던 것과 똑같은 문제. 다만 "혹시 몰라서" 안전하게 원복함.
+아래 내용은 시도했던 기록으로 남겨둠 (지금은 미적용 상태).
+
+**배경**: 수정 6~7 이후에도 실주행 중 위치가 계속 틀어짐. 새 맵(190909)으로
+바뀐 뒤 처음 겪는 문제라 원인 후보가 많았음 — CPU 부하인지, 매칭 파라미터인지
+구분 필요했음.
+
+**CPU/램 실측 (전체 스택 켠 상태)**:
+```
+코어: 6개, load average: 4.74/6 (여유 있음)
+메모리: 3.7GB available, 스왑 0B 사용
+```
+→ **CPU/메모리는 문제가 아님**을 확인. 이전에 의심했던 "코어 3개+40Hz라 부하일
+것"이라는 가설은 실측으로 기각됨.
+
+**그래서 재검토**: CPU가 괜찮다면 원인은 "계산량 부족"이 아니라 "매칭이 잘못된
+후보를 확신 있게 고르는 것"(품질 문제)일 가능성이 큼. 의심 지점:
+
+```
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window
+```
+이 값이 0.42(수정6, 3~3.5m/s 실측 근거 있음) → 0.5(10m/s급 대비 "방어적
+마진", 실측 근거 없이 미리 늘려둔 값)로 되어 있었음. 트랙이 반복적인 루프
+형태라, 탐색 범위가 넓을수록 다른 구간과 헷갈릴 위험이 있음(수정 1과 같은
+종류의 문제, 이번엔 로컬 스캔매칭 레벨에서).
+
+**수정**: `src/localization_layer/config/cartographer_2d_localization.lua`
+
+| 파라미터 | 이전 | 이후 | 이유 |
+|---|---|---|---|
+| `real_time_correlative_scan_matcher.linear_search_window` | 0.5 | 0.42 | 실측 근거 없던 마진 제거, 실측 검증됐던 값으로 복귀 |
+| `MAP_BUILDER.num_background_threads` | 3 | 4 | CPU 여유 확인됐으니 살짝 상향 |
+
+**확인 필요**: 재시작 후 고속 코너 재테스트. 위치 틀어짐이 줄어드는지 확인.
+그래도 안 되면 다음 후보는 새 맵(190909) 자체의 품질(Foxglove로 벽선이
+깔끔한지 육안 확인) 또는 `stanley_waypoint_follow_node.py`의
+`reverse_track_direction`(조향 방향, 위치추정과는 별개 문제).
+
+**되돌리는 법**:
+```bash
+git diff HEAD -- src/localization_layer/config/cartographer_2d_localization.lua
+```

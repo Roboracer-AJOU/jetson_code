@@ -31,7 +31,7 @@ _DEFAULT_MAP_DIR = "/home/nvidia/f1tenth_ajou/maps"
 
 CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
-    "map_name": "cartographer_map_20260803_202601.yaml",
+    "map_name": "cartographer_map_20260804_190909_rosmap.yaml",
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",

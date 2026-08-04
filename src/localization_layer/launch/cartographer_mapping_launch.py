@@ -72,6 +72,9 @@ def _build_cartographer_stack(context):
         'servo_command_deg_topic': '/esp32/servo_command_deg',
         'drive_topic': '/drive',
         'odom_topic': odom_topic_str,
+        # 모터/VESC 근처 지자기 간섭으로 EBIMU orientation이 정지 중에도 계속 도는 게
+        # 실측 확인됨(fused였을 때 odom이 제자리에서 계속 회전) → 순수 자이로 적분만 사용.
+        'yaw_source': 'gyro',
         'center_servo_deg': 90.0,
         'servo_span_deg': 40.0,
         'max_steer_rad': 0.45,
@@ -370,8 +373,8 @@ def generate_launch_description():
     ),
     DeclareLaunchArgument(
       'lidar_scan_frequency',
-      default_value='20.0',
-      description='LiDAR scan frequency in Hz for mapping (used when sensor bringup is enabled)',
+      default_value='40.0',
+      description='LiDAR scan frequency in Hz for mapping (40: 장애물 인지용 해상도 확보, Jetson 부하 확인 필요)',
     ),
     DeclareLaunchArgument(
       'use_wheel_odom_tf',

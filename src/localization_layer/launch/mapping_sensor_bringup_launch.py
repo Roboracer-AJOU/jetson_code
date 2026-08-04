@@ -6,6 +6,7 @@
 """
 
 import os
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -15,6 +16,14 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+_LAUNCH_DIR = os.path.dirname(os.path.abspath(__file__))
+if _LAUNCH_DIR not in sys.path:
+    sys.path.insert(0, _LAUNCH_DIR)
+
+from local_cpu_policy import local_cpu_prefix
+
+_LOCAL_CPU = local_cpu_prefix()
 
 
 def _sensor_stack_actions(
@@ -42,6 +51,7 @@ def _sensor_stack_actions(
         executable='sllidar_node',
         name='sllidar_node',
         output='screen',
+        prefix=_LOCAL_CPU,
         respawn=True,
         respawn_delay=3.0,
         parameters=[{
@@ -64,6 +74,7 @@ def _sensor_stack_actions(
         executable='ebimu_driver',
         name='ebimu_driver',
         output='screen',
+        prefix=_LOCAL_CPU,
         respawn=True,
         respawn_delay=2.0,
         parameters=[{
@@ -165,7 +176,7 @@ def generate_launch_description():
             description='LiDAR scan angle offset (rad)',
         ),
         DeclareLaunchArgument('scan_mode', default_value='Sensitivity'),
-        DeclareLaunchArgument('scan_frequency', default_value='20.0'),
+        DeclareLaunchArgument('scan_frequency', default_value='40.0'),
         DeclareLaunchArgument('ebimu_port', default_value='/dev/ttyUSB0'),
         DeclareLaunchArgument('ebimu_baud', default_value='115200'),
         DeclareLaunchArgument('use_ebimu', default_value='true'),
