@@ -5,12 +5,14 @@ import os
 from launch.actions import ExecuteProcess, LogInfo, TimerAction
 
 # 코어5~6 = CPU 4-5
-PATH_CPU_PREFIX = ["taskset", "-c", "4-5"]
+# Node(prefix=...) expects a single string (shlex-split later). A list joins
+# without spaces and becomes 'taskset-c4-5'.
+PATH_CPU_PREFIX = "taskset -c 4-5"
 _POLICY = "/home/nvidia/f1tenth_ajou/scripts/apply_cpu_policy.sh"
 
 
 def path_cpu_prefix():
-    return list(PATH_CPU_PREFIX)
+    return PATH_CPU_PREFIX
 
 
 def cpu_policy_actions(*, apply_delay_sec: float = 2.0, start_daemon: bool = True):

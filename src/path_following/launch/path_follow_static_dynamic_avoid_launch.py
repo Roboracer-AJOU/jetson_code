@@ -99,14 +99,7 @@ def generate_launch_description():
                     }
                 ],
             ),
-            Node(
-                package="path_following",
-                executable="stack_status_node",
-                name="stack_status_node",
-                output="screen",
-                prefix=_CPU,
-                parameters=[{"period_s": 1.0}],
-            ),
+            # stack_status_node: /scan 구독으로 CPU 큼 → 기본 미기동 (필요 시 수동 ros2 run)
             Node(
                 package="path_following",
                 executable="control_node",

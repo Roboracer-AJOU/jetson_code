@@ -14,6 +14,8 @@ FGM (Follow the Gap Method) 노드.
 from __future__ import annotations
 
 import math
+import subprocess
+from pathlib import Path
 
 import numpy as np
 import rclpy
@@ -22,6 +24,9 @@ from geometry_msgs.msg import Point, PointStamped
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Float32MultiArray, Float64
 from visualization_msgs.msg import Marker
+
+_FGM_BOOST_FLAG = Path("/tmp/f1tenth_fgm_boost")
+_CPU_POLICY = Path("/home/nvidia/f1tenth_ajou/scripts/apply_cpu_policy.sh")
 
 
 # ============================================================
@@ -40,15 +45,20 @@ CFG = {
     "require_planner_enable": True,
     "target_topic": "/fgm_target",
     "publish_debug_scan": False,
+    # Foxglove/RViz 갭 마커. enable ON일 때만 계산·발행 (OFF면 스캔 스킵 유지).
+    "publish_gap_marker": True,
     # 스캔 전처리·갭 (알고리즘)
     # 정면(레이저 +x) 기준 ±fov_half_deg 만 사용. ≤0 이면 스캔 전체.
     # Slamtec 0~360° 스캔도 wrap 후 정면 기준으로 자름.
     "fov_half_deg": 80.0,
     # 고속에선 멀리까지 봐야 갭이 미리 보임 (목표점 거리보다 넉넉하게)
-    "scan_max_range_m": 4.0,
-    # 세이프티 버블: 장애 각도 섹터를 차폭+여유만큼 통째로 막는다.
-    # 차 반폭 0.15 m + 여유 → 이 값이 작으면 갭이 거의 안 갈라져 회피가 소극적.
-    "bubble_radius_m": 0.30,
+    "scan_max_range_m": 5.5,
+    # [장애물 버블] 장애 반경 위에 더하는 여유 (갭이 장애에서 얼마나 떨어질지).
+    "bubble_radius_m": 0.2,
+    # [차량 버블] 뒷축 기준 발자국 — 전방 길이 / 좌우 폭(전체).
+    # 폭은 FGM 섹터 반폭에 half_width로 들어가고, 전방은 planner 게이트(d−front)와 공유.
+    "ego_front_safety_m": 0.30,
+    "ego_safety_width_m": 0.15,
     "gap_threshold_primary_m": 1.5,
     "gap_threshold_fallback_m": 0.5,
     # 빔 개수가 아니라 각폭 기준 (라이다 분해능 바뀌어도 동일 동작)
@@ -58,12 +68,12 @@ CFG = {
     # 버블이 이미 차폭+여유를 먹고 있어 크게 줄 필요 없다 (각도라서 멀수록 과해짐).
     "gap_edge_inset_deg": 3.0,
     # 목표점 거리 = clamp(ego_speed * lead_time, min, max) [m, 레이저 프레임]
-    "target_lead_time_s": 0.55,
-    "target_min_m": 0.9,
-    "target_max_m": 3.0,
+    "target_lead_time_s": 0.70,
+    "target_min_m": 1.0,
+    "target_max_m": 3.5,
     # 목표 스무딩: EMA 1단 + 이동 속도 제한 [m/s] (고속일수록 자동 완화)
-    "target_smooth_alpha": 0.5,
-    "target_max_rate_mps": 2.5,
+    "target_smooth_alpha": 0.70,
+    "target_max_rate_mps": 3.5,
     # RViz V자 갭 마커 (주행과 무관, 표시만)
     "gap_marker_arm_scale": 1.5,
     "gap_marker_max_arm_m": 2.0,
@@ -123,15 +133,31 @@ class FGMNode(Node):
             )
 
         self.target_pub = self.create_publisher(PointStamped, tgt_t, 10)
-        self.debug_scan_pub = self.create_publisher(LaserScan, "/fgm_debug_scan", 10)
-        self.gap_marker_pub = self.create_publisher(Marker, "/fgm_gap_marker", 10)
+        self.publish_debug_scan = _param_bool(self.get_parameter("publish_debug_scan").value)
+        self.publish_gap_marker = _param_bool(self.get_parameter("publish_gap_marker").value)
+        self.debug_scan_pub = (
+            self.create_publisher(LaserScan, "/fgm_debug_scan", 10)
+            if self.publish_debug_scan
+            else None
+        )
+        self.gap_marker_pub = (
+            self.create_publisher(Marker, "/fgm_gap_marker", 10)
+            if self.publish_gap_marker
+            else None
+        )
 
         self.preprocess_dist = float(self.get_parameter("scan_max_range_m").value)
         self.bubble_radius = float(self.get_parameter("bubble_radius_m").value)
+        self.ego_front_safety_m = max(
+            0.0, float(self.get_parameter("ego_front_safety_m").value)
+        )
+        self.ego_safety_width_m = max(
+            0.0, float(self.get_parameter("ego_safety_width_m").value)
+        )
+        self.ego_half_width_m = 0.5 * self.ego_safety_width_m
         self.gap_edge_inset_rad = math.radians(
             max(0.0, float(self.get_parameter("gap_edge_inset_deg").value))
         )
-        self.publish_debug_scan = _param_bool(self.get_parameter("publish_debug_scan").value)
 
         self.fov_angle = math.radians(float(self.get_parameter("fov_half_deg").value))
         # ≤0 이면 FOV 크롭 안 함 (스캔 전방향)
@@ -173,13 +199,17 @@ class FGMNode(Node):
         self._filt_y: float | None = None
         self._ego_speed = 0.0
         self._last_scan_ns: int | None = None
+        self._cpu_boost_active = False
+        # 초기 enable 상태에 맞춰 CPU 우선순위 플래그 동기화
+        self._set_cpu_boost(self._fgm_enabled)
 
         self.get_logger().info(
             f"FGM started (sim algorithm) | frame={self._laser_frame}, "
             f"target=v*{self.target_lead_time_s}s "
             f"[{self.target_min_m}~{self.target_max_m}]m, "
             f"scan_max={self.preprocess_dist}m, "
-            f"bubble={self.bubble_radius}m, "
+            f"obs_bubble={self.bubble_radius}m "
+            f"ego={self.ego_front_safety_m:.2f}m×{self.ego_safety_width_m:.2f}m, "
             f"edge_inset={math.degrees(self.gap_edge_inset_rad):.0f}°, "
             f"planner_enable={self.require_planner_enable}({fgm_en_t}), "
             f"fov={'FULL' if self._use_full_scan_fov else f'±{math.degrees(self.fov_angle):.0f}°'}, "
@@ -209,9 +239,42 @@ class FGMNode(Node):
     def fgm_enable_callback(self, msg: Bool) -> None:
         was = self._fgm_enabled
         self._fgm_enabled = bool(msg.data)
+        if self._fgm_enabled != was:
+            self._set_cpu_boost(self._fgm_enabled)
         if was and not self._fgm_enabled:
             # 목표 스무딩만 리셋 — 갭 마커/히스테리시스는 유지
             self._reset_fgm_filter_state(keep_gap_hysteresis=True)
+            self._publish_gap_marker_delete()
+
+    def _set_cpu_boost(self, enabled: bool) -> None:
+        """FGM enable 시 패스 코어 1순위(nice -20). OFF면 기본(nice 5)으로 복귀."""
+        if enabled == self._cpu_boost_active and _FGM_BOOST_FLAG.is_file():
+            want = "1" if enabled else "0"
+            try:
+                if _FGM_BOOST_FLAG.read_text(encoding="utf-8").strip() == want:
+                    return
+            except OSError:
+                pass
+        self._cpu_boost_active = bool(enabled)
+        try:
+            _FGM_BOOST_FLAG.write_text("1\n" if enabled else "0\n", encoding="utf-8")
+        except OSError as exc:
+            self.get_logger().warning(f"FGM CPU boost flag write failed: {exc}")
+            return
+        # 즉시 적용 (데몬이 5초마다 같은 플래그를 존중)
+        if _CPU_POLICY.is_file():
+            try:
+                subprocess.Popen(
+                    ["sudo", "-n", "bash", str(_CPU_POLICY), "--once"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                pass
+        self.get_logger().info(
+            f"FGM CPU priority {'BOOST(-20)' if enabled else 'normal(5)'}"
+        )
 
     def _reset_fgm_filter_state(self, *, keep_gap_hysteresis: bool = False) -> None:
         if not keep_gap_hysteresis:
@@ -219,6 +282,8 @@ class FGMNode(Node):
         self._filt_x = self._filt_y = None
 
     def _publish_gap_marker_delete(self) -> None:
+        if self.gap_marker_pub is None:
+            return
         m = Marker()
         m.header.stamp = self.get_clock().now().to_msg()
         m.header.frame_id = self._laser_frame
@@ -277,8 +342,10 @@ class FGMNode(Node):
         return float(nx), float(ny)
 
     def scan_callback(self, scan_msg: LaserScan) -> None:
-        # 갭 마커는 항상 계산·발행. /fgm_target 은 planner enable 일 때만.
+        # enable OFF면 갭 연산/마커 모두 스킵 (CPU 절약). Foxglove 마커는 enable ON일 때만.
         publish_target = (not self.require_planner_enable) or self._fgm_enabled
+        if not publish_target:
+            return
 
         now_ns = self.get_clock().now().nanoseconds
         dt = 0.025
@@ -371,15 +438,16 @@ class FGMNode(Node):
         gap_end_angle = float(wrapped[gap_end_orig])
         viz_stamp = self.get_clock().now().to_msg()
 
-        self.publish_gap_marker_angles(
-            gap_start_angle,
-            gap_end_angle,
-            float(ranges[gap_start_orig]),
-            float(ranges[gap_end_orig]),
-            viz_stamp,
-        )
+        if self.publish_gap_marker:
+            self.publish_gap_marker_angles(
+                gap_start_angle,
+                gap_end_angle,
+                float(ranges[gap_start_orig]),
+                float(ranges[gap_end_orig]),
+                viz_stamp,
+            )
 
-        if self.publish_debug_scan:
+        if self.publish_debug_scan and self.debug_scan_pub is not None:
             debug_msg = LaserScan()
             debug_msg.header = scan_msg.header
             debug_msg.angle_min = scan_msg.angle_min
@@ -442,6 +510,8 @@ class FGMNode(Node):
         stamp_msg,
     ) -> None:
         """선택 갭 양끝 V자 (정면 기준 wrap 각도)."""
+        if self.gap_marker_pub is None:
+            return
         marker = Marker()
         marker.header.stamp = stamp_msg
         marker.header.frame_id = self._laser_frame
@@ -524,7 +594,11 @@ class FGMNode(Node):
 
         인덱스 창이 아니라 wrap 각도 마스크라 0/360° 경계에서도 잘리지 않는다.
         """
-        half_width = obstacle_radius + self.bubble_radius
+        # 장애 반경 + [장애물 버블] + [차량 버블 반폭(폭/2)]
+        # 전방 길이는 planner ego_front_safety 로 타이밍 보정 (여기선 폭만).
+        half_width = (
+            obstacle_radius + self.bubble_radius + self.ego_half_width_m
+        )
         if dist <= half_width:
             half_angle = math.pi / 2.0
         else:

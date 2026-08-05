@@ -47,7 +47,7 @@ from extract_centerline_from_map import (
 # ============================================================
 CFG = {
     # maps/ 아래 yaml 파일명만 (절대경로 넣어도 됨)
-    "map_name": "cartographer_map_20260804_190909_rosmap.yaml",
+    "map_name": "cartographer_map_20260805_215352.yaml",
     "map_dir": CENTERLINE_CFG["map_dir"],
     "centerline_csv": os.path.join(script_dir, "..", "config", "centerline.csv"),
     "out_csv": os.path.join(script_dir, "..", "config", "raceline.csv"),

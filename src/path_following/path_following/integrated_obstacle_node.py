@@ -31,7 +31,7 @@ _DEFAULT_MAP_DIR = "/home/nvidia/f1tenth_ajou/maps"
 
 CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
-    "map_name": "cartographer_map_20260804_190909_rosmap.yaml",
+    "map_name": "cartographer_map_20260805_215352.yaml",
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",
@@ -47,20 +47,22 @@ CFG = {
     "min_cluster_points": 10,
     "max_obstacle_size_m": 0.85,
     "min_obstacle_size_m": 0.14,
-    "max_obstacle_range_m": 8.0,
+    "max_obstacle_range_m": 11.0,
     # 옆벽 잔차 컷. 회피로 비켜나는 동안에도 장애물을 계속 봐야 해서
     # 너무 좁으면 조향 도중 장애물이 사라져 경로가 되감긴다.
     "max_obstacle_lateral_m": 1.40,
     "match_dist_m": 1.00,
     "speed_threshold_mps": 0.45,
     # 확정/유지는 스캔 Hz와 무관하게 "초" 기준 (고속에서 지연이 곧 거리)
-    "confirm_time_s": 0.08,          # 발행 전 최소 관측 시간
-    "dynamic_confirm_time_s": 0.15,  # dynamic 분류 최소 관측 시간
-    "track_keep_time_s": 0.15,       # 미검출 시 트랙 유지 시간
+    "confirm_time_s": 0.04,          # 발행 전 최소 관측 시간 (반응↑)
+    "dynamic_confirm_time_s": 0.08,  # dynamic 분류 최소 관측 시간
+    "track_keep_time_s": 0.12,       # 미검출 시 트랙 유지 시간
     "vel_ema_alpha": 0.35,
     "max_track_speed_mps": 12.0,
-    "log_detections": True,
+    "log_detections": False,
     "log_throttle_sec": 1.0,
+    # Foxglove/RViz MarkerArray
+    "publish_markers": True,
 }
 
 @dataclass
@@ -142,6 +144,7 @@ class IntegratedObstacleNode(Node):
             max(0.1, float(self.get_parameter("log_throttle_sec").value)) * 1e9
         )
         self._log_detections = param_bool(self.get_parameter("log_detections").value)
+        self._publish_markers = param_bool(self.get_parameter("publish_markers").value)
         self._last_detect_log_ns = 0
         self._last_tf_warn_ns = 0
 
@@ -163,7 +166,11 @@ class IntegratedObstacleNode(Node):
         self.create_subscription(LaserScan, scan_topic, self.scan_callback, 10)
         self.static_pub = self.create_publisher(Float32MultiArray, static_topic, 10)
         self.dynamic_pub = self.create_publisher(Float32MultiArray, dynamic_topic, 10)
-        self.marker_pub = self.create_publisher(MarkerArray, markers_topic, 10)
+        self.marker_pub = (
+            self.create_publisher(MarkerArray, markers_topic, 10)
+            if self._publish_markers
+            else None
+        )
 
         self._tracks: list[Track] = []
         self._next_id = 0
@@ -381,11 +388,12 @@ class IntegratedObstacleNode(Node):
         return track.age_s >= min_age_s and track.speed >= speed_threshold
 
     def _publish_empty(self) -> None:
-        delete = MarkerArray()
-        m = Marker()
-        m.action = Marker.DELETEALL
-        delete.markers.append(m)
-        self.marker_pub.publish(delete)
+        if self.marker_pub is not None:
+            delete = MarkerArray()
+            m = Marker()
+            m.action = Marker.DELETEALL
+            delete.markers.append(m)
+            self.marker_pub.publish(delete)
         self.static_pub.publish(Float32MultiArray(data=[]))
         self.dynamic_pub.publish(Float32MultiArray(data=[]))
 
@@ -415,10 +423,11 @@ class IntegratedObstacleNode(Node):
 
         static_data: list[float] = []
         dynamic_data: list[float] = []
-        marker_array = MarkerArray()
-        delete_marker = Marker()
-        delete_marker.action = Marker.DELETEALL
-        marker_array.markers.append(delete_marker)
+        marker_array = MarkerArray() if self.marker_pub is not None else None
+        if marker_array is not None:
+            delete_marker = Marker()
+            delete_marker.action = Marker.DELETEALL
+            marker_array.markers.append(delete_marker)
         now_msg = self.get_clock().now().to_msg()
 
         static_count = 0
@@ -458,29 +467,31 @@ class IntegratedObstacleNode(Node):
                 color = (1.0, 0.0, 0.0)
                 static_count += 1
 
-            marker = Marker()
-            marker.header.frame_id = self._laser_frame
-            marker.header.stamp = now_msg
-            marker.ns = "integrated_obstacles"
-            marker.id = track.track_id
-            marker.type = Marker.CUBE
-            marker.action = Marker.ADD
-            marker.pose.position.x = track.laser_x
-            marker.pose.position.y = track.laser_y
-            marker.pose.position.z = 0.0
-            marker.scale.x = max(track.radius * 2.0, 0.1)
-            marker.scale.y = max(track.radius * 2.0, 0.1)
-            marker.scale.z = 0.2
-            marker.color.a = 0.8
-            marker.color.r = color[0]
-            marker.color.g = color[1]
-            marker.color.b = color[2]
-            marker.lifetime = MsgDuration(sec=0, nanosec=200000000)
-            marker_array.markers.append(marker)
+            if marker_array is not None:
+                marker = Marker()
+                marker.header.frame_id = self._laser_frame
+                marker.header.stamp = now_msg
+                marker.ns = "integrated_obstacles"
+                marker.id = track.track_id
+                marker.type = Marker.CUBE
+                marker.action = Marker.ADD
+                marker.pose.position.x = track.laser_x
+                marker.pose.position.y = track.laser_y
+                marker.pose.position.z = 0.0
+                marker.scale.x = max(track.radius * 2.0, 0.1)
+                marker.scale.y = max(track.radius * 2.0, 0.1)
+                marker.scale.z = 0.2
+                marker.color.a = 0.8
+                marker.color.r = color[0]
+                marker.color.g = color[1]
+                marker.color.b = color[2]
+                marker.lifetime = MsgDuration(sec=0, nanosec=200000000)
+                marker_array.markers.append(marker)
 
         self.static_pub.publish(Float32MultiArray(data=static_data))
         self.dynamic_pub.publish(Float32MultiArray(data=dynamic_data))
-        self.marker_pub.publish(marker_array)
+        if self.marker_pub is not None and marker_array is not None:
+            self.marker_pub.publish(marker_array)
 
         if self._log_detections and (static_count + dynamic_count) > 0:
             if now_ns - self._last_detect_log_ns >= self.log_throttle_ns:

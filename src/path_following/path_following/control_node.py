@@ -77,7 +77,7 @@ CFG = {
     # AUTO closed-loop speed control (max_target_speed_mps is target speed [m/s])
     "max_auto_duty": 0.70,        # AUTO final safety duty limit
     "max_target_speed_mps": 10.0,  # AUTO target speed
-    "target_speed_mps": 3.5,       # AUTO configured target speed
+    "target_speed_mps": 2.0,       # AUTO configured target speed
     "auto_duty_output_sign": 1.0,
     "speed_ff_duty_per_mps": 0.076,
     "speed_kp": 0.15,

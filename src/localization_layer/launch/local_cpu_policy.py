@@ -5,12 +5,14 @@ import os
 from launch.actions import ExecuteProcess, LogInfo, TimerAction
 
 # 코어1~4 = CPU 0-3
-LOCAL_CPU_PREFIX = ["taskset", "-c", "0-3"]
+# Node(prefix=...) expects a single string (shlex-split later). A list joins
+# without spaces and becomes 'taskset-c0-3'.
+LOCAL_CPU_PREFIX = "taskset -c 0-3"
 _POLICY = "/home/nvidia/f1tenth_ajou/scripts/apply_cpu_policy.sh"
 
 
 def local_cpu_prefix():
-    return list(LOCAL_CPU_PREFIX)
+    return LOCAL_CPU_PREFIX
 
 
 def cpu_policy_actions(*, apply_delay_sec: float = 3.0, start_daemon: bool = True):

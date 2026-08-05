@@ -59,8 +59,8 @@ CFG = {
     # 0.08 은 실주행 오차보다 훨씬 작아서(실측 |cte| p50=0.13, p95=0.40)
     # 대부분의 시간을 하한 0.25 에 붙어 달렸다 — 곡선에서 밀릴수록 복구력이
     # 약해지는 역효과. 하한 도달점을 p95 부근(0.375 m)으로 옮긴다.
-    "stanley_heading_cte_blend_m": 0.50,
-    "stanley_heading_min_weight": 0.25,
+    "stanley_heading_cte_blend_m": 0.3,
+    "stanley_heading_min_weight": 0.15,
     # LOCAL_PATH(회피) 전용.
     # heading_gain 은 "경로 헤딩 오차 → 조향" 배율. FGM 각도가 이미 필요한
     # 회피량을 담고 있어서 1.0 을 넘기면 목표점을 지나쳐 과회피가 된다.
@@ -69,8 +69,8 @@ CFG = {
     "local_path_heading_gain": 0.8,
     "local_path_cte_speed_cap_mps": 1.2,  # 고속에서 cte_term 약화 방지
     "local_path_lookahead_m": 0.70,      # heading 기준을 앞쪽 경로로
-    "local_path_steering_smooth_alpha": 0.70,
-    "local_path_steering_rate_limit_radps": 8.0,
+    "local_path_steering_smooth_alpha": 0.55,
+    "local_path_steering_rate_limit_radps": 10.0,
     # 횡가속 한계 조향 상한 — LOCAL_PATH(회피)에만 적용 (≤0 이면 끔).
     # CSV 추종은 낮은 stanley_k + 곡률 FF 조합으로 이미 튜닝돼 있어서
     # 여기에 상한을 걸면 곡선에서 FF가 잘려 언더스티어가 난다.
@@ -87,7 +87,10 @@ CFG = {
     "status_log_hz": 2.0,
     "planner_gate_stale_sec": 0.15,  # override False 미수신 시 빠르게 CSV 복귀
     "steering_rate_limit_radps": 6.5,
+    # Foxglove/모니터용 시각화·디버그 토픽
     "publish_tracked_path": True,
+    "publish_stanley_debug_topic": True,
+    "publish_control_diagnostics": True,
 }
 
 
@@ -222,6 +225,12 @@ class StanleyWaypointFollowNode(Node):
 
         _ptp = self.get_parameter("publish_tracked_path").value
         self.publish_tracked_path = param_bool(_ptp)
+        self.publish_stanley_debug_topic = param_bool(
+            self.get_parameter("publish_stanley_debug_topic").value
+        )
+        self.publish_control_diagnostics = param_bool(
+            self.get_parameter("publish_control_diagnostics").value
+        )
 
         csv_points = load_csv_xy(self.csv_path)
         reverse_track = param_bool(
@@ -287,25 +296,33 @@ class StanleyWaypointFollowNode(Node):
 
         self.drive_pub = self.create_publisher(AckermannDriveStamped, self.drive_topic, 10)
 
-        self.stanley_debug_pub = self.create_publisher(
-            Float64MultiArray, "/stanley/debug", 10
+        self.stanley_debug_pub = (
+            self.create_publisher(Float64MultiArray, "/stanley/debug", 10)
+            if self.publish_stanley_debug_topic
+            else None
         )
-        # Existing scalar diagnostics retained for current consumers.
-        self.raw_steer_cmd_pub = self.create_publisher(
-            Float64, "/control/raw_steer_cmd", 10
-        )
-        self.filtered_steer_cmd_pub = self.create_publisher(
-            Float64, "/control/filtered_steer_cmd", 10
-        )
-        self.cte_pub = self.create_publisher(
-            Float64, "/control/cross_track_error", 10
-        )
-        self.heading_error_pub = self.create_publisher(
-            Float64, "/control/heading_error", 10
-        )
-        self.path_curvature_pub = self.create_publisher(
-            Float64, "/control/path_curvature", 10
-        )
+        if self.publish_control_diagnostics:
+            self.raw_steer_cmd_pub = self.create_publisher(
+                Float64, "/control/raw_steer_cmd", 10
+            )
+            self.filtered_steer_cmd_pub = self.create_publisher(
+                Float64, "/control/filtered_steer_cmd", 10
+            )
+            self.cte_pub = self.create_publisher(
+                Float64, "/control/cross_track_error", 10
+            )
+            self.heading_error_pub = self.create_publisher(
+                Float64, "/control/heading_error", 10
+            )
+            self.path_curvature_pub = self.create_publisher(
+                Float64, "/control/path_curvature", 10
+            )
+        else:
+            self.raw_steer_cmd_pub = None
+            self.filtered_steer_cmd_pub = None
+            self.cte_pub = None
+            self.heading_error_pub = None
+            self.path_curvature_pub = None
 
         self.tracked_path_pub = None
         if self.publish_tracked_path:
@@ -775,6 +792,8 @@ class StanleyWaypointFollowNode(Node):
         kappa_used: float,
     ) -> None:
         """Publish the existing normalized/scalar control diagnostics."""
+        if not self.publish_control_diagnostics:
+            return
         if abs(self.max_steering) > 1e-6:
             raw_norm = raw_steer / self.max_steering
             filtered_norm = filtered_steer / self.max_steering
@@ -828,6 +847,8 @@ class StanleyWaypointFollowNode(Node):
           15 lat to CSV raceline point [m],
           16 veh_x [m], 17 veh_y [m], 18 veh_yaw [rad].
         """
+        if self.stanley_debug_pub is None:
+            return
         total_before_sat = ff_term + stanley_fb_sum
         msg = Float64MultiArray()
         msg.data = [

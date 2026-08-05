@@ -64,14 +64,16 @@ CFG = {
     "min_cluster_points": 10,
     "max_obstacle_size_m": 0.85,
     "min_obstacle_size_m": 0.14,
-    "max_obstacle_range_m": 8.0,
+    "max_obstacle_range_m": 11.0,
     "max_obstacle_lateral_m": 1.40,
     # 단발 잔차 깜빡임 완화 — 스캔 Hz와 무관하게 "초" 기준
     "persist_match_m": 0.55,
-    "confirm_time_s": 0.08,  # 발행 전 최소 관측 시간
+    "confirm_time_s": 0.04,  # 발행 전 최소 관측 시간 (반응↑)
     "keep_time_s": 0.10,     # 미검출 시 유지 시간
-    "log_detections": True,
+    "log_detections": False,
     "log_throttle_sec": 2.0,
+    # Foxglove/RViz MarkerArray
+    "publish_markers": True,
 }
 
 
@@ -189,6 +191,7 @@ class StaticObstacleNode(Node):
             max(0.1, float(self.get_parameter("log_throttle_sec").value)) * 1e9
         )
         self._log_detections = param_bool(self.get_parameter("log_detections").value)
+        self._publish_markers = param_bool(self.get_parameter("publish_markers").value)
         self._last_detect_log_ns = 0
         self._last_tf_warn_ns = 0
         # [(x, y, r, age_s, missed_s), ...]
@@ -213,7 +216,11 @@ class StaticObstacleNode(Node):
         self.subscription = self.create_subscription(
             LaserScan, scan_topic, self.listener_callback, 10
         )
-        self.marker_pub = self.create_publisher(MarkerArray, markers_topic, 10)
+        self.marker_pub = (
+            self.create_publisher(MarkerArray, markers_topic, 10)
+            if self._publish_markers
+            else None
+        )
         self.obstacle_pub = self.create_publisher(Float32MultiArray, obstacles_topic, 10)
 
         self.get_logger().info(
@@ -226,11 +233,12 @@ class StaticObstacleNode(Node):
         )
 
     def _publish_empty_obstacles(self) -> None:
-        marker_array = MarkerArray()
-        delete_marker = Marker()
-        delete_marker.action = Marker.DELETEALL
-        marker_array.markers.append(delete_marker)
-        self.marker_pub.publish(marker_array)
+        if self.marker_pub is not None:
+            marker_array = MarkerArray()
+            delete_marker = Marker()
+            delete_marker.action = Marker.DELETEALL
+            marker_array.markers.append(delete_marker)
+            self.marker_pub.publish(marker_array)
         obs_msg = Float32MultiArray()
         obs_msg.data = []
         self.obstacle_pub.publish(obs_msg)
@@ -345,10 +353,11 @@ class StaticObstacleNode(Node):
             # 아래 공통 publish 경로를 위해 raw_dets 비우고 계속할 수 없으므로
             # 여기서 확정 트랙만 재발행
             now_msg = self.get_clock().now().to_msg()
-            marker_array = MarkerArray()
-            delete_marker = Marker()
-            delete_marker.action = Marker.DELETEALL
-            marker_array.markers.append(delete_marker)
+            marker_array = MarkerArray() if self.marker_pub is not None else None
+            if marker_array is not None:
+                delete_marker = Marker()
+                delete_marker.action = Marker.DELETEALL
+                marker_array.markers.append(delete_marker)
             obstacle_data_list: list[float] = []
             final_obstacle_count = 0
             nearest_logic = None
@@ -360,37 +369,40 @@ class StaticObstacleNode(Node):
                 d = math.hypot(logic_x, logic_y)
                 if nearest_logic is None or d < nearest_logic[2]:
                     nearest_logic = (logic_x, logic_y, d)
-                marker = Marker()
-                marker.header.frame_id = self._laser_frame
-                marker.header.stamp = now_msg
-                marker.ns = "obstacles"
-                marker.id = oid
-                marker.type = Marker.CUBE
-                marker.action = Marker.ADD
-                marker.pose.position.x = logic_x
-                marker.pose.position.y = logic_y
-                marker.pose.position.z = 0.0
-                marker.scale.x = max(radius * 2.0, 0.1)
-                marker.scale.y = max(radius * 2.0, 0.1)
-                marker.scale.z = 0.2
-                marker.color.a = 0.8
-                marker.color.r = 1.0
-                marker.color.g = 0.0
-                marker.color.b = 0.0
-                marker.lifetime = MsgDuration(sec=0, nanosec=200000000)
-                marker_array.markers.append(marker)
+                if marker_array is not None:
+                    marker = Marker()
+                    marker.header.frame_id = self._laser_frame
+                    marker.header.stamp = now_msg
+                    marker.ns = "obstacles"
+                    marker.id = oid
+                    marker.type = Marker.CUBE
+                    marker.action = Marker.ADD
+                    marker.pose.position.x = logic_x
+                    marker.pose.position.y = logic_y
+                    marker.pose.position.z = 0.0
+                    marker.scale.x = max(radius * 2.0, 0.1)
+                    marker.scale.y = max(radius * 2.0, 0.1)
+                    marker.scale.z = 0.2
+                    marker.color.a = 0.8
+                    marker.color.r = 1.0
+                    marker.color.g = 0.0
+                    marker.color.b = 0.0
+                    marker.lifetime = MsgDuration(sec=0, nanosec=200000000)
+                    marker_array.markers.append(marker)
                 final_obstacle_count += 1
-            self.marker_pub.publish(marker_array)
+            if self.marker_pub is not None and marker_array is not None:
+                self.marker_pub.publish(marker_array)
             obs_msg = Float32MultiArray()
             obs_msg.data = obstacle_data_list
             self.obstacle_pub.publish(obs_msg)
             return
 
         now_msg = self.get_clock().now().to_msg()
-        marker_array = MarkerArray()
-        delete_marker = Marker()
-        delete_marker.action = Marker.DELETEALL
-        marker_array.markers.append(delete_marker)
+        marker_array = MarkerArray() if self.marker_pub is not None else None
+        if marker_array is not None:
+            delete_marker = Marker()
+            delete_marker.action = Marker.DELETEALL
+            marker_array.markers.append(delete_marker)
 
         obstacle_data_list: list[float] = []
         final_obstacle_count = 0
@@ -452,28 +464,30 @@ class StaticObstacleNode(Node):
             if nearest_logic is None or d < nearest_logic[2]:
                 nearest_logic = (logic_x, logic_y, d)
 
-            marker = Marker()
-            marker.header.frame_id = self._laser_frame
-            marker.header.stamp = now_msg
-            marker.ns = "obstacles"
-            marker.id = oid
-            marker.type = Marker.CUBE
-            marker.action = Marker.ADD
-            marker.pose.position.x = logic_x
-            marker.pose.position.y = logic_y
-            marker.pose.position.z = 0.0
-            marker.scale.x = max(radius * 2.0, 0.1)
-            marker.scale.y = max(radius * 2.0, 0.1)
-            marker.scale.z = 0.2
-            marker.color.a = 0.8
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
-            marker.lifetime = MsgDuration(sec=0, nanosec=200000000)
-            marker_array.markers.append(marker)
+            if marker_array is not None:
+                marker = Marker()
+                marker.header.frame_id = self._laser_frame
+                marker.header.stamp = now_msg
+                marker.ns = "obstacles"
+                marker.id = oid
+                marker.type = Marker.CUBE
+                marker.action = Marker.ADD
+                marker.pose.position.x = logic_x
+                marker.pose.position.y = logic_y
+                marker.pose.position.z = 0.0
+                marker.scale.x = max(radius * 2.0, 0.1)
+                marker.scale.y = max(radius * 2.0, 0.1)
+                marker.scale.z = 0.2
+                marker.color.a = 0.8
+                marker.color.r = 1.0
+                marker.color.g = 0.0
+                marker.color.b = 0.0
+                marker.lifetime = MsgDuration(sec=0, nanosec=200000000)
+                marker_array.markers.append(marker)
             final_obstacle_count += 1
 
-        self.marker_pub.publish(marker_array)
+        if self.marker_pub is not None and marker_array is not None:
+            self.marker_pub.publish(marker_array)
         obs_msg = Float32MultiArray()
         obs_msg.data = obstacle_data_list
         self.obstacle_pub.publish(obs_msg)

@@ -69,22 +69,34 @@ CFG = {
     "raceline_corridor_enable": True,
     "corridor_max_lateral_from_raceline_m": 0.40,
     "obstacle_forward_min_m": 0.30,
-    "obstacle_forward_max_m": 10.0,
+    "obstacle_forward_max_m": 12.0,
     "obstacle_lateral_abs_max_m": 0.42,
     "obstacle_tf_timeout_sec": 0.15,
     "laser_to_base_x_m": 0.275,
+    # [차량 버블] 뒷축→전방 길이. 게이트 거리 d에서 빼서 앞범퍼 기준으로 회피.
+    # 폭(ego_safety_width)은 fgm_node 에서 섹터 반폭으로 사용.
+    "ego_front_safety_m": 0.30,
     "use_fgm": True,
-    # 더 일찍 회피 진입 (기존 on=2.0 / fgm=6.0)
+    # 회피 거리 베이스 (avoid_timing_ref_mps 기준). 실제 게이트는 속도×마진으로 스케일.
+    # 예: v=2m/s, margin=1.3 → avoid_on ≈ 3.5×1.3 = 4.55m (기존보다 ~30% 일찍)
     "avoid_on_m": 3.5,
     "avoid_off_m": 5.0,
     "fgm_enable_m": 8.0,
+    "avoid_timing_ref_mps": 2.0,
+    "avoid_timing_margin": 1.30,
+    "avoid_on_min_m": 2.8,
+    "avoid_on_max_m": 7.5,
+    "avoid_off_min_m": 3.8,
+    "avoid_off_max_m": 9.0,
+    "fgm_enable_min_m": 5.0,
+    "fgm_enable_max_m": 11.0,
     "fgm_enable_topic": "/planner/fgm_enable",
     "avoid_on_count_th": 1,
-    "avoid_off_count_th": 4,
+    "avoid_off_count_th": 3,
     "forward_cone_deg": 75.0,
     "avoid_min_forward_x_m": 0.2,
     "avoid_trigger_lateral_abs_max_m": 0.55,
-    "fgm_target_stale_sec": 0.25,
+    "fgm_target_stale_sec": 0.18,
     "avoid_exit_use_passed": True,
     "avoid_pass_rear_x_m": -1.20,
     "avoid_exit_lateral_abs_max_m": 2.80,
@@ -106,7 +118,7 @@ CFG = {
     "avoid_skip_rejoin_if_cte_ok": False,
     "rejoin_speed_scale": 0.5,
     "avoid_merge_tail_max": 180,
-    "publish_hz": 50.0,
+    "publish_hz": 40.0,
     "path_window_size": 140,
     "path_anchor_half_width": 120,
     "map_frame": "map",
@@ -121,13 +133,14 @@ CFG = {
     "csv_track_viz_topic": "/raceline_csv_path",
     "csv_track_viz_hz": 2.0,
     "csv_track_viz_stride": 1,
-    "strategy_bridge_enable": True,
+    # drive_strategy 미사용 시 브리지/20Hz 재발행 끔 (코드는 유지)
+    "strategy_bridge_enable": False,
     "strategy_speed_multiplier_topic": "/strategy/speed_multiplier",
     "strategy_speed_condition_topic": "/strategy/speed_condition",
     "planner_speed_scale_out_topic": "/planner/speed_scale",
     "planner_speed_condition_out_topic": "/planner/speed_condition",
     "planner_mode_topic": "/planner/mode",
-    "status_log_hz": 2.0,  # ego/obs/rel 속도 STATUS (0=끔)
+    "status_log_hz": 0.0,  # ego/obs/rel 속도 STATUS (0=끔)
     "verbose_logs": False,
 }
 
@@ -207,6 +220,26 @@ class LocalPlannerNode(Node):
             self.avoid_on_m,
             float(self.get_parameter("fgm_enable_m").value),
         )
+        self.avoid_timing_ref_mps = max(
+            0.3, float(self.get_parameter("avoid_timing_ref_mps").value)
+        )
+        self.avoid_timing_margin = max(
+            0.5, float(self.get_parameter("avoid_timing_margin").value)
+        )
+        self.avoid_on_min_m = max(0.5, float(self.get_parameter("avoid_on_min_m").value))
+        self.avoid_on_max_m = max(
+            self.avoid_on_min_m, float(self.get_parameter("avoid_on_max_m").value)
+        )
+        self.avoid_off_min_m = max(0.5, float(self.get_parameter("avoid_off_min_m").value))
+        self.avoid_off_max_m = max(
+            self.avoid_off_min_m, float(self.get_parameter("avoid_off_max_m").value)
+        )
+        self.fgm_enable_min_m = max(
+            0.5, float(self.get_parameter("fgm_enable_min_m").value)
+        )
+        self.fgm_enable_max_m = max(
+            self.fgm_enable_min_m, float(self.get_parameter("fgm_enable_max_m").value)
+        )
         self.avoid_on_count_th = max(
             1, int(self.get_parameter("avoid_on_count_th").value)
         )
@@ -271,6 +304,9 @@ class LocalPlannerNode(Node):
         )
         self.laser_to_base_x_m = max(
             0.0, float(self.get_parameter("laser_to_base_x_m").value)
+        )
+        self.ego_front_safety_m = max(
+            0.0, float(self.get_parameter("ego_front_safety_m").value)
         )
         self.exit_require_csv_clear = param_bool(
             self.get_parameter("exit_require_csv_clear").value
@@ -382,9 +418,10 @@ class LocalPlannerNode(Node):
         self._rejoin_target_s: float | None = None
         self._last_mode_log_ns = 0
         self._last_avoid_warn_ns = 0
-        self.create_subscription(Float64, st_mul, self._cb_strategy_multiplier, 10)
-        self.create_subscription(UInt8, st_cond, self._cb_strategy_condition, 10)
-        self.create_timer(0.05, self._republish_planner_speed)
+        if self._strategy_bridge_enable:
+            self.create_subscription(Float64, st_mul, self._cb_strategy_multiplier, 10)
+            self.create_subscription(UInt8, st_cond, self._cb_strategy_condition, 10)
+            self.create_timer(0.05, self._republish_planner_speed)
 
         _dbg = self.get_parameter("publish_planner_debug").value
         self.publish_planner_debug = (
@@ -446,8 +483,9 @@ class LocalPlannerNode(Node):
             f"Local planner: gate `{gate_topic}`, out={out_topic}, "
             f"corridor≤{self._corridor_max_lat}m fwd=[{self._obstacle_forward_min_m},"
             f"{self._obstacle_forward_max_m}]m, "
-            f"avoid_on≤{self.avoid_on_m}m avoid_off≥{self.avoid_off_m}m "
-            f"fgm_enable≤{self.fgm_enable_m}m->{fgm_en_topic}, "
+            f"avoid_on_base={self.avoid_on_m}m@{self.avoid_timing_ref_mps:.1f}m/s "
+            f"×{self.avoid_timing_margin:.2f} "
+            f"fgm_base={self.fgm_enable_m}m->{fgm_en_topic}, "
             f"dynamic={dyn_obs_topic or 'OFF'}, ego_speed={odom_topic}, "
             f"cone={cone_deg}deg, rejoin={self.rejoin_enable}, use_fgm={self.use_fgm}"
             + dbg_bits
@@ -658,6 +696,35 @@ class LocalPlannerNode(Node):
         _, _, rel_speed, _ = self._dynamic_threat_metrics(filtered_dynamic)
         return self._dynamic_obstacles_remain(filtered_dynamic, rel_speed)
 
+    def _speed_scaled_dist(self, base_m: float, min_m: float, max_m: float) -> float:
+        """ref 속도에서의 base 거리를 (v/ref)*margin 으로 스케일 후 clamp."""
+        v = max(0.0, float(self._ego_speed_mps))
+        # 정지/극저속에서도 최소 게이트는 유지 (너무 늦게 켜지지 않게)
+        scale = self.avoid_timing_margin * (max(v, 0.5) / self.avoid_timing_ref_mps)
+        return max(min_m, min(max_m, base_m * scale))
+
+    def _effective_avoid_gates(self) -> tuple[float, float, float]:
+        """속도 기반 (avoid_on, avoid_off, fgm_enable) [m]."""
+        on_m = self._speed_scaled_dist(
+            self.avoid_on_m, self.avoid_on_min_m, self.avoid_on_max_m
+        )
+        off_m = self._speed_scaled_dist(
+            self.avoid_off_m, self.avoid_off_min_m, self.avoid_off_max_m
+        )
+        if off_m <= on_m:
+            off_m = on_m + 0.3
+        fgm_m = self._speed_scaled_dist(
+            self.fgm_enable_m, self.fgm_enable_min_m, self.fgm_enable_max_m
+        )
+        fgm_m = max(fgm_m, on_m)
+        return on_m, off_m, fgm_m
+
+    def _nose_adjusted_dist(self, d: float) -> float:
+        """뒷축 기준 표면거리 → 앞범퍼 여유(ego_front_safety)만큼 더 가까운 것으로 취급."""
+        if not math.isfinite(d):
+            return d
+        return max(0.0, float(d) - self.ego_front_safety_m)
+
     def _static_wants_fgm_local_path(
         self, filtered: list, d_closest: float, d_gate: float
     ) -> bool:
@@ -665,9 +732,10 @@ class LocalPlannerNode(Node):
             return False
         if self._static_obstacles_remain():
             return True
-        if math.isfinite(d_gate) and d_gate <= self.fgm_enable_m:
+        _, _, fgm_m = self._effective_avoid_gates()
+        if math.isfinite(d_gate) and d_gate <= fgm_m:
             return True
-        if math.isfinite(d_closest) and d_closest <= self.fgm_enable_m:
+        if math.isfinite(d_closest) and d_closest <= fgm_m:
             return True
         return False
 
@@ -680,7 +748,8 @@ class LocalPlannerNode(Node):
             return False
         if not math.isfinite(d_dyn_closest):
             return False
-        return d_dyn_closest <= self.avoid_on_m
+        on_m, _, _ = self._effective_avoid_gates()
+        return d_dyn_closest <= on_m
 
     def _avoidance_fully_cleared(
         self, filtered: list, current_pose: PoseStamped | None
@@ -1177,11 +1246,12 @@ class LocalPlannerNode(Node):
                 self._log_mode_transition(old_mode, d_closest)
             return
 
-        static_obstacle_on = d_closest <= self.avoid_on_m
+        on_m, _off_m, fgm_m = self._effective_avoid_gates()
+        static_obstacle_on = d_closest <= on_m
         dynamic_obstacle_on = (
             len(filtered_dynamic) >= 6
             and math.isfinite(d_dyn_closest)
-            and d_dyn_closest <= self.avoid_on_m
+            and d_dyn_closest <= on_m
             and rel_speed > 0.0
         )
         obstacle_on = static_obstacle_on or dynamic_obstacle_on
@@ -1204,17 +1274,17 @@ class LocalPlannerNode(Node):
         elif self.mode == "AVOID":
             static_still_ahead = (
                 still_blocking
-                or (math.isfinite(d_gate) and d_gate <= self.fgm_enable_m)
-                or (math.isfinite(d_closest) and d_closest <= self.fgm_enable_m)
+                or (math.isfinite(d_gate) and d_gate <= fgm_m)
+                or (math.isfinite(d_closest) and d_closest <= fgm_m)
             )
             dynamic_still_ahead = (
                 len(filtered_dynamic) >= 6
                 and rel_speed > 0.0
                 and (
-                    (math.isfinite(d_dyn_gate) and d_dyn_gate <= self.fgm_enable_m)
+                    (math.isfinite(d_dyn_gate) and d_dyn_gate <= fgm_m)
                     or (
                         math.isfinite(d_dyn_closest)
-                        and d_dyn_closest <= self.fgm_enable_m
+                        and d_dyn_closest <= fgm_m
                     )
                 )
             )
@@ -1381,17 +1451,18 @@ class LocalPlannerNode(Node):
     ) -> None:
         """
         FGM = 회피 주체. AVOID 전 구간 켜 두고, 접근 중에도 미리 켠다.
-        정적/동적 모두 fgm_enable_m(기본 6m) 이내면 enable.
+        정적/동적 모두 속도 스케일된 fgm_enable 이내면 enable.
         """
+        _, _, fgm_m = self._effective_avoid_gates()
         static_approaching = (
             len(filtered) >= 4
             and math.isfinite(d_gate)
-            and d_gate <= self.fgm_enable_m
+            and d_gate <= fgm_m
         )
         dynamic_approaching = (
             len(filtered_dynamic) >= 6
             and math.isfinite(d_dyn_gate)
-            and d_dyn_gate <= self.fgm_enable_m
+            and d_dyn_gate <= fgm_m
         )
         approaching = static_approaching or dynamic_approaching
         enable = self.use_fgm and (self.mode == "AVOID" or approaching)
@@ -1402,11 +1473,14 @@ class LocalPlannerNode(Node):
     def timer_publish(self):
         filtered = self._filter_obstacles_for_planner(self._obstacle_data)
         filtered_dynamic = self._filter_dynamic_for_planner(self._dynamic_obstacle_data)
-        d_closest = self._planner_closest_obstacle_m(filtered)
-        d_gate = self._planner_gate_closest_m(filtered)
+        # 뒷축 거리 − 전방 오버행 → 앞범퍼 기준으로 게이트 판단
+        d_closest = self._nose_adjusted_dist(self._planner_closest_obstacle_m(filtered))
+        d_gate = self._nose_adjusted_dist(self._planner_gate_closest_m(filtered))
         d_dyn_closest, d_dyn_gate, rel_speed, obs_speed = self._dynamic_threat_metrics(
             filtered_dynamic
         )
+        d_dyn_closest = self._nose_adjusted_dist(d_dyn_closest)
+        d_dyn_gate = self._nose_adjusted_dist(d_dyn_gate)
         self._last_obs_speed_mps = obs_speed
         self._last_rel_speed_mps = rel_speed
         self._last_d_dyn_closest = d_dyn_closest
