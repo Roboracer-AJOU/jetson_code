@@ -118,10 +118,23 @@ apply_policy() {
     apply_one "4-5" -15 "${lp}" "control"
   done < <(pids_matching 'path_following/lib/path_following/control_node|python[0-9.]* control_node\.py')
 
+  # FGM enable 중이면 FGM을 패스 코어 1순위 (nice -20). 플래그: /tmp/f1tenth_fgm_boost
+  local fgm_nice=5
+  local fgm_boost=0
+  if [[ -f /tmp/f1tenth_fgm_boost ]]; then
+    case "$(tr -d '[:space:]' < /tmp/f1tenth_fgm_boost 2>/dev/null || true)" in
+      1|true|TRUE|on|ON) fgm_boost=1; fgm_nice=-20 ;;
+    esac
+  fi
+
   while read -r lp; do apply_one "4-5" -10 "${lp}" "stanley"; done < <(pids_matching 'stanley_waypoint_follow_node')
   while read -r lp; do apply_one "4-5" -5 "${lp}" "planner"; done < <(pids_matching 'local_planner_node')
   while read -r lp; do apply_one "4-5" 0 "${lp}" "obstacle"; done < <(pids_matching 'integrated_obstacle_node|static_obstacle_node')
-  while read -r lp; do apply_one "4-5" 5 "${lp}" "fgm"; done < <(pids_matching 'fgm_node')
+  local fgm_label="fgm"
+  [[ "${fgm_boost}" -eq 1 ]] && fgm_label="fgm-boost"
+  while read -r lp; do
+    apply_one "4-5" "${fgm_nice}" "${lp}" "${fgm_label}"
+  done < <(pids_matching 'fgm_node')
   while read -r lp; do apply_one "4-5" 10 "${lp}" "path-launch"; done < <(pgrep -af 'ros2 launch path_following' | awk '/path_follow_/ {print $1}')
   while read -r lp; do apply_one "4-5" 19 "${lp}" "viz"; done < <(pids_matching 'stack_status_node|drive_monitor')
 }
