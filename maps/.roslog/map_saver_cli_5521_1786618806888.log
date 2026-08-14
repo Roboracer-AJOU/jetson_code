@@ -1,0 +1,15 @@
+[INFO] [1786618806.994628713] [map_saver]: 
+	map_saver lifecycle node launched. 
+	Waiting on external lifecycle transitions to activate
+	See https://design.ros2.org/articles/node_lifecycle.html for more information.
+[INFO] [1786618806.995171439] [map_saver]: Creating
+[INFO] [1786618806.996786017] [map_saver]: Configuring
+[INFO] [1786618807.004398166] [map_saver]: Saving map from '/map' topic to '/home/nvidia/f1tenth_ajou/maps/cartographer_map_20260813_200006' file
+[WARN] [1786618807.004626201] [map_saver]: Free threshold unspecified. Setting it to default value: 0.250000
+[WARN] [1786618807.004657785] [map_saver]: Occupied threshold unspecified. Setting it to default value: 0.650000
+[INFO] [1786618807.102345097] [map_io]: Received a 176 X 146 map @ 0.05 m/pix
+[INFO] [1786618807.125039707] [map_io]: Writing map occupancy data to /home/nvidia/f1tenth_ajou/maps/cartographer_map_20260813_200006.png
+[INFO] [1786618807.127361032] [map_io]: Writing map metadata to /home/nvidia/f1tenth_ajou/maps/cartographer_map_20260813_200006.yaml
+[INFO] [1786618807.127727054] [map_io]: Map saved
+[INFO] [1786618807.127759217] [map_saver]: Map saved successfully
+[INFO] [1786618807.129860072] [map_saver]: Destroying
