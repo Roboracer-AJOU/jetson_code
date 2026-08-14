@@ -37,9 +37,28 @@ def generate_launch_description():
     enable_vehicle_control = LaunchConfiguration("enable_vehicle_control")
     status_log_hz = LaunchConfiguration("status_log_hz")
     verbose_logs = LaunchConfiguration("verbose_logs")
+    track = LaunchConfiguration("track")
+    enable_aeb = LaunchConfiguration("enable_aeb")
 
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "enable_aeb",
+                default_value="true",
+                description=(
+                    "비상 제동(AEB) 노드. /scan TTC 로 /emergency_brake 발행. "
+                    "control_node 가 받아 역토크로 정지한다."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "track",
+                default_value="",
+                description=(
+                    "주행 라인: raceline | centerline | auto. "
+                    "빈 값이면 track_sliding.DEFAULT_TRACK. "
+                    "local_planner 와 stanley 에 동시에 적용된다."
+                ),
+            ),
             DeclareLaunchArgument(
                 "enable_vehicle_control",
                 default_value="false",
@@ -80,11 +99,21 @@ def generate_launch_description():
                 arguments=_QUIET,
                 parameters=[
                     {
+                        "track": ParameterValue(track, value_type=str),
                         "verbose_logs": ParameterValue(
                             verbose_logs, value_type=bool
                         ),
                     }
                 ],
+            ),
+            Node(
+                package="path_following",
+                executable="emergency_brake_node",
+                name="emergency_brake_node",
+                output="screen",
+                prefix=_CPU,
+                arguments=_QUIET,
+                condition=IfCondition(enable_aeb),
             ),
             Node(
                 package="path_following",
@@ -94,6 +123,7 @@ def generate_launch_description():
                 prefix=_CPU,
                 parameters=[
                     {
+                        "track": ParameterValue(track, value_type=str),
                         "status_log_hz": ParameterValue(
                             status_log_hz, value_type=float
                         ),

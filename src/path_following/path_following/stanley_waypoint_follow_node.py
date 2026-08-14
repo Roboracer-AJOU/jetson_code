@@ -8,10 +8,12 @@ Pure Pursuit 버전(waypoint_follow_node)과 별도 executable.
 from __future__ import annotations
 
 import math
+import os
 from typing import List, Tuple
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import PoseStamped
@@ -20,9 +22,11 @@ from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from path_following.track_sliding import (
+    DEFAULT_REVERSE_TRACK,
     LoopTrackSliding,
     apply_track_direction,
-    load_csv_xy,
+    apply_track_direction_scalars,
+    load_csv_xyv,
     param_bool,
     resolve_csv_path,
 )
@@ -32,8 +36,26 @@ from path_following.track_sliding import (
 # USER TUNING — Stanley 경로 추종 (여기만 수정)
 # ============================================================
 CFG = {
+    # 주행 라인 선택: "raceline" | "centerline" | "auto" | "" (=track_sliding.DEFAULT_TRACK)
+    # 런치로 한 번에 바꾸려면: ros2 launch ... track:=centerline
+    # local_planner 와 반드시 같은 값이어야 한다 (런치 인자가 둘 다 세팅).
+    "track": "",
+    # track 을 무시하고 특정 CSV 를 쓰고 싶을 때만 절대경로 지정
     "csv_path": "",
-    "reverse_track_direction": True,  # 200005 raceline: False (True면 hdg_err ~140° 반대)
+    # 주행 방향. local_planner 와 반드시 같아야 해서 track_sliding 한 곳에서 온다.
+    "reverse_track_direction": DEFAULT_REVERSE_TRACK,
+    # ---- 목표 속도 (CSV 3번째 열) ----
+    # CSV 에 v 열이 있으면 그 값을 /drive.speed 로 내보낸다. control_node 가
+    # use_drive_speed_command=True 면 이 값을 그대로 추종한다.
+    # v 열이 없는 구형 CSV 면 speed_fallback_mps 로 전 구간 정속 주행.
+    "speed_from_csv": True,
+    "speed_fallback_mps": 0.0,   # 0 = 정지 (안전측). 정속 실험은 여기에 값
+    "speed_scale": 1.0,          # 실차에서 급하게 줄일 때. CSV 재생성 없이 배율
+    "speed_max_mps": 0.0,        # 하드 상한. 0 = 제한 없음
+    # 앞으로 이 거리만큼의 최소 속도를 취해 제어·측위 지연을 흡수. 0 = 끔
+    "speed_lookahead_m": 0.3,
+    # 전략(회피·추월) 배율. local_planner 가 발행. 없으면 1.0
+    "speed_scale_topic": "/planner/speed_scale",
     "path_window_size": 140,
     "path_anchor_half_width": 120,
     "map_frame": "map",
@@ -59,8 +81,8 @@ CFG = {
     # 0.08 은 실주행 오차보다 훨씬 작아서(실측 |cte| p50=0.13, p95=0.40)
     # 대부분의 시간을 하한 0.25 에 붙어 달렸다 — 곡선에서 밀릴수록 복구력이
     # 약해지는 역효과. 하한 도달점을 p95 부근(0.375 m)으로 옮긴다.
-    "stanley_heading_cte_blend_m": 0.3,
-    "stanley_heading_min_weight": 0.15,
+    "stanley_heading_cte_blend_m": 0.5,
+    "stanley_heading_min_weight": 0.20,
     # LOCAL_PATH(회피) 전용.
     # heading_gain 은 "경로 헤딩 오차 → 조향" 배율. FGM 각도가 이미 필요한
     # 회피량을 담고 있어서 1.0 을 넘기면 목표점을 지나쳐 과회피가 된다.
@@ -79,7 +101,7 @@ CFG = {
     "max_lateral_accel_mps2": 5.0,
     # 곡률 피드포워드: δ = δ_ff(κ) + Stanley. 직선용 stanley_k 는 유지.
     "enable_steer_ff": True,
-    "ff_gain": 2.0,              # δ_ff = ff_gain * ff_sign * atan(L·κ)
+    "ff_gain": 2.3,              # δ_ff = ff_gain * ff_sign * atan(L·κ)
     "ff_sign": 1.0,              # 좌우 반대면 -1.0
     "ff_lookahead_m": 0.8,       # best_i 기준 앞쪽 평균 곡률 구간 [m]
     "ff_kappa_clip": 2.5,        # |κ| 상한 [1/m] (스파이크 방지)
@@ -140,11 +162,17 @@ class StanleyWaypointFollowNode(Node):
         for key, value in CFG.items():
             self.declare_parameter(key, value)
 
+        self.track = self.get_parameter("track").get_parameter_value().string_value
         self.csv_path = resolve_csv_path(
-            self.get_parameter("csv_path").get_parameter_value().string_value
+            self.get_parameter("csv_path").get_parameter_value().string_value,
+            self.track,
         )
         if not self.csv_path:
             raise RuntimeError("stanley_waypoint_follow_node: csv_path is required.")
+        # 해석 결과를 파라미터에 되써서 `ros2 param get ... csv_path` 로 확인 가능하게
+        self.set_parameters(
+            [Parameter("csv_path", Parameter.Type.STRING, self.csv_path)]
+        )
 
         self.path_window_size = int(self.get_parameter("path_window_size").value)
         self.path_anchor_half_width = int(
@@ -232,11 +260,12 @@ class StanleyWaypointFollowNode(Node):
             self.get_parameter("publish_control_diagnostics").value
         )
 
-        csv_points = load_csv_xy(self.csv_path)
+        csv_points, csv_speeds = load_csv_xyv(self.csv_path)
         reverse_track = param_bool(
             self.get_parameter("reverse_track_direction").value
         )
         csv_points = apply_track_direction(csv_points, reverse_track)
+        csv_speeds = apply_track_direction_scalars(csv_speeds, reverse_track)
         if len(csv_points) < 2:
             raise RuntimeError(f"CSV needs at least 2 points: {self.csv_path}")
 
@@ -245,6 +274,7 @@ class StanleyWaypointFollowNode(Node):
             self.path_window_size,
             self.path_anchor_half_width,
         )
+        self._setup_speed_profile(csv_points, csv_speeds)
 
         self._local_path: List[Tuple[float, float]] = []
         self._path_poses: List[Tuple[float, float]] = []
@@ -333,9 +363,14 @@ class StanleyWaypointFollowNode(Node):
         self.timer = self.create_timer(self.timer_period, self._timer_cb)
 
         self.get_logger().info(
-            f"Stanley waypoint follower | CSV={self.csv_path}, "
+            f"Stanley waypoint follower | track=[{os.path.basename(self.csv_path)}] "
+            f"CSV={self.csv_path}, "
             f"points={len(csv_points)}, reverse_track={reverse_track}, "
-            f"drive={self.drive_topic} (steer-only), "
+            f"drive={self.drive_topic} (steer + speed), "
+            f"speed_src={self._speed_source} "
+            f"v[{min(self._speed_profile):.2f}~{max(self._speed_profile):.2f}]m/s "
+            f"scale={self._speed_scale_cfg:.2f} "
+            f"cap={self._speed_max_mps if self._speed_max_mps > 0 else 'none'}, "
             f"measured_speed={self.measured_speed_topic}, "
             f"telemetry={self.telemetry_topic}, "
             f"stanley_k={self.stanley_k}, soft={self.stanley_softening}, "
@@ -874,11 +909,102 @@ class StanleyWaypointFollowNode(Node):
         ]
         self.stanley_debug_pub.publish(msg)
 
-    def _publish_drive(self, steering: float) -> None:
-        # 속도는 control_node 전담. /drive 에는 조향만 넣는다.
+    # ------------------------------------------------------------
+    # 목표 속도 (CSV 3번째 열)
+    # ------------------------------------------------------------
+    def _setup_speed_profile(self, csv_points, csv_speeds) -> None:
+        """웨이포인트별 목표 속도 배열을 만든다.
+
+        CSV v 열(오프라인에서 곡률·가감속 한계로 계산됨)을 그대로 쓰되,
+        speed_lookahead_m 구간의 최솟값을 취해 제어·측위 지연을 흡수한다.
+        (감속은 조금 일찍, 가속은 늦게 → 안전측)
+        """
+        self._speed_from_csv = param_bool(
+            self.get_parameter("speed_from_csv").value
+        )
+        self._speed_fallback_mps = max(
+            0.0, float(self.get_parameter("speed_fallback_mps").value)
+        )
+        self._speed_scale_cfg = max(
+            0.0, float(self.get_parameter("speed_scale").value)
+        )
+        self._speed_max_mps = max(
+            0.0, float(self.get_parameter("speed_max_mps").value)
+        )
+        lookahead_m = max(0.0, float(self.get_parameter("speed_lookahead_m").value))
+
+        n = len(csv_points)
+        if self._speed_from_csv and csv_speeds and len(csv_speeds) == n:
+            profile = [max(0.0, float(v)) for v in csv_speeds]
+            self._speed_source = "csv"
+        else:
+            profile = [self._speed_fallback_mps] * n
+            self._speed_source = (
+                "fallback(csv has no v column)"
+                if self._speed_from_csv
+                else "fallback(speed_from_csv=False)"
+            )
+
+        if lookahead_m > 0.0 and n >= 2 and self._speed_source == "csv":
+            profile = self._min_over_lookahead(csv_points, profile, lookahead_m)
+
+        self._speed_profile = profile
+        # 전략(회피·추월) 배율. local_planner 가 /planner/speed_scale 로 발행.
+        self._strategy_speed_scale = 1.0
+        scale_topic = str(self.get_parameter("speed_scale_topic").value).strip()
+        if scale_topic:
+            self.create_subscription(
+                Float64, scale_topic, self._speed_scale_cb, 10
+            )
+
+    @staticmethod
+    def _min_over_lookahead(points, profile, lookahead_m: float):
+        """각 점에서 앞으로 lookahead_m 안에 있는 목표 속도의 최솟값."""
+        n = len(points)
+        seg = [
+            math.hypot(
+                points[(i + 1) % n][0] - points[i][0],
+                points[(i + 1) % n][1] - points[i][1],
+            )
+            for i in range(n)
+        ]
+        out = [0.0] * n
+        for i in range(n):
+            v_min = profile[i]
+            travelled = 0.0
+            k = i
+            while travelled < lookahead_m:
+                travelled += seg[k]
+                k = (k + 1) % n
+                if k == i:
+                    break
+                if profile[k] < v_min:
+                    v_min = profile[k]
+            out[i] = v_min
+        return out
+
+    def _speed_scale_cb(self, msg: Float64) -> None:
+        # 감속만 허용한다. CSV v 는 이미 접지력 한계라 1.0 을 넘겨 올리면
+        # 코너에서 그립을 잃는다 (전략 노드는 직선용으로 2.0 을 보내기도 한다).
+        value = float(msg.data)
+        if math.isfinite(value) and value >= 0.0:
+            self._strategy_speed_scale = min(1.0, value)
+
+    def _target_speed_at(self, index: int) -> float:
+        """웨이포인트 index 의 목표 속도 [m/s]. 배율·상한 적용 후."""
+        if not self._speed_profile:
+            return 0.0
+        v = self._speed_profile[int(index) % len(self._speed_profile)]
+        v *= self._speed_scale_cfg * self._strategy_speed_scale
+        if self._speed_max_mps > 0.0:
+            v = min(v, self._speed_max_mps)
+        return max(0.0, v)
+
+    def _publish_drive(self, steering: float, speed: float = 0.0) -> None:
+        """조향 + 목표 속도. control_node 가 use_drive_speed_command 면 speed 를 추종."""
         msg = AckermannDriveStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.drive.speed = 0.0
+        msg.drive.speed = float(max(0.0, speed))
         msg.drive.steering_angle = float(steering)
         self.drive_pub.publish(msg)
 
@@ -904,7 +1030,7 @@ class StanleyWaypointFollowNode(Node):
         pose = self._get_pose_map()
 
         if pose is None:
-            self._publish_drive(0.0)
+            self._publish_drive(0.0, 0.0)
             self._maybe_log_status(
                 pose_ok=False,
                 x=0.0,
@@ -921,12 +1047,13 @@ class StanleyWaypointFollowNode(Node):
             return
 
         x, y, yaw = pose
-        csv_x, csv_y, _ = self.track.closest_projection_on_loop(x, y)
+        csv_x, csv_y, csv_seg = self.track.closest_projection_on_loop(x, y)
+        target_speed = self._target_speed_at(csv_seg)
 
         mode = self._select_mode_and_path(x, y)
 
         if mode == "STOP" or len(self._path_poses) < 2:
-            self._publish_drive(0.0)
+            self._publish_drive(0.0, 0.0)
             self._maybe_log_status(
                 pose_ok=True,
                 x=x,
@@ -1031,7 +1158,7 @@ class StanleyWaypointFollowNode(Node):
             kappa_used,
         )
 
-        self._publish_drive(steering_cmd)
+        self._publish_drive(steering_cmd, target_speed)
 
         self._maybe_log_status(
             pose_ok=True,

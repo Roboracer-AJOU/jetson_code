@@ -49,7 +49,7 @@ def resolve_map_yaml(map_name: str, map_dir: str = "") -> str:
 
 CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
-    "map_name": "cartographer_map_20260804_190909_rosmap.yaml",
+    "map_name": "cartographer_map_20260814_232850_rosmap.yaml",
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",  # 실차 (시뮬: ego_racecar/laser)

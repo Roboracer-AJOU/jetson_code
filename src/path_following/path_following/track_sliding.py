@@ -6,15 +6,39 @@ import math
 from pathlib import Path
 from typing import List, Tuple
 
+import numpy as np
+
 _DEFAULT_CSV_NAMES = ("raceline.csv", "centerline.csv")
 
+# ============================================================
+# 주행 라인 기본값 — local_planner / stanley 공통
+#   "raceline"   : config/raceline.csv (Out-In-Out 레이싱 라인)
+#   "centerline" : config/centerline.csv (벽-벽 중앙)
+#   "auto"       : raceline 이 있으면 raceline, 없으면 centerline
+# 일회성 전환은 런치 인자를 쓰는 게 편하다: `track:=centerline`
+# ============================================================
+DEFAULT_TRACK = "raceline"
 
-def resolve_csv_path(csv_param: str) -> str:
-    """CFG csv_path 가 비어 있으면 config/raceline.csv → centerline.csv 자동 탐색."""
-    p = (csv_param or "").strip()
-    if p:
-        return p
+# ============================================================
+# 주행 방향 — local_planner / stanley 공통
+#   True  : CSV 를 역순으로 (현재 raceline/centerline 이 이쪽)
+#   False : CSV 저장 순서 그대로
+# 두 노드가 달라지면 stanley 는 정방향으로 달리는데 플래너의 Frenet s 는
+# 역방향이 되어, 선감속·곡률 예측·rejoin 이 전부 차 뒤쪽을 본다. 그래서
+# 개별 노드에 값을 박지 말고 반드시 여기 하나만 고친다.
+# 값이 틀리면 stanley 기동 직후 hdg_err 가 ~180° 로 뜬다.
+# ============================================================
+DEFAULT_REVERSE_TRACK = True
 
+_TRACK_FILES = {
+    "raceline": ("raceline.csv",),
+    "centerline": ("centerline.csv",),
+    "auto": _DEFAULT_CSV_NAMES,
+}
+
+
+def _config_roots() -> list[Path]:
+    """설치본(share) → 소스 트리 순서로 config 디렉터리 후보."""
     roots: list[Path] = []
     try:
         from ament_index_python.packages import get_package_share_directory
@@ -29,21 +53,46 @@ def resolve_csv_path(csv_param: str) -> str:
             roots.append(parent / "config")
             break
 
+    out: list[Path] = []
     seen: set[Path] = set()
     for root in roots:
         root = root.resolve()
-        if root in seen:
-            continue
-        seen.add(root)
-        for name in _DEFAULT_CSV_NAMES:
-            cand = root / name
+        if root not in seen:
+            seen.add(root)
+            out.append(root)
+    return out
+
+
+def resolve_csv_path(csv_param: str, track: str = "") -> str:
+    """주행 라인 CSV 경로 결정.
+
+    우선순위: csv_path 파라미터(절대경로) > track 이름 > DEFAULT_TRACK.
+    track 은 "raceline" | "centerline" | "auto".
+    """
+    p = (csv_param or "").strip()
+    if p:
+        return p
+
+    name = (track or "").strip().lower() or DEFAULT_TRACK
+    if name.endswith(".csv"):  # track 에 파일명을 바로 넣은 경우
+        wanted = (name,)
+    elif name in _TRACK_FILES:
+        wanted = _TRACK_FILES[name]
+    else:
+        raise ValueError(
+            f"알 수 없는 track={track!r}. "
+            f"{'|'.join(_TRACK_FILES)} 또는 *.csv 파일명을 쓰세요."
+        )
+
+    for root in _config_roots():
+        for fname in wanted:
+            cand = root / fname
             if cand.is_file():
                 return str(cand)
 
-    names = ", ".join(_DEFAULT_CSV_NAMES)
     raise FileNotFoundError(
-        f"path_following/config/ 에서 {names} 을 찾지 못했습니다. "
-        "scripts 로 생성하거나 config/ 에 CSV 를 넣은 뒤 "
+        f"path_following/config/ 에서 {', '.join(wanted)} 을 찾지 못했습니다 "
+        f"(track={name}). scripts 로 생성하거나 config/ 에 CSV 를 넣은 뒤 "
         "`colcon build --packages-select path_following` 하세요."
     )
 
@@ -54,11 +103,18 @@ def param_bool(val) -> bool:
     return str(val).lower() in ("1", "true", "yes")
 
 
-def load_csv_xy(path: str) -> List[Tuple[float, float]]:
+def load_csv_xyv(path: str):
+    """CSV → (points, speeds).
+
+    3번째 열이 있으면 웨이포인트별 목표 속도 [m/s] 로 읽는다.
+    없으면 speeds 는 None (구형 x,y CSV 하위호환).
+    """
     pts: List[Tuple[float, float]] = []
+    speeds: List[float] = []
+    have_speed = True
     with open(path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        rows = list(reader)
+        rows = list(csv.reader(f))
+
     start = 0
     for i, r in enumerate(rows):
         if not r or r[0].strip().startswith("#"):
@@ -69,14 +125,29 @@ def load_csv_xy(path: str) -> List[Tuple[float, float]]:
         try:
             x = float(r[0].strip())
             y = float(r[1].strip())
-            pts.append((x, y))
         except ValueError:
             if i == start and (
                 "x" in (r[0] + r[1]).lower() or "m" in (r[0] + r[1]).lower()
             ):
                 start = i + 1
             continue
-    return pts
+        pts.append((x, y))
+        v = float("nan")
+        if len(r) >= 3:
+            try:
+                v = float(r[2].strip())
+            except ValueError:
+                v = float("nan")
+        if v != v or v < 0.0:  # NaN 또는 음수 → 속도 열 없음으로 취급
+            have_speed = False
+        speeds.append(v)
+
+    return pts, (speeds if (have_speed and speeds) else None)
+
+
+def load_csv_xy(path: str) -> List[Tuple[float, float]]:
+    """x,y 만. 3번째 열이 있어도 무시한다 (기존 호출부 호환)."""
+    return load_csv_xyv(path)[0]
 
 
 def apply_track_direction(
@@ -86,6 +157,13 @@ def apply_track_direction(
     if not reverse or len(points) < 2:
         return points
     return list(reversed(points))
+
+
+def apply_track_direction_scalars(values, reverse: bool):
+    """속도 등 웨이포인트 정렬 배열을 points 와 같은 방향으로 뒤집는다."""
+    if values is None or not reverse or len(values) < 2:
+        return values
+    return list(reversed(values))
 
 
 def _closest_point_on_segment(
@@ -115,15 +193,22 @@ def lateral_distance_to_closed_polyline(
     n = len(pts)
     if n < 2:
         return float("inf")
-    best_d2 = float("inf")
-    for i in range(n):
-        ax, ay = pts[i]
-        bx, by = pts[(i + 1) % n]
-        qx, qy, _t = _closest_point_on_segment(mx, my, ax, ay, bx, by)
-        d2 = (mx - qx) ** 2 + (my - qy) ** 2
-        if d2 < best_d2:
-            best_d2 = d2
-    return math.sqrt(best_d2)
+    xy = np.asarray(pts, dtype=np.float64)
+    ax, ay = xy[:, 0], xy[:, 1]
+    bx, by = np.roll(ax, -1), np.roll(ay, -1)
+    abx, aby = bx - ax, by - ay
+    ab2 = abx * abx + aby * aby
+    t = np.divide(
+        (mx - ax) * abx + (my - ay) * aby,
+        ab2,
+        out=np.zeros_like(ab2),
+        where=ab2 >= 1e-14,
+    )
+    t = np.clip(t, 0.0, 1.0)
+    qx = ax + t * abx
+    qy = ay + t * aby
+    d2 = (mx - qx) ** 2 + (my - qy) ** 2
+    return float(math.sqrt(d2.min()))
 
 
 class LoopTrackSliding:

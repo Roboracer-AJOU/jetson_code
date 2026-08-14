@@ -376,3 +376,130 @@ TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window
 ```bash
 git diff HEAD -- src/localization_layer/config/cartographer_2d_localization.lua
 ```
+
+---
+
+## 수정 9 — 2026-08-14
+
+**배경**: (다른 팀원이 완전히 새로 짠 "Jetson lite" 버전 위에서 진행) 팀원이
+"yaw를 너무 크게 받는 것 같다"고 보고함. 로컬라이제이션 매칭 스펙(정확도) 상향
+겸 서브맵 유지 개수 상향 요청.
+
+**수정**: `src/localization_layer/config/cartographer_2d_localization.lua`
+
+| 파라미터 | 이전 | 이후 | 이유 |
+|---|---|---|---|
+| `TRAJECTORY_BUILDER.pure_localization_trimmer.max_submaps_to_keep` | 2 | 4 | 참고할 submap을 더 많이 유지해서 매칭 품질 상향 |
+| `TRAJECTORY_BUILDER_2D.ceres_scan_matcher.rotation_weight` | 30.0 | 15.0 | 30이면 prior(odom/IMU) 회전에서 안 벗어나려는 힘이 강해서, prior의 yaw가 과대해도 라이다가 잘 못 눌러줌 → 낮춰서 라이다가 회전을 더 적극적으로 보정하게 함 |
+
+**참고**: `max_submaps_to_keep`을 올리면 메모리/매칭 계산량이 약간 늘어남.
+`num_background_threads=2`로 낮게 잡혀있는 "Jetson lite" 구성이라, CPU 여유
+없으면 이 상향이 부담될 수 있음 — 재시작 후 `top`으로 CPU 확인 권장.
+
+**확인 필요**: 재시작 후 회전(코너/제자리 회전)할 때 yaw가 이전보다 안정적으로
+나오는지, `ros2 topic echo /imu/data --field angular_velocity` 및 실제 화면상
+헤딩 변화로 비교. 서브맵 4개로 늘린 뒤 CPU 부담 없는지도 같이 확인.
+
+**되돌리는 법**:
+```bash
+git diff HEAD -- src/localization_layer/config/cartographer_2d_localization.lua
+```
+
+---
+
+## 수정 10 — 2026-08-15
+
+**배경**: (다른 팀원이 다시 새로 튜닝한 버전 위에서 진행) "2m/s까지는 잘 되는데
+3m/s부터 깨진다"는 증상 + 회전할 때 계속 틀어지는 문제. 이 버전은 전체적으로
+prior(odom+IMU 예측)를 강하게 믿고 라이다 보정은 좁게 막아두는 방향으로
+튜닝되어 있었음 (`angular_search_window=12°`, `rotation_delta_cost_weight=20`,
+`odometry_rotation_weight=1e4` 등).
+
+**왜 3m/s부터 깨지는지**: 40Hz라 스캔 간격은 0.025초로 짧지만, CPU가
+load average 6대(6코어 거의 꽉 참)라 처리가 살짝 밀릴 수 있음. 밀린 시간 동안
+고속 코너에서 실제로 도는 각도가 좁아진 탐색범위(12°)를 넘어버리면 못 찾음.
+저속에서는 같은 시간에 도는 각도가 작아서 12° 안에 들어와 괜찮았던 것.
+게다가 odom의 회전값은 순수 자이로 적분(지자기 보정 없음)이라 시간이 지날수록
+오차가 쌓이는데, 이 오차를 라이다가 고쳐줄 여지(탐색범위·가중치)까지 같이
+좁혀놔서 누적 오차가 그대로 반영되기 쉬운 상태였음.
+
+**수정**: `src/localization_layer/config/cartographer_2d_localization.lua`
+
+| 파라미터 | 이전 | 이후 | 이유 |
+|---|---|---|---|
+| `real_time_correlative_scan_matcher.angular_search_window` | 12° | 25° | 고속 코너에서 처리 지연 있어도 실제 회전량을 탐색범위 안에 들어오게 |
+| `real_time_correlative_scan_matcher.rotation_delta_cost_weight` | 20.0 | 5.0 | prior(odom 회전)에서 벗어나기 쉽게 해서 라이다가 회전을 더 자유롭게 보정 |
+| `POSE_GRAPH.optimization_problem.odometry_rotation_weight` | 1e4 | 5e2 | odom 회전(누적 오차 있음)을 다시 보조 역할로만 사용 |
+
+**나머지 값은 그대로 둠**: `max_submaps_to_keep=2`, `linear_search_window=0.35`,
+`ceres_scan_matcher.rotation_weight=55.0` 등 나머지 튜닝은 팀원이 최근에
+다시 잡아둔 값이라 손대지 않음. 이번엔 회전 관련 3곳만 조정.
+
+**확인 필요**: 재시작 후 3m/s 이상으로 코너 재테스트. 여전히 깨지면 CPU
+부담(load average 6대) 자체를 먼저 줄여야 할 수도 있음 (다른 노드 정리 또는
+`num_background_threads` 조정 — 단 이건 이미 2로 낮게 잡혀 있어서 여유 적음).
+
+**되돌리는 법**:
+```bash
+git diff HEAD -- src/localization_layer/config/cartographer_2d_localization.lua
+```
+위 표의 "이전" 값으로 되돌리면 됨.
+
+---
+
+## ⚠️ 2026-08-15 — 지금까지 실측으로 확인된 "제일 나은" 조합 (함부로 갈아엎지 마세요)
+
+**밤새 여러 사람이 이 파일을 계속 다른 방향으로 고쳐왔습니다.** "odom을 약하게, 라이다를
+강하게", "탐색범위 넓게" 등 이론적으로 맞아 보이는 방향들을 실제로 다 테스트해봤는데,
+**아래 값들이 그 어떤 조합보다 실제 주행에서 제일 안정적이었습니다.**
+
+```lua
+TRAJECTORY_BUILDER.pure_localization_trimmer.max_submaps_to_keep = 2
+options.tracking_frame = "imu_link"
+options.published_frame = "base_link"
+options.provide_odom_frame = true
+options.use_odometry = true
+options.pose_publish_period_sec = 0.05
+options.submap_publish_period_sec = 2.0
+MAP_BUILDER.num_background_threads = 2
+TRAJECTORY_BUILDER_2D.imu_gravity_time_constant = 80.0
+TRAJECTORY_BUILDER_2D.max_range = 20.0
+TRAJECTORY_BUILDER_2D.voxel_filter_size = 0.10
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 0.35
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window = math.rad(12.)
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.translation_delta_cost_weight = 10.0
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.rotation_delta_cost_weight = 20.0
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.occupied_space_weight = 30.0
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.translation_weight = 8.0
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.rotation_weight = 55.0
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.ceres_solver_options.max_num_iterations = 6
+TRAJECTORY_BUILDER_2D.motion_filter.max_time_seconds = 0.06
+TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.05
+TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(1.0)
+TRAJECTORY_BUILDER_2D.submaps.num_range_data = 60
+POSE_GRAPH.optimize_every_n_nodes = 80
+POSE_GRAPH.global_sampling_ratio = 0.003
+POSE_GRAPH.constraint_builder.sampling_ratio = 0.04
+POSE_GRAPH.constraint_builder.min_score = 0.65
+POSE_GRAPH.constraint_builder.global_localization_min_score = 0.82
+POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.linear_search_window = 1.2
+POSE_GRAPH.constraint_builder.fast_correlative_scan_matcher.angular_search_window = math.rad(12.)
+POSE_GRAPH.global_constraint_search_after_n_seconds = 15.
+POSE_GRAPH.optimization_problem.local_slam_pose_translation_weight = 1e5
+POSE_GRAPH.optimization_problem.local_slam_pose_rotation_weight = 1e5
+POSE_GRAPH.optimization_problem.odometry_translation_weight = 1e4
+POSE_GRAPH.optimization_problem.odometry_rotation_weight = 1e4
+POSE_GRAPH.optimization_problem.ceres_solver_options.max_num_iterations = 4
+POSE_GRAPH.optimization_problem.ceres_solver_options.num_threads = 2
+POSE_GRAPH.max_num_final_iterations = 4
+```
+
+**시도했지만 이것보다 별로였던 조합들** (또 시도하지 마세요):
+- odom 회전 가중치를 낮추고(`odometry_rotation_weight` 낮춤) 라이다를 더 믿게 한 조합
+- `angular_search_window`를 20~25도로 넓힌 조합
+
+**만약 이 파일을 또 고치고 싶다면**:
+1. 먼저 이 섹션을 읽고, 왜 이 값들인지 이해하고 시작할 것
+2. 한 번에 하나씩만 바꾸고, 최소 여러 번 반복 주행 테스트 후 결론 낼 것
+3. 바꾼 이유와 결과를 반드시 이 파일에 새 "수정 N" 항목으로 남길 것
+4. 이 조합으로 안 되면, 최소한 **되돌아올 수 있는 값이 바로 이 섹션**이라는 걸 기억할 것

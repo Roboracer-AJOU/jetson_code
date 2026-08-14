@@ -25,7 +25,7 @@ import rclpy
 import serial
 from ackermann_msgs.msg import AckermannDriveStamped
 from rclpy.node import Node
-from std_msgs.msg import Float32, Float64, Float64MultiArray
+from std_msgs.msg import Bool, Float32, Float64, Float64MultiArray
 
 
 # ============================================================
@@ -76,8 +76,24 @@ CFG = {
     "speed_topic": "/vehicle/speed_mps",
     # AUTO closed-loop speed control (max_target_speed_mps is target speed [m/s])
     "max_auto_duty": 0.70,        # AUTO final safety duty limit
-    "max_target_speed_mps": 10.0,  # AUTO target speed
-    "target_speed_mps": 2.0,       # AUTO configured target speed
+    "max_target_speed_mps": 10.0,  # AUTO 목표 속도 하드 상한 (안전 클램프)
+    # AUTO 목표 속도를 어디서 받을지.
+    #   True  : /drive.speed (stanley 가 CSV v 열에서 뽑아 보내는 값) — 구간별 가변
+    #   False : 아래 target_speed_mps 로 전 구간 정속 (구동계 튜닝용)
+    # 어느 쪽이든 /drive 가 cmd_timeout_sec 이상 끊기면 duty·steer 0 으로 떨어진다.
+    "use_drive_speed_command": True,
+    "target_speed_mps": 2.0,       # use_drive_speed_command=False 일 때만 사용
+    # ---- 비상 제동 (emergency_brake_node) ----
+    # AUTO 에서만 동작. 키보드 Space / RC CH6 ESTOP 과 달리 자동으로 풀린다.
+    # AUTO 속도 PI 는 duty 하한이 0 이라 타력주행밖에 못 한다. 여기서만 역토크를
+    # 걸어 실제로 세운다.
+    "emergency_brake_topic": "/emergency_brake",
+    "emergency_brake_duty": 0.15,      # 역방향 duty 크기. 크면 잠기고 미끄러진다
+    # 이 속도 아래로 떨어지면 역토크 해제 (계속 걸면 후진한다)
+    "emergency_brake_release_speed_mps": 0.15,
+    # 신호가 오다가 끊기면 제동 (노드가 죽은 것 → fail-safe).
+    # 한 번도 못 받았으면 노드 미사용으로 보고 무시한다.
+    "emergency_brake_stale_sec": 0.5,
     "auto_duty_output_sign": 1.0,
     "speed_ff_duty_per_mps": 0.076,
     "speed_kp": 0.15,
@@ -151,6 +167,21 @@ class VehicleControlNode(Node):
             0.0,
             self._max_target_speed_mps,
         )
+        self._use_drive_speed_command = bool(
+            CFG.get("use_drive_speed_command", False)
+        )
+        self._emergency_brake_duty = abs(
+            float(CFG.get("emergency_brake_duty", 0.15))
+        )
+        self._emergency_brake_release_speed = max(
+            0.0, float(CFG.get("emergency_brake_release_speed_mps", 0.15))
+        )
+        self._emergency_brake_stale = max(
+            0.0, float(CFG.get("emergency_brake_stale_sec", 0.5))
+        )
+        self._emergency_brake_cmd = False
+        self._emergency_brake_recv_time = 0.0
+        self._emergency_brake_engaged = False
         self._auto_duty_output_sign = -1.0 if float(
             CFG.get("auto_duty_output_sign", -1.0)
         ) < 0.0 else 1.0
@@ -255,6 +286,12 @@ class VehicleControlNode(Node):
             self.drive_callback,
             10,
         )
+        self.create_subscription(
+            Bool,
+            str(CFG.get("emergency_brake_topic", "/emergency_brake")),
+            self._emergency_brake_callback,
+            10,
+        )
         self.create_timer(float(CFG["timer_period_sec"]), self.timer_callback)
         tel_topic = str(CFG.get("telemetry_topic", "/vehicle/telemetry"))
         self._telemetry_pub = self.create_publisher(Float64MultiArray, tel_topic, 10)
@@ -289,12 +326,24 @@ class VehicleControlNode(Node):
             f"max_auto_duty = AUTO final safety limit: {self._max_auto_duty:.2f}"
         )
         self.get_logger().info(
-            f"max_target_speed_mps = AUTO target speed: "
+            f"max_target_speed_mps = AUTO 목표 속도 상한: "
             f"{self._max_target_speed_mps:.2f}"
         )
+        if self._use_drive_speed_command:
+            self.get_logger().info(
+                "AUTO target speed = /drive.speed (stanley CSV v열, 구간별 가변). "
+                f"상한 {self._max_target_speed_mps:.2f} m/s 로 클램프"
+            )
+        else:
+            self.get_logger().info(
+                f"AUTO target speed = target_speed_mps 정속: "
+                f"{self._configured_target_speed_mps:.2f} m/s "
+                "(구간별 속도를 쓰려면 use_drive_speed_command=True)"
+            )
         self.get_logger().info(
-            f"target_speed_mps = AUTO configured target: "
-            f"{self._configured_target_speed_mps:.2f}"
+            f"AEB: {CFG.get('emergency_brake_topic')} 수신 시 역토크 duty "
+            f"{self._emergency_brake_duty:.2f} (AUTO 전용, 자동 해제). "
+            "신호가 오다 끊기면 제동"
         )
         self.get_logger().info(
             f"AUTO speed FF+PI: target≤{self._max_target_speed_mps:.2f} m/s, "
@@ -383,7 +432,13 @@ class VehicleControlNode(Node):
                 return
 
             self.last_cmd_time = time.time()
-            target_speed_mps = self._configured_target_speed_mps
+            if self._use_drive_speed_command:
+                # stanley 가 CSV v 열에서 뽑아 보낸 구간별 목표 속도
+                target_speed_mps = self.clamp(
+                    abs(cmd_speed), 0.0, self._max_target_speed_mps
+                )
+            else:
+                target_speed_mps = self._configured_target_speed_mps
 
             if self._invert_steer:
                 steering_rad = -steering_rad
@@ -409,6 +464,28 @@ class VehicleControlNode(Node):
         else:
             self._manual_drive_speed_active = False
             self._manual_drive_invert_duty = False
+
+    def _emergency_brake_callback(self, msg: Bool) -> None:
+        self._emergency_brake_cmd = bool(msg.data)
+        self._emergency_brake_recv_time = time.time()
+
+    def _emergency_brake_requested(self, now: float) -> bool:
+        """AEB 제동 요청 여부.
+
+        한 번도 수신한 적 없으면 노드를 안 띄운 것으로 보고 무시한다.
+        수신하다 끊기면 노드가 죽은 것이므로 제동한다 (fail-safe).
+        """
+        if self._emergency_brake_recv_time <= 0.0:
+            return False
+        if now - self._emergency_brake_recv_time > self._emergency_brake_stale:
+            return True
+        return self._emergency_brake_cmd
+
+    def _emergency_brake_output_duty(self) -> float:
+        """역토크 duty. 거의 멈췄으면 0 (계속 걸면 후진한다)."""
+        if abs(self._measured_speed_mps) <= self._emergency_brake_release_speed:
+            return 0.0
+        return -self._emergency_brake_duty * self._auto_duty_output_sign
 
     @staticmethod
     def _parse_rc_line(line: str):
@@ -801,11 +878,32 @@ class VehicleControlNode(Node):
         autonomous = self._is_autonomous_mode()
         self._control_mode = "AUTO" if autonomous else "MANUAL"
 
+        aeb = (
+            autonomous
+            and not self._is_estop_latched()
+            and self._emergency_brake_requested(now)
+        )
+        if aeb != self._emergency_brake_engaged:
+            self._emergency_brake_engaged = aeb
+            if aeb:
+                self.get_logger().warn(
+                    f"AEB 제동 — v={self._measured_speed_mps:.2f} m/s"
+                )
+            else:
+                self.get_logger().info("AEB 해제 — 정상 주행 복귀")
+
         if self._is_estop_latched():
             self.current_duty = 0.0
             self.current_steer = 0.0
             self._reset_speed_controller()
             self._reset_auto_steer()
+        elif aeb:
+            # 조향은 마지막 명령을 유지한다 (직진으로 되돌리면 오히려 위험).
+            self._manual_drive_speed_active = False
+            self.current_duty = self._emergency_brake_output_duty()
+            self.current_steer = self._apply_steer_rate_limit(self._auto_steer, dt)
+            self._reset_speed_controller()
+            self.send_steering(self.current_steer)
         elif autonomous:
             self._manual_drive_speed_active = False
             if now - self.last_cmd_time > self._cmd_timeout:

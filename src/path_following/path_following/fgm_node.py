@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from geometry_msgs.msg import Point, PointStamped
 from sensor_msgs.msg import LaserScan
@@ -52,7 +53,9 @@ CFG = {
     # Slamtec 0~360° 스캔도 wrap 후 정면 기준으로 자름.
     "fov_half_deg": 80.0,
     # 고속에선 멀리까지 봐야 갭이 미리 보임 (목표점 거리보다 넉넉하게)
-    "scan_max_range_m": 5.5,
+    # 이 거리 밖은 전부 "뚫린 것" 으로 뭉갠다. 짧으면 멀리 목표를 못 찍어
+    # 고속에서 회피가 급해진다 (target_max_m 이 이 안쪽이어야 의미가 있다).
+    "scan_max_range_m": 10.0,
     # [장애물 버블] 장애 반경 위에 더하는 여유 (갭이 장애에서 얼마나 떨어질지).
     "bubble_radius_m": 0.2,
     # [차량 버블] 뒷축 기준 발자국 — 전방 길이 / 좌우 폭(전체).
@@ -67,10 +70,25 @@ CFG = {
     # 갭 안에서 목표 각도를 가장자리로부터 얼마나 안쪽에 둘지.
     # 버블이 이미 차폭+여유를 먹고 있어 크게 줄 필요 없다 (각도라서 멀수록 과해짐).
     "gap_edge_inset_deg": 3.0,
+    # ---- 목표점 주행폭 검증 (회피 직후 벽 긁힘 방지) ----
+    # 갭 선택은 각도 기준이라, 목표 방향으로 실제 "차폭이 들어가는지"는 따로 봐야
+    # 한다. edge_inset 은 각도라 멀수록 실제 여유가 줄어든다 (3° 는 3 m 에서
+    # 겨우 0.16 m). 차폭 코리도를 훑어 막히는 지점까지만 목표를 찍고, 그래도
+    # 부족하면 갭 안에서 더 뚫린 각도로 목표를 옮긴다.
+    "corridor_check_enable": True,
+    "corridor_half_width_m": 0.22,   # 차량 반폭 + 여유
+    "corridor_stop_margin_m": 0.15,  # 막히는 지점에서 이만큼 앞에 멈춰 찍는다
+    "corridor_angle_samples": 11,    # 갭 안에서 시도할 목표 각도 후보 수
+    # 크게 꺾는 데 매기는 벌점 [m/rad]. 키우면 정면 고집(회피 소극적),
+    # 줄이면 여유 공간을 찾아 과감히 튼다.
+    "corridor_straight_bias_m_per_rad": 1.0,
     # 목표점 거리 = clamp(ego_speed * lead_time, min, max) [m, 레이저 프레임]
     "target_lead_time_s": 0.70,
     "target_min_m": 1.0,
-    "target_max_m": 3.5,
+    # 고속 회피의 실질 병목. 목표점이 가까우면 같은 횡오프셋도 곡률이 커져
+    # 횡가속도 한계에 먼저 걸린다 (3.5 m 목표로 0.5 m 틀면 4.9 m/s 가 천장,
+    # 5.0 m 면 7.0 m/s). 대신 멀수록 반응이 느려지므로 scan_max_range_m 안쪽.
+    "target_max_m": 5.0,
     # 목표 스무딩: EMA 1단 + 이동 속도 제한 [m/s] (고속일수록 자동 완화)
     "target_smooth_alpha": 0.70,
     "target_max_rate_mps": 3.5,
@@ -167,6 +185,21 @@ class FGMNode(Node):
         self.target_lead_time_s = max(
             0.0, float(self.get_parameter("target_lead_time_s").value)
         )
+        self.corridor_check_enable = bool(
+            self.get_parameter("corridor_check_enable").value
+        )
+        self.corridor_half_width = max(
+            0.01, float(self.get_parameter("corridor_half_width_m").value)
+        )
+        self.corridor_stop_margin = max(
+            0.0, float(self.get_parameter("corridor_stop_margin_m").value)
+        )
+        self.corridor_angle_samples = max(
+            3, int(self.get_parameter("corridor_angle_samples").value)
+        )
+        self.corridor_straight_bias = max(
+            0.0, float(self.get_parameter("corridor_straight_bias_m_per_rad").value)
+        )
         self.target_min_m = max(0.2, float(self.get_parameter("target_min_m").value))
         self.target_max_m = max(
             self.target_min_m, float(self.get_parameter("target_max_m").value)
@@ -199,6 +232,7 @@ class FGMNode(Node):
         self._filt_y: float | None = None
         self._ego_speed = 0.0
         self._last_scan_ns: int | None = None
+        self._last_corridor_warn_ns = 0
         self._cpu_boost_active = False
         # 초기 enable 상태에 맞춰 CPU 우선순위 플래그 동기화
         self._set_cpu_boost(self._fgm_enabled)
@@ -341,6 +375,71 @@ class FGMNode(Node):
         self._filt_x, self._filt_y = nx, ny
         return float(nx), float(ny)
 
+    def _warn_corridor_blocked(self, angle: float, clear: float) -> None:
+        """차폭이 안 들어가는 상황 경고 (1초에 한 번). 정지는 AEB 몫."""
+        now = self.get_clock().now().nanoseconds
+        if now - self._last_corridor_warn_ns < 1_000_000_000:
+            return
+        self._last_corridor_warn_ns = now
+        self.get_logger().warn(
+            f"gap 은 열렸지만 차폭이 안 들어감 — aim={math.degrees(angle):+.0f}° "
+            f"clear={clear:.2f}m < {self.target_min_m:.2f}m. 목표점을 당겨 찍음"
+        )
+
+    def _corridor_clear_distance(
+        self, geom_ranges: np.ndarray, wrapped: np.ndarray, angle: float
+    ) -> float:
+        """angle 방향으로 차폭 코리도가 뚫려 있는 거리 [m].
+
+        목표 방향을 축으로 두고, 축에서 반폭 이내로 들어오는 점들 중 가장 가까운
+        것까지의 전방거리를 낸다. 갭 판정이 각도 기준이라 놓치는 "멀리서 좁아지는
+        통로"를 여기서 잡는다.
+        """
+        d_ang = _wrap_pi_np(wrapped - angle)
+        valid = (geom_ranges > 0.0) & (np.abs(d_ang) < math.pi * 0.5)
+        if not np.any(valid):
+            return self.preprocess_dist
+        r = geom_ranges[valid]
+        da = d_ang[valid]
+        along = r * np.cos(da)
+        perp = np.abs(r * np.sin(da))
+        blocking = (perp < self.corridor_half_width) & (along > 0.0)
+        if not np.any(blocking):
+            return self.preprocess_dist
+        return max(0.0, float(along[blocking].min()) - self.corridor_stop_margin)
+
+    def _pick_target_angle(
+        self,
+        geom_ranges: np.ndarray,
+        wrapped: np.ndarray,
+        lo: float,
+        hi: float,
+        preferred: float,
+        want: float,
+    ) -> tuple[float, float]:
+        """(목표 각도, 그 방향 코리도 여유거리).
+
+        preferred(갭 안에서 정면에 제일 가까운 각도)로 want 만큼 못 가면 갭
+        안의 다른 각도를 뒤진다. 점수 = min(여유, want) − bias·|각도| 라서,
+        여유가 충분해지는 순간부터는 정면에 가까운 쪽이 이긴다. 즉 필요한
+        만큼만 틀고 불필요하게 크게 꺾지 않는다.
+
+        후보를 [lo, hi] 로 가두므로 이미 검증된 갭 밖으로는 절대 안 나간다.
+        """
+        best_angle = preferred
+        best_clear = self._corridor_clear_distance(geom_ranges, wrapped, preferred)
+        if best_clear >= want:
+            return best_angle, best_clear
+
+        best_score = min(best_clear, want) - self.corridor_straight_bias * abs(preferred)
+        for cand in np.linspace(lo, hi, self.corridor_angle_samples):
+            angle = float(cand)
+            clear = self._corridor_clear_distance(geom_ranges, wrapped, angle)
+            score = min(clear, want) - self.corridor_straight_bias * abs(angle)
+            if score > best_score:
+                best_angle, best_clear, best_score = angle, clear, score
+        return best_angle, best_clear
+
     def scan_callback(self, scan_msg: LaserScan) -> None:
         # enable OFF면 갭 연산/마커 모두 스킵 (CPU 절약). Foxglove 마커는 enable ON일 때만.
         publish_target = (not self.require_planner_enable) or self._fgm_enabled
@@ -359,6 +458,9 @@ class FGMNode(Node):
         ranges = np.where(np.isinf(ranges), self.preprocess_dist, ranges)
         ranges = np.where(np.isnan(ranges), 0.0, ranges)
         ranges[ranges > self.preprocess_dist] = self.preprocess_dist
+        # 버블·FOV 마스킹 전의 실측 거리. 코리도 검증은 기하 문제라 원본을 써야 한다
+        # (버블은 각도 섹터를 0 으로 만들어서 거리 정보가 사라진다).
+        geom_ranges = ranges.copy()
 
         angle_min = scan_msg.angle_min
         angle_inc = scan_msg.angle_increment
@@ -488,6 +590,17 @@ class FGMNode(Node):
         if gap_range > 0.1:
             target_dist = min(target_dist, max(self.target_min_m, gap_range * 0.9))
 
+        # 단일 빔이 아니라 차폭 코리도로 다시 검증. 각도 기준 갭 선택은
+        # "각도는 열려 있는데 차폭은 안 들어가는" 통로를 걸러내지 못한다.
+        if self.corridor_check_enable:
+            eff_angle, clear = self._pick_target_angle(
+                geom_ranges, wrapped, lo, hi, eff_angle, target_dist
+            )
+            if clear < target_dist:
+                target_dist = max(0.2, clear)
+                if clear < self.target_min_m:
+                    self._warn_corridor_blocked(eff_angle, clear)
+
         target_x = target_dist * math.cos(eff_angle)
         target_y = target_dist * math.sin(eff_angle)
 
@@ -612,11 +725,12 @@ def main(args=None):
     node = FGMNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

@@ -19,13 +19,18 @@ CSV 전 코스 시각화(선택): `csv_track_viz_topic`(기본 `/raceline_csv_pa
 """
 from __future__ import annotations
 
+import bisect
 import math
+import os
 from typing import List, Tuple
 
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from nav_msgs.msg import Path
+from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from nav_msgs.msg import OccupancyGrid, Path
 from std_msgs.msg import Bool
 from std_msgs.msg import Float32MultiArray
 from std_msgs.msg import Float64
@@ -47,19 +52,35 @@ from path_following.obstacle_filter import (
     _pack_dynamic_as_static_gate,
 )
 from path_following.track_sliding import (
+    DEFAULT_REVERSE_TRACK,
     LoopTrackSliding,
     apply_track_direction,
-    load_csv_xy,
+    apply_track_direction_scalars,
+    load_csv_xyv,
     param_bool,
     resolve_csv_path,
+)
+from .avoidance_safety import (
+    AvoidSpeedParams,
+    InflatedMap,
+    avoid_speed_limit,
+    first_blocked_index,
+    trim_back,
 )
 
 # ============================================================
 # USER TUNING — local_planner (실차: 장애·LOCAL_PATH·FGM 타이밍은 여기만)
 # ============================================================
 CFG = {
+    # 주행 라인 선택: "raceline" | "centerline" | "auto" | "" (=track_sliding.DEFAULT_TRACK)
+    # 런치로 한 번에 바꾸려면: ros2 launch ... track:=centerline
+    # stanley_waypoint_follow_node 와 반드시 같은 값이어야 한다.
+    "track": "",
+    # track 을 무시하고 특정 CSV 를 쓰고 싶을 때만 절대경로 지정
     "csv_path": "",
-    "reverse_track_direction": False,
+    # 주행 방향. stanley 와 반드시 같아야 해서 track_sliding 한 곳에서 온다.
+    # 어긋나면 Frenet s 가 역방향이 되어 선감속·rejoin 이 차 뒤를 본다.
+    "reverse_track_direction": DEFAULT_REVERSE_TRACK,
     "static_obstacles_topic": "/static_obstacles",
     "dynamic_obstacles_topic": "/dynamic_obstacles",
     "ego_speed_topic": "/vehicle/speed_mps",  # control_node 실측 속도
@@ -85,11 +106,13 @@ CFG = {
     "avoid_timing_ref_mps": 2.0,
     "avoid_timing_margin": 1.30,
     "avoid_on_min_m": 2.8,
-    "avoid_on_max_m": 7.5,
+    # 고속에서 회피를 얼마나 일찍 켤지의 상한. 장애물 검출 상한
+    # (obstacle_forward_max_m) 과 맞춰 둔다 — 더 크게 잡아도 안 보인다.
+    "avoid_on_max_m": 12.0,
     "avoid_off_min_m": 3.8,
     "avoid_off_max_m": 9.0,
     "fgm_enable_min_m": 5.0,
-    "fgm_enable_max_m": 11.0,
+    "fgm_enable_max_m": 12.0,
     "fgm_enable_topic": "/planner/fgm_enable",
     "avoid_on_count_th": 1,
     "avoid_off_count_th": 3,
@@ -117,6 +140,28 @@ CFG = {
     "rejoin_finish_heading_deg": 15.0,
     "avoid_skip_rejoin_if_cte_ok": False,
     "rejoin_speed_scale": 0.5,
+    # ---- 회피 경로 충돌검사 ----
+    # 회피 경로는 FGM 목표점 너머로 avoid_forward_num_points 만큼 직선 연장된다.
+    # 그 구간은 아무도 검사한 적이 없어서 코너에서는 그대로 벽을 향한다.
+    # 맵과 장애물로 잘라낸다. 맵이 없으면 장애물 검사만 동작한다.
+    "path_check_enable": True,
+    "map_topic": "/map",
+    "path_check_inflation_m": 0.25,   # 차량 반폭 + 여유. 이만큼 벽에서 떨어져야 통과
+    "path_check_obstacle_margin_m": 0.10,
+    "path_check_backoff_m": 0.20,     # 충돌 지점에서 이만큼 더 물러나 끝냄
+    "path_check_min_length_m": 0.6,   # 잘라낸 경로가 이보다 짧으면 회피를 포기
+    # ---- 회피 구간 속도 ----
+    # 회피 중엔 CSV 속도가 의미 없다 (레이싱라인 곡률 기준으로 뽑은 값이라).
+    # 아래 물리값으로 매 주기 목표속도를 구해 CSV 대비 배율로 내보낸다.
+    # avoid_speed_enable=False 면 기존처럼 rejoin_speed_scale 일괄 적용.
+    "avoid_speed_enable": True,
+    "avoid_a_lat_mps2": 4.0,      # 회피 조향에서 허용할 횡가속도
+    "avoid_a_brake_mps2": 3.0,    # 회피 실패 시 정지에 쓸 감속도 (AEB 보다 보수적)
+    "avoid_safety_factor": 0.7,   # 센서 지연·추종 오차 몫. 낮출수록 느리고 안전
+    "avoid_standoff_m": 0.35,     # 장애물 앞 최소 이격
+    "avoid_lateral_margin_m": 0.10,
+    "avoid_speed_min_mps": 0.6,   # 이 아래로는 안 줄인다 (기어가지 않게)
+    "avoid_speed_ref_mps": 2.0,   # CSV 에 속도 열이 없을 때 쓸 기준속도
     "avoid_merge_tail_max": 180,
     "publish_hz": 40.0,
     "path_window_size": 140,
@@ -183,8 +228,11 @@ class LocalPlannerNode(Node):
             self.declare_parameter(key, value)
 
         csv_path = resolve_csv_path(
-            self.get_parameter("csv_path").get_parameter_value().string_value
+            self.get_parameter("csv_path").get_parameter_value().string_value,
+            self.get_parameter("track").get_parameter_value().string_value,
         )
+        # 해석 결과를 파라미터에 되써서 `ros2 param get ... csv_path` 로 확인 가능하게
+        self.set_parameters([Parameter("csv_path", Parameter.Type.STRING, csv_path)])
         obs_topic = self.get_parameter("static_obstacles_topic").value
         dyn_obs_topic = str(self.get_parameter("dynamic_obstacles_topic").value)
         odom_topic = str(self.get_parameter("ego_speed_topic").value)
@@ -278,6 +326,44 @@ class LocalPlannerNode(Node):
         self.rejoin_speed_scale = max(
             0.05, float(self.get_parameter("rejoin_speed_scale").value)
         )
+
+        g = self.get_parameter
+        self.path_check_enable = param_bool(g("path_check_enable").value)
+        self.path_check_inflation_m = max(
+            0.0, float(g("path_check_inflation_m").value)
+        )
+        self.path_check_obstacle_margin_m = max(
+            0.0, float(g("path_check_obstacle_margin_m").value)
+        )
+        self.path_check_min_length_m = max(
+            0.0, float(g("path_check_min_length_m").value)
+        )
+        self.path_check_backoff_m = max(0.0, float(g("path_check_backoff_m").value))
+        self.avoid_speed_enable = param_bool(g("avoid_speed_enable").value)
+        self.avoid_speed_ref_mps = max(0.1, float(g("avoid_speed_ref_mps").value))
+        self.avoid_speed_params = AvoidSpeedParams(
+            a_lat=float(g("avoid_a_lat_mps2").value),
+            a_brake=float(g("avoid_a_brake_mps2").value),
+            safety_factor=float(g("avoid_safety_factor").value),
+            standoff_m=float(g("avoid_standoff_m").value),
+            ego_half_width_m=0.5 * float(g("obstacle_lateral_abs_max_m").value),
+            ego_front_m=float(g("ego_front_safety_m").value),
+            lateral_margin_m=float(g("avoid_lateral_margin_m").value),
+            v_min=float(g("avoid_speed_min_mps").value),
+        )
+        self._inflated_map: InflatedMap | None = None
+        self._map_warned = False
+        self._last_avoid_speed = float("nan")
+        self._last_avoid_reason = ""
+        self._last_path_cut = 0
+        self._last_block_warn_ns = 0
+        self._last_pose_for_speed: PoseStamped | None = None
+        self._speed_static_obs: list = []
+        self._speed_dynamic_obs: list = []
+        self._slew_prev_v: float | None = None
+        self._slew_prev_ns = 0
+        self._override_active = False
+
         self.use_fgm = param_bool(self.get_parameter("use_fgm").value)
         cone_deg = float(self.get_parameter("forward_cone_deg").value)
         self.forward_cone_rad = math.radians(cone_deg)
@@ -351,9 +437,10 @@ class LocalPlannerNode(Node):
         reverse_track = param_bool(
             self.get_parameter("reverse_track_direction").value
         )
-        self.points = apply_track_direction(
-            load_csv_xy(csv_path), reverse_track
-        )
+        csv_points, csv_speeds = load_csv_xyv(csv_path)
+        self.points = apply_track_direction(csv_points, reverse_track)
+        # 회피 감속을 "CSV 속도 대비 배율" 로 내보내려면 기준 속도를 알아야 한다.
+        self.csv_speeds = apply_track_direction_scalars(csv_speeds, reverse_track)
         if len(self.points) < 2:
             raise RuntimeError(
                 f"local_planner: csv_path needs ≥2 points: {csv_path} ({len(self.points)})"
@@ -363,7 +450,8 @@ class LocalPlannerNode(Node):
         )
         self._build_loop_geometry()
         self.get_logger().info(
-            f"CSV track loaded: {csv_path} ({len(self.points)} pts), "
+            f"CSV track loaded: [{os.path.basename(csv_path)}] {csv_path} "
+            f"({len(self.points)} pts), "
             f"window={self.path_window_size}, anchor_half_width={self.path_anchor_half_width}"
         )
         self._obstacle_data: list = []
@@ -393,6 +481,18 @@ class LocalPlannerNode(Node):
         self.sub_fgm = self.create_subscription(
             PointStamped, fgm_topic, self.cb_fgm_target, 10
         )
+        if self.path_check_enable:
+            # 맵은 latch 로 한 번만 오므로 transient_local 이어야 늦게 떠도 받는다
+            self.sub_map = self.create_subscription(
+                OccupancyGrid,
+                str(self.get_parameter("map_topic").value),
+                self.cb_map,
+                QoSProfile(
+                    depth=1,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                ),
+            )
         gate_topic = self.get_parameter("planner_path_override_topic").value
         self.pub_override_gate = self.create_publisher(Bool, gate_topic, 10)
         self.pub_path = self.create_publisher(Path, out_topic, 10)
@@ -508,34 +608,9 @@ class LocalPlannerNode(Node):
             return None
 
     def _filter_obstacles_for_planner(self, raw: list) -> list:
-        corridor_on = self._raceline_corridor_enable and len(self.points) >= 2
-        tf_lm = self._lookup_laser_to_map_transform() if corridor_on else None
-        if corridor_on and tf_lm is None:
-            now_ns = self.get_clock().now().nanoseconds
-            if now_ns - self._last_tf_warn_ns > 2_000_000_000:
-                self.get_logger().warn(
-                    f"TF {self.map_frame}<-{self.laser_frame} 실패 — "
-                    "코리도 필수: 회피 게이트 장애 없음으로 처리(벽 오검 방지)."
-                )
-                self._last_tf_warn_ns = now_ns
+        corridor_on, laser_to_map = self._corridor_lookup(warn=True)
+        if corridor_on and laser_to_map is None:
             return []
-
-        tr = tf_lm.transform if tf_lm is not None else None
-
-        def laser_to_map(lx: float, ly: float):
-            if tr is None:
-                return None
-            return _point_laser_to_map(
-                lx,
-                ly,
-                tr.translation.x,
-                tr.translation.y,
-                tr.rotation.w,
-                tr.rotation.x,
-                tr.rotation.y,
-                tr.rotation.z,
-            )
-
         return filter_obstacles_laser_frame(
             raw,
             forward_min_m=self._obstacle_forward_min_m,
@@ -544,33 +619,15 @@ class LocalPlannerNode(Node):
             corridor_enable=corridor_on,
             corridor_max_lat_m=self._corridor_max_lat,
             track_pts=self.points,
-            laser_to_map=laser_to_map if corridor_on else None,
+            laser_to_map=laser_to_map,
             require_corridor_tf=True,
         )
 
     def _filter_obstacles_for_exit(self, raw: list) -> list:
         """회피 해제용: 코리도 안 장애만 (벽 raw 제외)."""
-        corridor_on = self._raceline_corridor_enable and len(self.points) >= 2
-        tf_lm = self._lookup_laser_to_map_transform() if corridor_on else None
-        if corridor_on and tf_lm is None:
+        corridor_on, laser_to_map = self._corridor_lookup()
+        if corridor_on and laser_to_map is None:
             return []
-
-        tr = tf_lm.transform if tf_lm is not None else None
-
-        def laser_to_map(lx: float, ly: float):
-            if tr is None:
-                return None
-            return _point_laser_to_map(
-                lx,
-                ly,
-                tr.translation.x,
-                tr.translation.y,
-                tr.rotation.w,
-                tr.rotation.x,
-                tr.rotation.y,
-                tr.rotation.z,
-            )
-
         return filter_obstacles_for_exit(
             raw,
             pass_rear_x_m=self.avoid_pass_rear_x_m,
@@ -578,7 +635,7 @@ class LocalPlannerNode(Node):
             corridor_enable=corridor_on,
             corridor_max_lat_m=self._corridor_max_lat,
             track_pts=self.points,
-            laser_to_map=laser_to_map if corridor_on else None,
+            laser_to_map=laser_to_map,
         )
 
     def _make_laser_to_map_fn(self, tf_lm):
@@ -600,12 +657,28 @@ class LocalPlannerNode(Node):
 
         return laser_to_map
 
-    def _filter_dynamic_for_planner(self, raw: list) -> list:
+    def _corridor_lookup(self, *, warn: bool = False):
+        """(코리도 ON 여부, laser→map 함수). TF 실패면 (True, None)."""
         corridor_on = self._raceline_corridor_enable and len(self.points) >= 2
-        tf_lm = self._lookup_laser_to_map_transform() if corridor_on else None
-        if corridor_on and tf_lm is None:
-            return []
+        if not corridor_on:
+            return False, None
+        tf_lm = self._lookup_laser_to_map_transform()
+        if tf_lm is None:
+            if warn:
+                now_ns = self.get_clock().now().nanoseconds
+                if now_ns - self._last_tf_warn_ns > 2_000_000_000:
+                    self.get_logger().warn(
+                        f"TF {self.map_frame}<-{self.laser_frame} 실패 — "
+                        "코리도 필수: 회피 게이트 장애 없음으로 처리(벽 오검 방지)."
+                    )
+                    self._last_tf_warn_ns = now_ns
+            return True, None
+        return True, self._make_laser_to_map_fn(tf_lm)
 
+    def _filter_dynamic_for_planner(self, raw: list) -> list:
+        corridor_on, laser_to_map = self._corridor_lookup()
+        if corridor_on and laser_to_map is None:
+            return []
         return filter_dynamic_obstacles_laser_frame(
             raw,
             forward_min_m=self._obstacle_forward_min_m,
@@ -614,16 +687,14 @@ class LocalPlannerNode(Node):
             corridor_enable=corridor_on,
             corridor_max_lat_m=self._corridor_max_lat,
             track_pts=self.points,
-            laser_to_map=self._make_laser_to_map_fn(tf_lm) if corridor_on else None,
+            laser_to_map=laser_to_map,
             require_corridor_tf=True,
         )
 
     def _filter_dynamic_for_exit(self, raw: list) -> list:
-        corridor_on = self._raceline_corridor_enable and len(self.points) >= 2
-        tf_lm = self._lookup_laser_to_map_transform() if corridor_on else None
-        if corridor_on and tf_lm is None:
+        corridor_on, laser_to_map = self._corridor_lookup()
+        if corridor_on and laser_to_map is None:
             return []
-
         return filter_dynamic_obstacles_for_exit(
             raw,
             pass_rear_x_m=self.avoid_pass_rear_x_m,
@@ -631,7 +702,7 @@ class LocalPlannerNode(Node):
             corridor_enable=corridor_on,
             corridor_max_lat_m=self._corridor_max_lat,
             track_pts=self.points,
-            laser_to_map=self._make_laser_to_map_fn(tf_lm) if corridor_on else None,
+            laser_to_map=laser_to_map,
         )
 
     def _dynamic_threat_metrics(
@@ -800,6 +871,172 @@ class LocalPlannerNode(Node):
             clear_radius_m=self.exit_csv_clear_radius_m,
         )
 
+    def cb_map(self, msg: OccupancyGrid) -> None:
+        """맵 수신 → 차폭만큼 부풀린 클리어런스 격자 생성 (수신 시 1회)."""
+        try:
+            self._inflated_map = InflatedMap(msg, self.path_check_inflation_m)
+        except Exception as exc:  # 맵이 깨져도 플래너는 살아 있어야 한다
+            self.get_logger().error(f"map inflation failed: {exc}")
+            self._inflated_map = None
+            return
+        self.get_logger().info(
+            f"path check map ready — {msg.info.width}x{msg.info.height} "
+            f"@{msg.info.resolution:.3f}m/px, inflation={self.path_check_inflation_m:.2f}m"
+        )
+
+    def _obstacle_disks_map(self, tf_lm) -> list:
+        """장애물을 맵 좌표 원판 [(x, y, r), ...] 으로. 반경엔 차폭이 포함된다."""
+        if tf_lm is None:
+            return []
+        to_map = self._make_laser_to_map_fn(tf_lm)
+        grow = (
+            self.avoid_speed_params.ego_half_width_m
+            + self.path_check_obstacle_margin_m
+        )
+        disks = []
+        obs = self._obstacle_data
+        for k in range(0, max(0, len(obs) - 3), 4):
+            mx, my = to_map(float(obs[k + 1]), float(obs[k + 2]))
+            disks.append((mx, my, float(obs[k + 3]) + grow))
+        dyn = self._dynamic_obstacle_data
+        for k in range(0, max(0, len(dyn) - 5), 6):
+            mx, my = to_map(float(dyn[k + 1]), float(dyn[k + 2]))
+            disks.append((mx, my, float(dyn[k + 5]) + grow))
+        return disks
+
+    def _truncate_path_at_collision(self, path: Path, tf_lm) -> tuple[Path, bool]:
+        """회피 경로를 첫 충돌 지점 앞에서 자른다. (경로, 쓸만한가).
+
+        FGM 목표점 너머 직선 연장이 벽을 향하는 경우가 이걸로 걸린다.
+        남은 길이가 너무 짧으면 회피 자체를 포기한다 — 그 짧은 경로를 주면
+        Stanley 가 끝점에서 이상하게 돌고, 차라리 CSV 로 두고 AEB 에 맡기는
+        편이 안전하다.
+        """
+        if not self.path_check_enable or len(path.poses) < 2:
+            return path, True
+
+        if self._inflated_map is None and not self._map_warned:
+            # 조용히 벽 검사만 빠지면 "검사하고 있다" 고 착각하게 된다
+            self._map_warned = True
+            self.get_logger().warn(
+                "path_check 켜져 있는데 /map 이 아직 없음 — 장애물 검사만 동작하고 "
+                "벽 검사는 빠진다. map_server 를 띄우거나 path_check_enable=false."
+            )
+
+        pts = [(p.pose.position.x, p.pose.position.y) for p in path.poses]
+        cut = first_blocked_index(
+            pts,
+            self._inflated_map,
+            self._obstacle_disks_map(tf_lm),
+            start_index=1,
+        )
+        self._last_path_cut = cut
+        if cut >= len(pts):
+            return path, True
+
+        kept = trim_back(pts, cut, self.path_check_backoff_m)
+        length = 0.0
+        for i in range(1, kept):
+            length += math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+
+        if length < self.path_check_min_length_m:
+            return path, False
+
+        path.poses = path.poses[:kept]
+        return path, True
+
+    def _warn_avoid_path_blocked(self) -> None:
+        """회피 경로가 통째로 막힘 (1초에 한 번). 감속·정지는 속도정책과 AEB 몫."""
+        now = self.get_clock().now().nanoseconds
+        if now - getattr(self, "_last_block_warn_ns", 0) < 1_000_000_000:
+            return
+        self._last_block_warn_ns = now
+        self.get_logger().warn(
+            f"회피 경로가 {self._last_path_cut}번째 점에서 막힘 — 쓸 만한 길이가 "
+            "안 나와 회피 포기, CSV 유지. 감속 후 AEB 가 받는다."
+        )
+
+    def _csv_speed_near(self, x: float, y: float) -> float:
+        """현재 위치에서 가장 가까운 CSV 웨이포인트의 목표속도 [m/s].
+
+        회피 감속을 배율로 내보내야 해서 기준값이 필요하다. 속도 열이 없는
+        구형 CSV 면 avoid_speed_ref_mps 로 대신한다.
+        """
+        if not self.csv_speeds:
+            return self.avoid_speed_ref_mps
+        d2 = (self._xs_np - x) ** 2 + (self._ys_np - y) ** 2
+        v = float(self.csv_speeds[int(np.argmin(d2))])
+        return v if v > 0.05 else self.avoid_speed_ref_mps
+
+    def _avoid_speed_scale(
+        self, current: PoseStamped | None, *, avoiding: bool
+    ) -> float:
+        """속도 배율. 물리로 목표속도를 구해 CSV 속도로 나눈다.
+
+        avoiding=False 는 접근 구간(GLOBAL) 선감속. 조향 한계는 빼고 거리
+        기반만 건다.
+        """
+        if not self.avoid_speed_enable:
+            return self.rejoin_speed_scale if avoiding else 1.0
+
+        # FGM 목표점을 차량 기준 (전방, 횡) 으로 — 조향이 얼마나 급한지가 여기서 나온다
+        fwd, lat = 2.0, 0.0
+        tgt = self._fgm_target_fresh()
+        if tgt is not None:
+            # /fgm_target 은 laser frame 이라 그대로 전방/횡으로 쓸 수 있다
+            fwd = max(0.1, float(tgt.point.x))
+            lat = float(tgt.point.y)
+        else:
+            # 목표가 없거나 오래됐으면 조향 한계를 걸 근거가 없다
+            avoiding = False
+
+        v_target, reason = avoid_speed_limit(
+            self._speed_static_obs,
+            self._speed_dynamic_obs,
+            self._ego_speed_mps,
+            fwd,
+            lat,
+            self.avoid_speed_params,
+            laser_to_base_x_m=self.laser_to_base_x_m,
+            include_maneuver=avoiding,
+        )
+        v_target = self._slew_limit_speed(v_target)
+        self._last_avoid_speed = v_target
+        self._last_avoid_reason = reason
+
+        v_csv = self.avoid_speed_ref_mps
+        if current is not None:
+            v_csv = self._csv_speed_near(
+                float(current.pose.position.x), float(current.pose.position.y)
+            )
+        return min(1.0, v_target / max(0.05, v_csv))
+
+    def _slew_limit_speed(self, v_target: float) -> float:
+        """감속 명령이 차가 낼 수 있는 감속도를 넘지 않게 완만화.
+
+        장애물이 검출 범위에 처음 들어오는 순간 목표속도가 뚝 떨어지는데,
+        그대로 내보내면 못 따라가는 명령이라 속도 PI 가 포화되고 적분이
+        쌓인다. a_brake 로 기울기를 제한하면 명령 자체가 추종 가능해진다.
+        가속 방향은 제한하지 않는다 (위험이 사라지면 바로 회복).
+        """
+        now = self.get_clock().now().nanoseconds
+        prev = self._slew_prev_v
+        prev_ns = self._slew_prev_ns
+        self._slew_prev_ns = now
+
+        if prev is None or prev_ns == 0:
+            self._slew_prev_v = v_target
+            return v_target
+        dt = (now - prev_ns) * 1e-9
+        if dt <= 0.0 or dt > 0.5:  # 오래 끊겼으면 이력 버림
+            self._slew_prev_v = v_target
+            return v_target
+
+        floor = prev - self.avoid_speed_params.a_brake * dt
+        v = max(v_target, floor)
+        self._slew_prev_v = v
+        return v
+
     def _planner_gate_closest_m(self, filtered: list) -> float:
         """게이트 통과 장애 — 전방 콘 없이(조향 후에도 '아직 있음' 판정용)."""
         return closest_obstacle_surface_m(
@@ -840,8 +1077,17 @@ class LocalPlannerNode(Node):
             sc = self._snap_speed_scale(self._strategy_mul_recv)
             cd = int(self._strategy_cond_recv) & 0xFF
 
-        if self.mode in ("AVOID", "REJOIN"):
-            sc = min(sc, self.rejoin_speed_scale)
+        # GLOBAL 에서도 접근 선감속을 건다. 모드가 바뀌는 순간이 아니라
+        # 장애물이 가까워지는 정도에 따라 연속적으로 줄어들어야 한다.
+        # mode 가 아니라 실제로 회피 경로를 내보내는 중인지로 판단한다.
+        # 장애물이 사라진 뒤에도 mode 는 잠시 AVOID 로 남는데, 그동안 조향
+        # 한계까지 걸면 아무것도 없는 구간에서 속도가 묶인다.
+        sc = min(
+            sc,
+            self._avoid_speed_scale(
+                self._last_pose_for_speed, avoiding=self._override_active
+            ),
+        )
 
         self.pub_planner_speed_scale.publish(Float64(data=sc))
         self.pub_planner_speed_condition.publish(UInt8(data=cd))
@@ -1001,9 +1247,25 @@ class LocalPlannerNode(Node):
             self.pub_sent_dbg.publish(self._stamp_copy_of_path(out))
 
     def _publish_override_gate(self, active: bool) -> None:
+        # 속도 정책이 "실제로 회피 경로를 주고 있는지" 를 봐야 해서 기억해 둔다.
+        # rejoin 이 꺼져 있으면 장애물이 사라진 뒤 mode 는 바로 GLOBAL 이 된다.
+        self._override_active = bool(active)
         g = Bool()
         g.data = bool(active)
         self.pub_override_gate.publish(g)
+
+    def _fgm_target_fresh(self) -> PointStamped | None:
+        """신선한 /fgm_target 만. 오래된 목표로 속도를 묶으면 안 된다."""
+        tgt = self._fgm_target
+        if tgt is None:
+            return None
+        now_ns = self.get_clock().now().nanoseconds
+        stamp_ns = (
+            tgt.header.stamp.sec * 1_000_000_000 + tgt.header.stamp.nanosec
+        )
+        if now_ns - stamp_ns > self.fgm_target_stale_ns:
+            return None
+        return tgt
 
     def _build_loop_geometry(self) -> None:
         n = len(self.points)
@@ -1019,57 +1281,49 @@ class LocalPlannerNode(Node):
             cum0.append(cum0[-1] + self._seg_len[i])
         self._total_l = cum0[-1]
         self._seg_start = cum0[:-1]
+        self._seg_end = cum0[1:]
         self._n = n
+        self._xs_np = np.asarray(self._xs, dtype=np.float64)
+        self._ys_np = np.asarray(self._ys, dtype=np.float64)
+        self._bx_np = np.roll(self._xs_np, -1)
+        self._by_np = np.roll(self._ys_np, -1)
 
     def _closest_on_loop(
         self, xp: float, yp: float
     ) -> Tuple[float, float, int, float]:
-        n = self._n
-        best_d2 = float("inf")
-        best_qx = best_qy = 0.0
-        best_i = 0
-        best_t = 0.0
-        for i in range(n):
-            ax, ay = self._xs[i], self._ys[i]
-            bx, by = self._xs[(i + 1) % n], self._ys[(i + 1) % n]
-            abx, aby = bx - ax, by - ay
-            apx, apy = xp - ax, yp - ay
-            ab2 = abx * abx + aby * aby
-            if ab2 < 1e-14:
-                continue
-            t = max(0.0, min(1.0, (apx * abx + apy * aby) / ab2))
-            qx = ax + t * abx
-            qy = ay + t * aby
-            d2 = (xp - qx) ** 2 + (yp - qy) ** 2
-            if d2 < best_d2:
-                best_d2 = d2
-                best_qx, best_qy = qx, qy
-                best_i = i
-                best_t = t
-        return best_qx, best_qy, best_i, best_t
+        ax, ay = self._xs_np, self._ys_np
+        bx, by = self._bx_np, self._by_np
+        abx, aby = bx - ax, by - ay
+        ab2 = abx * abx + aby * aby
+        t = np.divide(
+            (xp - ax) * abx + (yp - ay) * aby,
+            ab2,
+            out=np.zeros_like(ab2),
+            where=ab2 >= 1e-14,
+        )
+        t = np.clip(t, 0.0, 1.0)
+        qx = ax + t * abx
+        qy = ay + t * aby
+        d2 = (xp - qx) ** 2 + (yp - qy) ** 2
+        d2 = np.where(ab2 < 1e-14, np.inf, d2)
+        i = int(np.argmin(d2))
+        return float(qx[i]), float(qy[i]), i, float(t[i])
 
     def _xy_yaw_at_s(self, s: float) -> Tuple[float, float, float]:
         n = self._n
         if self._total_l < 1e-6:
             return self._xs[0], self._ys[0], 0.0
         s = s % self._total_l
-        for i in range(n):
-            if self._seg_start[i] + self._seg_len[i] >= s - 1e-9:
-                tloc = (s - self._seg_start[i]) / max(self._seg_len[i], 1e-9)
-                tloc = max(0.0, min(1.0, tloc))
-                x = self._xs[i] + tloc * (self._xs[(i + 1) % n] - self._xs[i])
-                y = self._ys[i] + tloc * (self._ys[(i + 1) % n] - self._ys[i])
-                yaw = math.atan2(
-                    self._ys[(i + 1) % n] - self._ys[i],
-                    self._xs[(i + 1) % n] - self._xs[i],
-                )
-                return x, y, yaw
-        i = n - 1
-        yaw = math.atan2(
-            self._ys[0] - self._ys[i],
-            self._xs[0] - self._xs[i],
-        )
-        return self._xs[i], self._ys[i], yaw
+        i = bisect.bisect_left(self._seg_end, s - 1e-9)
+        if i >= n:
+            i = n - 1
+        tloc = (s - self._seg_start[i]) / max(self._seg_len[i], 1e-9)
+        tloc = max(0.0, min(1.0, tloc))
+        j = (i + 1) % n
+        x = self._xs[i] + tloc * (self._xs[j] - self._xs[i])
+        y = self._ys[i] + tloc * (self._ys[j] - self._ys[i])
+        yaw = math.atan2(self._ys[j] - self._ys[i], self._xs[j] - self._xs[i])
+        return x, y, yaw
 
     def _project_to_frenet(
         self, x: float, y: float, yaw: float
@@ -1305,7 +1559,11 @@ class LocalPlannerNode(Node):
                     and self._csv_cte_abs_m(current_pose)
                     <= self.rejoin_finish_lateral_m
                 )
-                if not cte_ok:
+                # rejoin 을 쓸 때만 CTE 가 줄 때까지 AVOID 를 붙든다. rejoin 이
+                # 꺼져 있으면 이미 override 를 내려 Stanley 가 CSV 로 복귀하는
+                # 중이라, mode 만 AVOID 로 남겨두면 AEB 완화와 속도 캡이
+                # 이유 없이 길어진다.
+                if not cte_ok and self.rejoin_enable:
                     pass
                 elif current_pose is not None and self.rejoin_enable:
                     self._rejoin_path_msg = self._build_frenet_quintic_rejoin_path(
@@ -1396,14 +1654,8 @@ class LocalPlannerNode(Node):
             return out
 
         n = len(self.points)
-        best_i = 0
-        best_d2 = float("inf")
-        for i in range(n):
-            px, py = self.points[i]
-            d2 = (px - fgm_x) ** 2 + (py - fgm_y) ** 2
-            if d2 < best_d2:
-                best_d2 = d2
-                best_i = i
+        d2 = (self._xs_np - fgm_x) ** 2 + (self._ys_np - fgm_y) ** 2
+        best_i = int(np.argmin(d2))
 
         for t_idx in range(self.avoid_merge_tail_max):
             i = (best_i + t_idx) % n
@@ -1485,6 +1737,11 @@ class LocalPlannerNode(Node):
         self._last_rel_speed_mps = rel_speed
         self._last_d_dyn_closest = d_dyn_closest
         current = self._get_current_pose_map()
+        # strategy 콜백에서도 속도 배율을 다시 내므로 캐시해 둔다.
+        # 속도 판단엔 코리도 통과 장애만 쓴다 — 트랙 밖 물체로 감속하면 안 된다.
+        self._last_pose_for_speed = current
+        self._speed_static_obs = filtered
+        self._speed_dynamic_obs = filtered_dynamic
 
         self._update_mode(
             d_closest,
@@ -1535,6 +1792,13 @@ class LocalPlannerNode(Node):
             out = self._build_avoid_path(
                 current, fgm_x, fgm_y, merge_csv_tail=False
             )
+            out, usable = self._truncate_path_at_collision(
+                out, self._lookup_laser_to_map_transform()
+            )
+            if not usable:
+                self._warn_avoid_path_blocked()
+                self._publish_override_gate(False)
+                return
 
             if len(out.poses) >= 2:
                 base_path = (
@@ -1597,11 +1861,12 @@ def main(args=None):
     node = LocalPlannerNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == "__main__":
     main()

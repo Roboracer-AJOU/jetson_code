@@ -373,7 +373,7 @@ def generate_launch_description():
     ),
     DeclareLaunchArgument(
       'lidar_scan_frequency',
-      default_value='40.0',
+      default_value='20.0',
       description='LiDAR scan frequency in Hz for mapping (40: 장애물 인지용 해상도 확보, Jetson 부하 확인 필요)',
     ),
     DeclareLaunchArgument(

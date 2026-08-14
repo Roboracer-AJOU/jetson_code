@@ -29,6 +29,7 @@ setup(
             'integrated_obstacle_node = path_following.integrated_obstacle_node:main',
             'stanley_waypoint_follow_node = path_following.stanley_waypoint_follow_node:main',
             'control_node = path_following.control_node:main',
+            'emergency_brake_node = path_following.emergency_brake_node:main',
             'csv_logger_node = path_following.csv_logger_node:main',
             'vehicle_measurement_node = path_following.vehicle_measurement_node:main',
             'drive_monitor = path_following.drive_monitor:main',
