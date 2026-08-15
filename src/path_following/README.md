@@ -526,6 +526,45 @@ Stanley 가 `/planner/speed_scale` (`std_msgs/Float64`) 를 구독해 CSV 속도
 회피 계층의 일이지 AEB 의 일이 아니다. 장애물이 치워지거나 상대가 움직여야
 다시 출발한다.
 
+#### 재발동 방지 — 탈출 창
+
+여유 안쪽에 서 버렸을 때를 위해 `stuck_release_sec`(1.5 s) 뒤 제동을 푸는
+탈출구가 있다. 그런데 **푸는 것만으로는 나갈 수 없다.** 차가 아직 그 자리라면
+`closest` 가 그대로라 다음 틱(20 ms)에 `standoff` 가 다시 물고, 결과는
+
+```
+1.9 s 제동 → 0.02 s 해제 → 재제동 → …        (탈출 불가)
+```
+
+제동이 풀린 시간이 한 틱뿐이라 차가 움직일 기회가 없다. 그래서 **stuck 으로
+풀린 직후에는 재발동을 일정 구간 막는다.** 그동안 FGM+플래너가 탈출 경로를
+찾아 실제로 빠져나가야 한다.
+
+무한정 막으면 그냥 AEB 를 끈 것과 같으므로 네 가지로 창을 닫는다.
+
+| 종료 조건 | 파라미터 | 기본 | 의미 |
+| --- | --- | --- | --- |
+| 실제로 이동 | `escape_min_travel_m` | `0.35` | 속도 적분. TF 가 끊겨도 동작한다 |
+| 시간 초과 | `escape_max_sec` | `3.0` | 못 빠져나갔으면 다시 AEB 에 맡긴다 |
+| 정상 주행 복귀 | `escape_speed_end_mps` | `1.0` | 이 속도면 이미 자유 주행이다 |
+| **hard_stop 침범** | `escape_hard_stop_m` | `0.12` | **창 안에서도 무조건 제동** |
+
+마지막 줄이 안전의 핵심이다. 이게 없으면 "탈출한다"며 벽으로 그대로 들어간다.
+`escape_hard_stop_m` 은 `min_standoff_m`(0.30) 보다 한참 작아야 의미가 있다 —
+같게 두면 창이 열리자마자 닫혀서 원래 루프로 돌아간다.
+
+`escape_enable: False` 로 되돌리면 이전 거동(= 재발동 루프)으로 완전히 복귀한다.
+로그로 `AEB 탈출 창 시작 #N` / `AEB 탈출 창 종료 — <사유>` 를 찍으므로, 실차에서
+`시간 초과` 가 자주 보이면 탈출 경로 자체가 안 나오는 것이니 회피 쪽을 봐야 한다.
+
+**이 창은 절반이다.** 재발동을 막아도 나갈 경로가 없으면 제자리다. 나머지 절반은
+플래너 쪽 탈출 모드가 담당한다 → [§5.6.3](#563-aeb-로-멈춘-뒤-빠져나가기--탈출-모드).
+
+> AEB 가 자주 걸리는 것 자체가 이상 신호다. 대부분의 장애물은 `AVOID` 나
+> `TRAILING` 이 처리해야 하고, AEB 는 갑자기 튀어나온 것만 받아야 한다.
+> `AEB 발동 횟수` 가 랩당 한 자리를 넘으면 회피 진입 임계(`avoid_on_m`)나
+> 검출 품질(아래 5.8)을 먼저 의심한다.
+
 > 출발 전 주의: 차를 벽에서 `min_standoff_m`(0.30 m) 안쪽에 놓고 AUTO 로 넘기면
 > AEB 가 계속 걸려 출발하지 않는다. 로그에 `EMERGENCY BRAKE [STANDOFF]` 가 뜬다.
 
@@ -547,7 +586,17 @@ AEB 는 위험이 사라지면 자동으로 풀린다. AUTO 에서만 동작한�
 | --- | --- | --- |
 | `GLOBAL` (평상시) | ttc < 0.55 s, 거리 < 0.30 m | ttc ≥ 0.83 s, 거리 ≥ 0.40 m |
 | `AVOID` / `REJOIN` | ttc < 0.33 s, 거리 < 0.18 m | ttc ≥ 0.49 s, 거리 ≥ 0.28 m |
+| `TRAILING` | `GLOBAL` 과 동일 (엄격) | 동일 |
 | 토픽 끊김 / 노드 없음 | `GLOBAL` 과 동일 (엄격) | 동일 |
+
+`TRAILING` 은 CSV 를 정상 추종하는 상태라 완화 대상이 아니다 (`avoid_modes` 에
+넣지 않는다). 갭 유지에 실패하면 AEB 가 엄격 기준 그대로 받아야 한다.
+
+AEB 탈출 모드([§5.6.3](#563-aeb-로-멈춘-뒤-빠져나가기--탈출-모드))는 `/planner/mode` 를
+`AVOID` 로 내보내므로 완화 기준이 걸린다. 의도한 것이다 — 탈출 중에는 장애물
+가까이서 조향으로 빠져나가야 하고, 속도는 `aeb_escape_speed_mps`(0.8 m/s) 로 묶여
+있다. 그래도 `avoid_standoff_floor_m`(0.18 m) 과 `escape_hard_stop_m`(0.12 m) 은
+살아 있어서 밀고 들어가지는 못한다.
 
 **끄는 게 아니라 낮추는 것**이 핵심이다. AEB 는 최후 방어선이라 플래너가 무력화할
 수 있으면 의미가 없다. 그래서 두 겹으로 막는다.
@@ -749,21 +798,25 @@ v = v_장애물 + sqrt(2 · a_brake · 남은거리)
 
 ### 5.6.1 회피가 끝나면 어떻게 글로벌 패스로 돌아오는가
 
-돌아온다. 다만 **복귀 경로를 따로 그려서 돌아오는 게 아니라, 회피 경로 발행을
-멈추면 Stanley 가 알아서 CSV 로 붙는 방식**이다. `rejoin_enable` 이 기본 `False`
-라서 Frenet quintic 복귀 경로는 만들지 않는다.
+돌아온다. `rejoin_enable` 이 **기본 `True`** 라, 현재 위치에서 레이스라인까지
+Frenet quintic 복귀 경로를 그려 `REJOIN` 모드로 붙는다.
 
 순서는 이렇다.
 
 1. 장애물이 `avoid_fgm_gate_m` 밖으로 나가고 `_avoidance_fully_cleared` 가
    `avoid_off_count_th`(3) 사이클 연속 성립
-2. 플래너가 `/planner_path_override_active` 를 `False` 로 내림
-3. Stanley 가 `/local_path` 를 무시하고 CSV 를 다시 따라감 → 횡오차가 줄어듦
-4. 모드가 `AVOID → GLOBAL`, 속도 배율도 1.0 으로 복귀
+2. 현재 (s, d, d′) 에서 d → 0 으로 가는 quintic 을 생성.
+   길이는 속도 연동 `L = clip(rejoin_time_sec × v_ego, 0.50, 2.50)` m
+3. 그 경로도 `_truncate_path_at_collision` 을 통과해야 채택된다.
+   막히면 `REJOIN` 을 포기하고 바로 `GLOBAL` — CSV 로 두는 편이 안전하다
+4. `|CTE| ≤ rejoin_finish_lateral_m` 이 되면 `REJOIN → GLOBAL`
 
-`rejoin_enable=True` 로 켜면 2번 대신 현재 위치에서 CSV 까지 quintic 을 그려
-`REJOIN` 모드로 부드럽게 붙는다. 이때는 `|CTE| ≤ rejoin_finish_lateral_m` 이
-될 때까지 모드를 붙들고 있는다.
+`rejoin_enable=False` 로 끄면 2번 대신 그냥 `/planner_path_override_active` 를
+내려서, Stanley 가 CSV 로 알아서 붙게 둔다 (예전 동작).
+
+> **길이 고정 버그**: 예전에는 `L = min(rejoin_min_length_m, rejoin_max_length_m)`
+> 이라 속도와 무관하게 항상 0.50 m 였고 `rejoin_time_sec` 은 읽히기만 하고 안
+> 쓰였다. 3 m/s 에서 0.5 m 는 0.17 초 만에 붙으라는 요구라 조향이 튄다.
 
 > **주의 — 과거 동작**: 예전에는 `rejoin_enable` 이 꺼져 있어도 `|CTE| ≤ 0.20 m`
 > 가 될 때까지 모드가 `AVOID` 에 남았다. 3번에서 이미 CSV 로 복귀하는 중인데도
@@ -771,6 +824,214 @@ v = v_장애물 + sqrt(2 · a_brake · 남은거리)
 > 오래 유지됐다. 지금은 rejoin 을 쓸 때만 CTE 를 기다린다. 또한 회피 속도 정책은
 > 모드 라벨이 아니라 **실제 override 발행 여부**를 보고, `/fgm_target` 이
 > `fgm_target_stale_sec` 를 넘겨 오래됐으면 조향 상한을 걸지 않는다.
+
+### 5.6.2 못 지나갈 때 — `TRAILING`
+
+옆으로 빠질 틈이 없으면 예전에는 `AVOID` 를 계속 시도하다 결국 AEB 가 급정거로
+받았다. head-to-head 에서는 이게 곧 실격이거나 추돌이다. `TRAILING` 은 그
+사이를 메우는 상태다 — **경로는 CSV 그대로 두고 속도만 줄여 갭을 유지한다.**
+
+| 전이 | 조건 |
+|---|---|
+| `GLOBAL → TRAILING` | 전방 s 갭 ≤ `trailing_enter_m`(3.0 m) 인데 `AVOID` 진입 조건은 안 섬 |
+| `AVOID → TRAILING` | 회피 경로가 `path_check_min_length_m` 밑으로 잘렸고 **따라갈 앞차가 있을 때** |
+| `AVOID → GLOBAL` | 같은데 따라갈 앞차가 **없을 때** (= 정적 장애물) |
+| `TRAILING → AVOID` | 회피 진입 조건이 다시 서고 경로 막힘 래치도 풀림 |
+| `TRAILING → GLOBAL` | 갭 > `trailing_exit_m`(4.5 m) 가 `trailing_exit_count_th`(5) 프레임 연속 |
+
+#### 경로 막힘은 시간 래치로 붙든다 — `avoid_retry_sec`
+
+"회피 경로가 막혔다" 는 예전에 한 프레임짜리 bool 이었다. `AVOID → TRAILING`
+전이에서 바로 리셋돼 다음 프레임에 `TRAILING → AVOID` 로 튕겨 나갔고, 40 Hz 에서
+**2 프레임 주기로 왕복**했다. 그러면 AEB 완화 기준이 프레임마다 깜빡이고
+(`AVOID` 프레임은 완화, `TRAILING` 프레임은 엄격) 갭 제어의 미분 이력도 매번
+리셋된다. 즉 두 상태 어느 쪽도 제 일을 못 한다.
+
+`avoid_retry_sec`(0.5 s) 동안 "막힘" 을 붙들어 두면 재시도가 그 주기로만 일어난다.
+`GLOBAL → AVOID` 도 같은 래치로 막아서, 실패한 회피를 즉시 다시 시도하지 않는다.
+대가는 "틈이 생겼는데 최대 0.5 초 늦게 `AVOID` 로 복귀" 뿐이다.
+
+측정 (정적 장애물이 경로를 계속 막는 상황, 2 초 / 80 프레임):
+
+| | 모드 전이 횟수 |
+|---|---|
+| bool (예전) | 약 78 회 |
+| 시간 래치 (0.5 s) | 6 회 |
+
+**따라갈 앞차가 없으면 `TRAILING` 이 아니라 `GLOBAL` 로 보낸다.** 정적 장애물을
+`TRAILING` 으로 보내면 전방 s 갭이 `inf` 라서 5 프레임 뒤 곧바로 `GLOBAL` 로
+빠져나가고, `AVOID → TRAILING → GLOBAL → AVOID` 가 200 ms 주기로 돈다. 처음부터
+`GLOBAL` 로 보내면 AEB 완화 없이 엄격한 기준을 유지한다. 어느 쪽이든 경로는
+발행되지 않으므로 Stanley 는 CSV 를 타고, 감속은 모드와 무관한 속도 정책이 한다.
+
+#### 무엇을 "따라갈 앞차" 로 볼 것인가
+
+추월 로직이 없으므로 같은 방향으로 달리는 차는 비켜 가려 하지 말고 뒤에 붙는다.
+반대로 아래는 따라갈 대상이 아니라 **`AVOID` 로 보낸다.**
+
+| 앞차 상태 | 판정 | 이유 |
+| --- | --- | --- |
+| 정지 / `trailing_min_leader_speed_mps`(0.5) 미만 | `AVOID` | 서 있는 차를 따라가면 영원히 그 뒤에 선다 |
+| 역주행 (`vs < 0`) | `AVOID` | 마주 오는 차 뒤에 붙는다는 말이 성립하지 않는다 |
+| 같은 방향 주행 | `TRAILING` | 뒤에 붙어 갭만 지킨다 |
+
+절대속도만 보면 0.5 m/s 만 넘으면 따라가게 된다 — 우리가 5 m/s 를 낼 수 있어도
+1 m/s 로 기어가는 차 뒤에 붙어 같이 1 m/s 로 간다. 레이싱에서 그건 지는 것이라
+상대속도 조건을 하나 더 본다.
+
+| 파라미터 | 기본 | 의미 |
+| --- | --- | --- |
+| `trailing_speed_deficit_enable` | `True` | 아래 조건을 쓸지 |
+| `trailing_max_speed_deficit_mps` | `0.5` | `CSV 목표속도 − 앞차속도` 가 이걸 넘으면 `AVOID` |
+
+"비슷한 속도면 따라가고, 확실히 느리면 비켜 간다" 가 된다. 새 상태나 추월 판단
+로직은 없다 — **분류 기준만 하나 늘린 것**이고, 비켜 가는 경로는 정적 장애물과
+똑같은 FGM 반응형이다.
+
+> 임계를 더 낮추지 말 것. 움직이는 차 옆을 지나는 건 콘을 지나는 것과 다르다.
+> 상대는 우리가 옆에 붙은 순간 라인을 바꿀 수 있고 반응형 회피는 그걸 예측하지
+> 못한다. 조금만 빨라도 비켜 가려 들면 head-to-head 접촉 위험이 실제로 올라간다.
+
+`TRAILING` 중에는 `/local_path` 를 **발행하지 않고** `override=False` 를 유지한다.
+Stanley 는 평소처럼 CSV 를 탄다. 속도만 갭 제어로 조인다.
+
+#### 갭 제어의 기준은 CSV 속도가 아니라 앞차 속도다
+
+처음에는 CSV 속도에 배율을 곱했다. 그런데 그러면 갭이 목표에 맞았을 때
+(`gap_error = 0`) 배율이 1.0 이 되어 **CSV 전속**이 나온다. 앞차가 1.2 m/s 인데
+자차는 5 m/s 를 명령하니 갭이 순식간에 무너지고, 그때서야 오차가 음수로 커져
+급제동한다. 서면 갭이 벌어져 다시 전속. 이 왕복이 "갔다 멈췄다" 버벅임의 정체다.
+**정상상태가 없는 제어**였다.
+
+앞차 속도를 기준으로 두면 오차 0 에서 `v = v_lead` 라 정상상태가 생긴다.
+
+```
+gap_error = 전방 s 갭 − trailing_target_gap_m
+v         = v_lead + Kp·gap_error + Ki·∫ + Kd·d(gap_error)/dt
+v         = min(v, v_lead + √(2·a_brake·max(0, gap_error)))   ← 제동거리 상한
+v         = min(v_csv, max(0, v))
+```
+
+D 항이 중요하다(`Kd=0.25`). 앞차와의 상대속도가 곧 갭의 변화율이라, 거리보다
+"좁혀지는 속도"에 먼저 반응해야 붙지 않는다. `Ki` 는 windup 때문에 기본 0.
+
+제동거리 상한이 두 번째 핵심이다. P 항만 두면 갭이 넓을 때 CSV 전속을 명령하고,
+목표갭에 닿았을 땐 이미 그 거리 안에서 못 서는 속도가 돼 있다. 그러면 AEB 가
+대신 잡는데 AEB 는 역토크라 급정거 → 갭 벌어짐 → 다시 전속으로 버벅인다.
+접근 자체를 "목표갭에 맞춰 설 수 있는 속도" 로 제한해야 AEB 를 안 부른다.
+
+> 배율 하한(`trailing_min_speed_scale`)은 제거했다. 절대속도 기준으로 바뀌면서
+> 쓰이지 않게 됐고, 하한을 두면 갭이 무너졌을 때 필요한 만큼 못 늦춰서 오히려
+> AEB 를 부른다.
+
+갭은 유클리드 거리가 아니라 **s 차이**로 잰다. 코너에서 옆 차선 차가 유클리드로는
+가까워도 s 로는 나란히거나 뒤일 수 있다. `_delta_s()` 가 랩 랩어라운드까지 본다.
+
+pose 를 못 얻어 갭을 못 재는 프레임은 "앞차가 사라졌다"로 세지 않는다. 그렇게
+세면 TF 가 한 번 끊길 때마다 `TRAILING` 이 풀려 앞차 쪽으로 다시 가속한다.
+
+**AEB 와의 관계.** `TRAILING` 은 AEB 를 대체하지 않는다. `avoid_modes` 는
+`[AVOID, REJOIN]` 그대로라 `TRAILING` 중 AEB 는 **엄격 기준**으로 돈다 — CSV 를
+정상 추종 중이니 완화할 이유가 없다. `TRAILING` 이 제 몫을 하면 AEB 발동이
+줄어야 하고, 그건 로그로 본다.
+
+```
+[TRAILING] gap=1.15m target=1.50m v=2.73m/s ego=2.10m/s aeb_total=0
+```
+
+`aeb_total` 은 `/emergency_brake` 상승엣지 누적이다. 이 값이 계속 오르면
+`trailing_target_gap_m` 을 키우거나 `trailing_kp` 를 올려야 한다.
+
+### 5.6.3 AEB 로 멈춘 뒤 빠져나가기 — 탈출 모드
+
+AEB 쪽에는 이미 재발동을 막는 탈출 창이 있다([§4 탈출 창](#재발동-방지--탈출-창)).
+그런데 **재발동을 막는 것만으로는 나갈 수 없다.** 나갈 경로가 있어야 한다.
+
+문제는 정면이 막혀 멈춘 상황에서 플래너가 `TRAILING` 이나 `GLOBAL` 에 있다는
+것이었다. 둘 다 `/local_path` 를 발행하지 않으니 Stanley 는 CSV 를 그대로 탄다.
+정적 장애물이 CSV 위에 있으면 **CSV 를 따라간다는 건 장애물로 다시 들어간다는
+뜻**이다. 결과:
+
+```
+AEB 제동 → 해제(탈출 창) → CSV 로 0.6 m/s 기어감 → 다시 접근 → 창 만료 → AEB …
+```
+
+조향을 틀 경로가 없어서 제자리에서 장애물을 밀며 왕복한다. AEB 쪽 탈출 창이
+무의미해지는 것이다.
+
+그래서 **AEB 로 멈춘 뒤에는 `TRAILING` 대신 `AVOID` 를 강제해 FGM 경로를
+발행한다.** `_update_mode` 의 다른 모든 전이보다 먼저 판정한다.
+
+| 파라미터 | 기본 | 의미 |
+| --- | --- | --- |
+| `aeb_escape_enable` | `True` | 끄면 이전 거동(= 경로 없이 CSV) 으로 복귀 |
+| `aeb_escape_arm_speed_mps` | `0.20` | **이 속도 이하로 실제로 멈춘 뒤에만** 경로를 바꾼다 |
+| `aeb_escape_hold_sec` | `2.0` | AEB 해제 후 이만큼 더 유지 (빠져나가는 구간) |
+| `aeb_escape_speed_mps` | `0.8` | 탈출 중 속도 상한 |
+| `aeb_escape_min_path_m` | `0.25` | 탈출 중에만 완화하는 최소 경로 길이 |
+
+두 구간으로 나뉜다.
+
+1. **AEB 가 걸린 채 멈춰 있는 동안** — `control_node` 는 AEB 중에도 조향은
+   `/drive` 를 따르므로, 정지 상태에서 바퀴가 탈출 방향으로 미리 꺾인다.
+   FGM 목표점 스무딩(EMA)이 수렴할 시간도 여기서 번다.
+2. **AEB 해제 후 `aeb_escape_hold_sec`** — 그 방향으로 실제로 빠져나간다.
+
+`aeb_escape_arm_speed_mps` 조건이 안전상 중요하다. 아직 고속으로 제동 중일 때
+조향을 새 경로로 틀면 거동이 예측 밖으로 간다. **멈춘 뒤에만** 바꾼다.
+
+두 가지를 탈출 중에만 완화한다. 정면이 막힌 상황에서 평소 기준을 그대로 요구하면
+경로가 늘 기각돼 탈출이 성립하지 않기 때문이다.
+
+- 회피 필요 여부 게이트(`_static_wants_fgm_local_path` 등)를 건너뛴다.
+- 경로 최소 길이를 `path_check_min_length_m`(0.6 m) → `aeb_escape_min_path_m`(0.25 m).
+
+완화하지 않는 것: `_truncate_path_at_collision` 의 **충돌 검사 자체**는 그대로다.
+벽·장애물을 관통하는 경로는 탈출 중에도 발행되지 않는다. 그래서 정말 나갈 틈이
+없으면 경로가 안 나오고 차는 그 자리에 선다 — 장애물을 밀고 가는 것보다 낫다.
+
+속도는 `aeb_escape_speed_mps` 로 덮어쓴다(우선순위는 AEB 다음, 나머지보다 위).
+이게 없으면 장애물이 시야에서 빠지는 순간 CSV 전속으로 튀어 나간다.
+
+로그로 진입/종료를 한 번씩 찍는다.
+
+```
+AEB 탈출 모드 진입 — FGM 회피경로 강제 발행, 속도 ≤0.80m/s (aeb_total=3)
+AEB 탈출 모드 종료 — 정상 판정 복귀
+```
+
+### 5.6.4 회피 경로 모양 — `avoid_path_mode`
+
+| 값 | 방식 |
+|---|---|
+| `straight` (기본) | FGM 목표점까지 직선 + `avoid_forward_step_m × avoid_forward_num_points` 전방 직선 연장 |
+| `frenet` | 레이스라인을 기준선으로 `d(s)` quintic — 진입 → 유지(apex) → 복귀 |
+
+`frenet` 은 기준선의 곡률을 그대로 따라가므로 고속 코너에서 조향이 덜 급하고
+복귀가 매끄럽다. 구간 길이는 `avoid_frenet_enter_len_m` / `_hold_m` / `_exit_len_m`
+이고, `|d|` 는 `avoid_frenet_max_offset_m`(0.65 m) 로 클램프된다. 클램프된 경로가
+그래도 막히면 `_truncate_path_at_collision` 이 잘라내고, 그 결과 막힘 래치가 서서
+`TRAILING`(앞차 있음) 또는 `GLOBAL`(정적) 로 넘어간다.
+
+생성에 실패하면 조용히 `straight` 로 대체하고 경고를 남긴다. 검증 전까지 기본값은
+`straight` 다.
+
+### 5.6.5 Frenet 스냅샷 (`/planner/frenet_debug`)
+
+매 주기 자차와 필터 통과 장애물을 CSV 폐곡선에 투영해 `(s, d)` 로 들고 있는다.
+`TRAILING` 갭과 예측 s 가 이걸 쓴다. **기존 XY 기반 게이트(`avoid_on_m` 등)는
+그대로다** — 정보만 추가한 것이지 판정 로직을 바꾼 게 아니다.
+
+`publish_frenet_debug:=true` 로 켜면 `[s_ego, d_ego, s_obs1, d_obs1, ...]` 가
+`Float32MultiArray` 로 나온다. pose 가 없으면 앞 두 값이 `NaN`.
+
+`use_predicted_s:=true` 면 동적 장애물의 s 를 `pred_horizon_sec`(1.0 s) 만큼
+등속 전파한 값을 회피 진입 판정과 갭 계산에 쓴다. 앞차가 빠르게 멀어지는 중이면
+불필요한 감속을 줄여 준다. 전방/후방 판정은 **항상 현재 s** 로 한다 — 예측 s 로
+거르면 마주 오는 물체가 "이미 지나갔다"고 계산되어 갭 계산에서 사라진다.
+
+동적 장애물의 `vx, vy` 는 laser frame **상대속도**다. 절대 s 속도는
+`R(yaw)·v_laser + v_ego` 로 근사한다 (자차 요레이트 항은 1 초 예측이라 무시).
 
 ### 5.7 고속(7 m/s급)에서 회피가 되는가
 
@@ -824,6 +1085,87 @@ v = v_장애물 + sqrt(2 · a_brake · 남은거리)
 필요하다. 지금 4.0 / 3.0 은 보수적으로 잡은 값이라, 실제 그립이 더 나오면
 그만큼 천장이 올라간다. 검출 거리(12 m)를 더 늘리는 건 라이다·장애물 인식
 품질 문제라 그 다음 순서다.
+
+### 5.8 검출 품질 (클러스터링 / 트래킹)
+
+회피 판단의 입력이 전부 여기서 나온다. 경로가 아무리 좋아도 장애물이 안 보이거나
+반지름이 프레임마다 튀면 소용이 없다. 아래 다섯 개는 **전부 기본값이 기존 동작**
+이고, 플래그 하나만 되돌리면 원복된다.
+
+클러스터링은 `path_following/scan_cluster.py` 로 합쳤다. 예전에는
+`static_obstacle_node._cluster_xy` 와 `integrated_obstacle_node._cluster_indices` 에
+같은 알고리즘이 따로 있어서, 한쪽만 고치면 두 런치의 거동이 조용히 갈라졌다.
+
+| 플래그 | 기본 | 켜면 | 노드 |
+| --- | --- | --- | --- |
+| `cluster_mode` | `fixed` | `adaptive` — 끊는 임계를 거리에 비례 | static / integrated |
+| `adaptive_min_points` | `False` | 원거리에서 최소 점수를 낮춤 | static / integrated |
+| `consistent_centroid` | `False` | 추적은 centroid, 반지름은 분위수 | static / integrated |
+| `tracker_mode` | `ema` | `kf` — 등속 칼만 | integrated |
+| `wall_residual_guard` | `False` | 팽창 벽에 붙은 잔차에 높은 기준 | static / integrated |
+| `bubble_speed_scale_enable` | `False` | FGM 버블을 속도에 비례 | fgm |
+
+**적응형 임계(`cluster_mode: adaptive`).** 끊는 기준을
+`d_max(r) = r·sin(Δφ)/sin(λ−Δφ) + 3σ` 로 잡고 `[0.05, 0.35] m` 로 클램프한다.
+`λ`(기본 10°)는 "이보다 비스듬한 면은 같은 물체로 안 본다"는 허용 입사각이다.
+
+여기서 알아둘 것: 고정 `0.28 m` 는 사실상 **8 m 용으로 튜닝된 값**이다. λ=10°
+에서 두 곡선은 8 m 부근에서 만난다. 즉 적응형으로 바꾸면 원거리가 아니라
+**근거리가 크게 엄격해진다** (2 m 에서 0.115 m). 가까운 물체를 잘 분리하는 게
+이득이지만, 반대로 **가까운 상대차 하나가 2~3 조각으로 쪼개질 위험**이 있다.
+조각 각각이 `min_obstacle_size_m`(0.14) 미만이면 전부 버려져서 **장애물이 통째로
+사라진다.** 실차에서 이 모드를 켤 때는 상대차를 2 m 앞에 세워두고
+`/static_obstacles` 개수가 1 로 유지되는지부터 봐야 한다. 쪼개지면
+`abd_lambda_deg` 를 15~20° 로 올린다 (임계가 커진다).
+
+**거리 스케일 최소 점수(`adaptive_min_points`).** 10 m 앞 0.3 m 물체는
+각분해능상 7점밖에 안 찍혀서 고정 10점 기준에 걸려 통째로 사라진다.
+`min_arc_m / (r·Δφ)` 로 기대 점수를 계산해 `min_cluster_points_floor`(3)까지
+낮춘다. **`wall_residual_guard` 와 같이 켜는 걸 권한다** — 안 그러면 노이즈
+3점이 장애물이 된다.
+
+**대표점 일관화(`consistent_centroid`).** 지금은 `laser_x/y` = 최근접점,
+`map_x/y` = 평균이라 정의가 다르다. 그 불일치가 유한차분 속도에 그대로 노이즈로
+들어간다. 켜면 **추적·속도는 centroid, 발행·거리 게이트는 최근접점**으로 갈라
+쓴다. 토픽 레이아웃(`[id,x,y,r]` / `[id,x,y,vx,vy,r]`)과 프레임은 그대로라
+소비자(AEB·FGM·플래너)는 아무것도 모른다. 반지름도 bbox `span/2` 대신 중심에서의
+점 거리 `radius_percentile`(90) 분위수를 써서 이상점 몇 개에 덜 끌린다.
+
+**등속 칼만 트래커(`tracker_mode: kf`).** `x = [px, py, vx, vy]`, 관측은 위치만.
+map / laser 프레임에 각각 하나씩 돌린다 — laser 쪽이 상대운동이라 `closing_mps`
+가 거기서 바로 나온다 (부호 규약 `-(p·v)/|p|` 는 그대로). 미검출 프레임에도
+`predict` 를 돌려 트랙이 얼어붙지 않게 한다.
+
+단위 테스트에서 확인된 차이 (`test_obstacle_tracking.py`):
+
+- 3 프레임(0.075 s) 가림 후 재검출에서 **EMA 속도는 참값의 1.5배 이상 튄다.**
+  얼어 있던 위치 때문에 4 프레임치 변위가 한 `dt` 에 몰려서다. KF 는 1.2배 미만.
+- **`track_keep_time_s`(0.12) 는 40 Hz 에서 5 프레임뿐이다.** 그보다 긴 가림이면
+  트랙이 삭제되고 새 ID 로 태어나면서 `age_s` 가 리셋되고, `dynamic_confirm_time_s`
+  를 다시 세는 동안 **달려오는 차가 static 으로 분류된다.**
+
+유지 시간은 `tracker_mode` 에 묶여 있다. `ema` 는 `track_keep_time_s`(0.12),
+`kf` 는 `track_keep_time_s_kf`(0.25) 를 쓴다. `ema` 에서 늘리면 **얼어붙은 위치가
+그대로 오래 남아 오히려 나빠지므로** 같이 올리면 안 된다. `kf` 는 미검출 중에도
+`predict` 로 위치를 밀어 주니 늘려도 말이 된다. 묶어 둔 덕에 `tracker_mode` 하나만
+되돌리면 유지 시간도 같이 원복된다. 노드 시작 로그에 `tracker=kf keep=0.25s` 로
+실제 적용값이 찍힌다.
+
+**벽 잔차 가드(`wall_residual_guard`).** 측위가 흔들리면 벽이 `is_wall()` 팽창
+밴드를 벗어나 "장애물"로 샌다. 켜면 팽창 경계에서 `wall_clearance_m`(0.12) 안쪽에
+있는 클러스터에는 `near_wall_min_points`(14) + `near_wall_min_span_m`(0.20) 를
+추가로 요구한다. 경계 거리는 `StaticMap` 에 distance transform 격자를 **첫 호출에
+한 번만** 만들어 조회한다 (끄면 비용 0).
+
+**FGM 버블 속도 연동(`bubble_speed_scale_enable`).** 고정 0.2 m 는 고속에서 너무
+작고 저속에서 과하다. `clip(0.18 + 0.035·v, 0.18, 0.40)`. `_select_gap()` 의
+히스테리시스와 corridor_check 는 건드리지 않았다.
+
+검증은 ROS 없이 돈다:
+
+```bash
+python3 -m pytest src/path_following/test/ -q     # 27 passed
+```
 
 ---
 
@@ -962,7 +1304,7 @@ source install/setup.bash
 
 | 섹션 | 내용 |
 |------|------|
-| 모드 | CH5 수동/자율, planner GLOBAL/AVOID/REJOIN, Stanley CSV/LOCAL |
+| 모드 | CH5 수동/자율, planner GLOBAL/AVOID/REJOIN/TRAILING, Stanley CSV/LOCAL |
 | 속도 | `/drive` 명령, `/odom` 또는 TF 추정, VESC duty |
 | 조향 | `/drive` rad/deg, ESP `S:` 전송값 |
 | LiDAR | `/scan` Hz, 전방 최소거리, `/static_obstacles` 개수·최근접 |
@@ -971,7 +1313,7 @@ source install/setup.bash
 **필요 토픽**
 
 - `/vehicle/telemetry` ← `control_node` (duty, RC, AUTO/MANUAL)
-- `/planner/mode` ← `local_planner_node` (GLOBAL/AVOID/REJOIN)
+- `/planner/mode` ← `local_planner_node` (GLOBAL/AVOID/REJOIN/TRAILING)
 - `/drive`, `/scan`, `/static_obstacles`, `/fgm_target`, `/planner_path_override_active`
 
 코드 수정 후: `colcon build --packages-select path_following`

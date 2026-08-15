@@ -58,6 +58,14 @@ CFG = {
     "scan_max_range_m": 10.0,
     # [장애물 버블] 장애 반경 위에 더하는 여유 (갭이 장애에서 얼마나 떨어질지).
     "bubble_radius_m": 0.2,
+    # [A6] 고정 0.2 m 는 고속에서 너무 작고 저속에선 과하다. 켜면 속도에 비례해
+    # 버블을 키운다 — /vehicle/speed_mps 는 이미 구독 중이라 추가 구독은 없다.
+    # bubble = clip(base + gain*v, min, max)
+    "bubble_speed_scale_enable": False,
+    "bubble_base_m": 0.18,
+    "bubble_speed_gain_s": 0.035,
+    "bubble_min_m": 0.18,
+    "bubble_max_m": 0.40,
     # [차량 버블] 뒷축 기준 발자국 — 전방 길이 / 좌우 폭(전체).
     # 폭은 FGM 섹터 반폭에 half_width로 들어가고, 전방은 planner 게이트(d−front)와 공유.
     "ego_front_safety_m": 0.30,
@@ -166,6 +174,17 @@ class FGMNode(Node):
 
         self.preprocess_dist = float(self.get_parameter("scan_max_range_m").value)
         self.bubble_radius = float(self.get_parameter("bubble_radius_m").value)
+        self.bubble_speed_scale = _param_bool(
+            self.get_parameter("bubble_speed_scale_enable").value
+        )
+        self.bubble_base_m = float(self.get_parameter("bubble_base_m").value)
+        self.bubble_speed_gain_s = float(
+            self.get_parameter("bubble_speed_gain_s").value
+        )
+        self.bubble_min_m = float(self.get_parameter("bubble_min_m").value)
+        self.bubble_max_m = max(
+            self.bubble_min_m, float(self.get_parameter("bubble_max_m").value)
+        )
         self.ego_front_safety_m = max(
             0.0, float(self.get_parameter("ego_front_safety_m").value)
         )
@@ -237,12 +256,18 @@ class FGMNode(Node):
         # 초기 enable 상태에 맞춰 CPU 우선순위 플래그 동기화
         self._set_cpu_boost(self._fgm_enabled)
 
+        _bubble_desc = (
+            f"{self.bubble_base_m}+{self.bubble_speed_gain_s}·v"
+            f"∈[{self.bubble_min_m},{self.bubble_max_m}]m"
+            if self.bubble_speed_scale
+            else f"{self.bubble_radius}m"
+        )
         self.get_logger().info(
             f"FGM started (sim algorithm) | frame={self._laser_frame}, "
             f"target=v*{self.target_lead_time_s}s "
             f"[{self.target_min_m}~{self.target_max_m}]m, "
             f"scan_max={self.preprocess_dist}m, "
-            f"obs_bubble={self.bubble_radius}m "
+            f"obs_bubble={_bubble_desc} "
             f"ego={self.ego_front_safety_m:.2f}m×{self.ego_safety_width_m:.2f}m, "
             f"edge_inset={math.degrees(self.gap_edge_inset_rad):.0f}°, "
             f"planner_enable={self.require_planner_enable}({fgm_en_t}), "
@@ -269,6 +294,13 @@ class FGMNode(Node):
 
     def speed_callback(self, msg: Float64) -> None:
         self._ego_speed = abs(float(msg.data))
+
+    def _bubble_now(self) -> float:
+        """[A6] 현재 속도에서의 장애물 버블 반경 [m]."""
+        if not self.bubble_speed_scale:
+            return self.bubble_radius
+        b = self.bubble_base_m + self.bubble_speed_gain_s * self._ego_speed
+        return min(self.bubble_max_m, max(self.bubble_min_m, b))
 
     def fgm_enable_callback(self, msg: Bool) -> None:
         was = self._fgm_enabled
@@ -710,7 +742,7 @@ class FGMNode(Node):
         # 장애 반경 + [장애물 버블] + [차량 버블 반폭(폭/2)]
         # 전방 길이는 planner ego_front_safety 로 타이밍 보정 (여기선 폭만).
         half_width = (
-            obstacle_radius + self.bubble_radius + self.ego_half_width_m
+            obstacle_radius + self._bubble_now() + self.ego_half_width_m
         )
         if dist <= half_width:
             half_angle = math.pi / 2.0

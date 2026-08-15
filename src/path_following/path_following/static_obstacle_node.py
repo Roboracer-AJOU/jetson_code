@@ -20,6 +20,7 @@ from std_msgs.msg import Float32MultiArray
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
+from path_following.scan_cluster import ClusterParams, cluster_scan_xy
 from path_following.track_sliding import param_bool
 
 
@@ -62,6 +63,23 @@ CFG = {
     "tf_timeout_sec": 0.10,
     "cluster_gap_threshold_m": 0.28,
     "min_cluster_points": 10,
+    # ---- [A1]~[A3], [A5] : integrated_obstacle_node 와 같은 의미/기본값 ----
+    # 두 노드가 같은 공용 클러스터러(scan_cluster.py)를 쓰므로 파라미터도 맞춘다.
+    "cluster_mode": "fixed",       # "fixed" | "adaptive"
+    "abd_lambda_deg": 10.0,
+    "abd_sigma_r_m": 0.02,
+    "abd_min_gap_m": 0.05,
+    "abd_max_gap_m": 0.35,
+    "adaptive_min_points": False,
+    "min_cluster_points_floor": 3,
+    "min_arc_m": 0.07,
+    "consistent_centroid": False,
+    "radius_percentile": 90.0,
+    "radius_min_m": 0.05,
+    "wall_residual_guard": False,
+    "wall_clearance_m": 0.12,
+    "near_wall_min_points": 14,
+    "near_wall_min_span_m": 0.20,
     "max_obstacle_size_m": 0.85,
     "min_obstacle_size_m": 0.14,
     "max_obstacle_range_m": 11.0,
@@ -116,6 +134,7 @@ class StaticMap:
         self.yaml_path = str(path)
         self.wall_match_radius_m = wall_match_radius_m
         self.dilate_cells = r_cells
+        self._wall_dist: np.ndarray | None = None
 
     @staticmethod
     def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
@@ -141,6 +160,33 @@ class StaticMap:
             (self.origin_y + self.height * self.resolution - y) / self.resolution
         ).astype(np.int64)
         return row, col
+
+    def wall_distance(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """팽창 벽 경계까지의 거리 [m]. 벽 안쪽이면 0, 맵 밖이면 0.
+
+        [A5] 용. 매 스캔 반경 검사 대신 distance transform 격자를 한 번 만들어
+        조회한다 (avoidance_safety.InflatedMap 과 같은 방식). 첫 호출에서만
+        계산하고 이후엔 조회만 한다 — 켜지 않으면 비용이 0 이다.
+        """
+        if self._wall_dist is None:
+            try:
+                from scipy.ndimage import distance_transform_edt
+
+                self._wall_dist = (
+                    distance_transform_edt(~self.wall).astype(np.float32)
+                    * self.resolution
+                )
+            except Exception:
+                # scipy 가 없으면 가드를 무력화한다 (전부 "경계에서 멀다").
+                self._wall_dist = np.full(self.wall.shape, 1e3, dtype=np.float32)
+
+        row, col = self.world_to_cell(x, y)
+        inside = (
+            (row >= 0) & (row < self.height) & (col >= 0) & (col < self.width)
+        )
+        out = np.zeros(np.shape(x), dtype=np.float32)
+        out[inside] = self._wall_dist[row[inside], col[inside]]
+        return out
 
     def is_wall(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
         row, col = self.world_to_cell(x, y)
@@ -194,6 +240,28 @@ class StaticObstacleNode(Node):
         self._publish_markers = param_bool(self.get_parameter("publish_markers").value)
         self._last_detect_log_ns = 0
         self._last_tf_warn_ns = 0
+
+        gp = self.get_parameter
+        self._cluster_params = ClusterParams(
+            mode=str(gp("cluster_mode").value).strip().lower(),
+            gap_threshold_m=self.cluster_gap_threshold_m,
+            lambda_deg=float(gp("abd_lambda_deg").value),
+            sigma_r_m=float(gp("abd_sigma_r_m").value),
+            min_gap_m=float(gp("abd_min_gap_m").value),
+            max_gap_m=float(gp("abd_max_gap_m").value),
+            min_points=self.min_cluster_points,
+            adaptive_min_points=param_bool(gp("adaptive_min_points").value),
+            min_points_floor=max(3, int(gp("min_cluster_points_floor").value)),
+            min_arc_m=max(0.01, float(gp("min_arc_m").value)),
+        )
+        self._consistent_centroid = param_bool(gp("consistent_centroid").value)
+        self._radius_percentile = min(100.0, max(1.0, float(gp("radius_percentile").value)))
+        self._radius_min_m = max(0.01, float(gp("radius_min_m").value))
+        self._wall_guard = param_bool(gp("wall_residual_guard").value)
+        self._wall_clearance_m = max(0.0, float(gp("wall_clearance_m").value))
+        self._near_wall_min_points = max(1, int(gp("near_wall_min_points").value))
+        self._near_wall_min_span_m = max(0.0, float(gp("near_wall_min_span_m").value))
+
         # [(x, y, r, age_s, missed_s), ...]
         self._persist: list[list[float]] = []
         self._last_scan_ns: int | None = None
@@ -269,23 +337,18 @@ class StaticObstacleNode(Node):
         my = s * lx + c * ly + ty
         return mx, my
 
-    def _cluster_xy(self, px: np.ndarray, py: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
-        n = int(px.size)
-        if n == 0:
-            return []
-        order = np.argsort(np.arctan2(py, px))
-        px = px[order]
-        py = py[order]
-        clusters: list[tuple[np.ndarray, np.ndarray]] = []
-        start = 0
-        for i in range(1, n):
-            if math.hypot(px[i] - px[i - 1], py[i] - py[i - 1]) > self.cluster_gap_threshold_m:
-                if i - start >= self.min_cluster_points:
-                    clusters.append((px[start:i].copy(), py[start:i].copy()))
-                start = i
-        if n - start >= self.min_cluster_points:
-            clusters.append((px[start:].copy(), py[start:].copy()))
-        return clusters
+    def _cluster_xy(self, px: np.ndarray, py: np.ndarray, angle_inc: float):
+        """[A1] integrated_obstacle_node 와 같은 공용 클러스터러를 쓴다."""
+        return cluster_scan_xy(
+            px,
+            py,
+            angle_increment=angle_inc,
+            params=self._cluster_params,
+            radius_percentile=self._radius_percentile,
+            radius_min_m=self._radius_min_m,
+            radius_max_m=self.max_obstacle_size_m / 2.0,
+            consistent_centroid=self._consistent_centroid,
+        )
 
     def listener_callback(self, msg: LaserScan) -> None:
         scan_ns = self.get_clock().now().nanoseconds
@@ -341,7 +404,23 @@ class StaticObstacleNode(Node):
 
         ox = lx[obs_mask]
         oy = ly[obs_mask]
-        clusters = self._cluster_xy(ox, oy)
+        clusters = self._cluster_xy(ox, oy, angle_inc)
+        if self._wall_guard and clusters:
+            cmx, cmy = self._transform_xy(
+                tf,
+                np.array([c.center_x for c in clusters], dtype=np.float64),
+                np.array([c.center_y for c in clusters], dtype=np.float64),
+            )
+            wdist = self.static_map.wall_distance(cmx, cmy)
+            clusters = [
+                c
+                for c, wd in zip(clusters, wdist)
+                if wd >= self._wall_clearance_m
+                or (
+                    c.n_points >= self._near_wall_min_points
+                    and c.span_m >= self._near_wall_min_span_m
+                )
+            ]
         if not clusters:
             # 검출 없음 — missed만 증가시키도록 빈 raw로 persistence 갱신
             for p in self._persist:
@@ -409,26 +488,17 @@ class StaticObstacleNode(Node):
         nearest_logic = None
         raw_dets: list[tuple[float, float, float]] = []
 
-        for cidx, (px_arr, py_arr) in enumerate(clusters):
-            d2 = px_arr * px_arr + py_arr * py_arr
-            kmin = int(np.argmin(d2))
-            logic_x = float(px_arr[kmin])
-            logic_y = float(py_arr[kmin])
-
-            min_x, max_x = float(np.min(px_arr)), float(np.max(px_arr))
-            min_y, max_y = float(np.min(py_arr)), float(np.max(py_arr))
-            size_x = max_x - min_x
-            size_y = max_y - min_y
-            if size_x > self.max_obstacle_size_m or size_y > self.max_obstacle_size_m:
+        for cl in clusters:
+            # 거리 게이트는 최근접점 유지 (AEB/FGM 등 소비자 거동 보존)
+            logic_x, logic_y = cl.near_x, cl.near_y
+            if cl.span_m > self.max_obstacle_size_m:
                 continue
-            span_m = max(size_x, size_y)
-            if span_m < self.min_obstacle_size_m:
+            if cl.span_m < self.min_obstacle_size_m:
                 continue
             if abs(logic_y) > self.max_obstacle_lateral_m:
                 continue
 
-            radius = span_m / 2.0
-            raw_dets.append((logic_x, logic_y, radius))
+            raw_dets.append((logic_x, logic_y, cl.radius))
 
         # 연속 히트 persistence — 단발 노이즈 깜빡임 억제
         for p in self._persist:

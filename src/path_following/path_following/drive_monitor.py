@@ -377,6 +377,7 @@ class DriveMonitor(Node):
             "GLOBAL": "CSV 직진 (GLOBAL)",
             "AVOID": "회피 (AVOID)",
             "REJOIN": "CSV 복귀 (REJOIN)",
+            "TRAILING": "갭 유지 추종 (TRAILING)",
         }.get(m, m)
 
     def _control_mode_ko(self) -> str:

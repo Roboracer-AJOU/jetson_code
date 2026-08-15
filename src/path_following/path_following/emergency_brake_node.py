@@ -58,10 +58,32 @@ CFG = {
     # TTC 판정이 꺼져서 조금씩 전진하다 결국 장애물을 들이받는다.
     "arm_speed_mps": 0.4,
     # 코리도 안 장애물과 최소 이격 [m]. 속도 무관. 기어가듯 다가가는 걸 막는다.
-    # 정지 후에도 이 거리를 유지하므로, 치워지지 않는 장애물은 여기서 멈춰 선다.
-    # (돌아가는 건 회피 계층의 일이지 AEB 의 일이 아니다)
     "min_standoff_m": 0.30,
     "standoff_release_m": 0.40,   # 이만큼 멀어져야 해제 (히스테리시스)
+    # ---- 데드락 탈출구 ----
+    # 여유 안쪽에 서 버렸을 때의 탈출구.
+    # 정지 상태가 이만큼 이어지면 해제한다. 선 차는 아무것도 못 받으므로
+    # 제동을 붙들고 있을 안전상 이유가 없고, 다시 다가가면 standoff 가
+    # 재트리거한다. 이게 없으면 위 계산이 빗나간 순간 영구 정지가 된다.
+    "stuck_release_sec": 1.5,
+    "stuck_speed_mps": 0.05,
+    # ---- 탈출 창 (재발동 방지) ----
+    # stuck 으로 풀어 줘도 차가 아직 그 자리면 다음 틱에 standoff 가 다시 물어서
+    # "1.9초 제동 → 0.02초 해제 → 재제동" 루프가 된다. 제동이 풀린 시간이
+    # 20 ms 뿐이라 차는 영원히 못 빠져나온다.
+    #
+    # 그래서 stuck 으로 풀린 직후에는 일정 시간/거리 동안 재발동을 막는다.
+    # 그동안 FGM+플래너가 탈출 경로를 찾아 실제로 빠져나가야 한다.
+    # 무한정 막지 않도록 네 가지로 창을 닫는다:
+    #   (1) escape_min_travel_m 만큼 실제로 이동   (2) escape_max_sec 경과
+    #   (3) escape_speed_end_mps 이상으로 가속     (4) 아래 hard_stop 침범
+    # (4) 는 창 안에서도 살아 있는 절대 방어선이다 — 이것까지 없으면
+    # 탈출한답시고 벽으로 그대로 들어간다.
+    "escape_enable": True,
+    "escape_min_travel_m": 0.35,
+    "escape_max_sec": 3.0,
+    "escape_speed_end_mps": 1.0,
+    "escape_hard_stop_m": 0.12,
     # 노이즈 빔 하나로 급정거하지 않도록, 조건을 만족하는 빔이 이 개수 이상일 때만
     "min_hit_beams": 3,
     # ---- 주행 코리도 (오작동의 대부분이 여기서 갈린다) ----
@@ -138,6 +160,19 @@ class EmergencyBrakeNode(Node):
         self.drive_stale_ns = int(float(g("drive_stale_sec").value) * 1e9)
         self.min_hold_sec = max(0.0, float(g("min_hold_sec").value))
         self.release_factor = max(1.0, float(g("release_ttc_factor").value))
+        self.stuck_release_sec = max(0.0, float(g("stuck_release_sec").value))
+        self.stuck_speed = max(0.0, float(g("stuck_speed_mps").value))
+        self._stopped_since = 0.0
+
+        self.escape_enable = bool(g("escape_enable").value)
+        self.escape_min_travel = max(0.0, float(g("escape_min_travel_m").value))
+        self.escape_max_sec = max(0.0, float(g("escape_max_sec").value))
+        self.escape_speed_end = max(0.0, float(g("escape_speed_end_mps").value))
+        self.escape_hard_stop = max(0.0, float(g("escape_hard_stop_m").value))
+        self._escape_until = 0.0     # 0 = 창 닫힘
+        self._escape_travel = 0.0
+        self._escape_count = 0
+        self._last_tick = 0.0
 
         self._speed = 0.0
         self._steering = 0.0
@@ -429,6 +464,48 @@ class EmergencyBrakeNode(Node):
             t.transform.translation.y,
         )
 
+    def _open_escape_window(self, now: float) -> None:
+        """stuck 해제 직후 재발동 억제 구간 시작."""
+        if not self.escape_enable or self.escape_max_sec <= 0.0:
+            return
+        self._escape_until = now + self.escape_max_sec
+        self._escape_travel = 0.0
+        self._escape_count += 1
+        self.get_logger().warn(
+            f"AEB 탈출 창 시작 #{self._escape_count} — "
+            f"{self.escape_max_sec:.1f}s / {self.escape_min_travel:.2f}m 안에 "
+            f"빠져나가야 한다 (hard_stop {self.escape_hard_stop:.2f}m 는 계속 살아 있음)"
+        )
+
+    def _update_escape_window(self, now: float, dt: float, closest: float) -> bool:
+        """탈출 창 갱신. True 면 이번 틱은 재발동을 억제한다.
+
+        이동거리는 속도 적분으로 잰다. TF 가 끊겨도 동작해야 하고, 여기서
+        알고 싶은 건 "그 자리에 그대로인가" 라서 경로長이면 충분하다.
+        """
+        if self._escape_until <= 0.0:
+            return False
+
+        self._escape_travel += self._speed * dt
+
+        reason = ""
+        if closest < self.escape_hard_stop:
+            reason = f"hard_stop 침범 ({closest:.2f}m)"
+        elif self._escape_travel >= self.escape_min_travel > 0.0:
+            reason = f"탈출 성공 ({self._escape_travel:.2f}m 이동)"
+        elif self._speed >= self.escape_speed_end > 0.0:
+            reason = f"정상 주행 복귀 ({self._speed:.2f}m/s)"
+        elif now >= self._escape_until:
+            reason = "시간 초과 — 못 빠져나감"
+
+        if not reason:
+            return True
+
+        self._escape_until = 0.0
+        self._escape_travel = 0.0
+        self.get_logger().info(f"AEB 탈출 창 종료 — {reason}")
+        return False
+
     def _timer_cb(self) -> None:
         ttc_thr, standoff, relaxed = self._thresholds()
         ttc, hits, closest = self._evaluate(ttc_thr)
@@ -438,10 +515,19 @@ class EmergencyBrakeNode(Node):
         ttc_hit = hits >= self.min_hit_beams
         too_close = closest < standoff
 
+        dt = now - self._last_tick if self._last_tick > 0.0 else 0.0
+        if not (0.0 < dt < 0.5):
+            dt = 0.0
+        self._last_tick = now
+        escaping = self._update_escape_window(now, dt, closest)
+
         if not self._active:
-            if ttc_hit or too_close:
+            # 탈출 창 안에서는 재발동을 막는다. 단 hard_stop 안쪽은 예외 —
+            # 그건 탈출이 아니라 그냥 박기 직전이다.
+            if (ttc_hit or too_close) and not escaping:
                 self._active = True
                 self._trigger_time = now
+                self._stopped_since = 0.0
                 cause = "TTC" if ttc_hit else "STANDOFF"
                 mode = f" mode={self._mode}(완화)" if relaxed else ""
                 self.get_logger().warn(
@@ -455,10 +541,33 @@ class EmergencyBrakeNode(Node):
                 ttc >= ttc_thr * self.release_factor
                 and closest >= standoff + self.standoff_gap
             )
-            if held and clear:
+            # 정지 지속 시간. 여유 안쪽에 서 버려 clear 가 영영 안 서는 경우의
+            # 탈출구다 — 선 차는 제동을 붙들 이유가 없고, 다시 다가가면
+            # standoff 가 재트리거한다.
+            if self._speed <= self.stuck_speed:
+                if self._stopped_since <= 0.0:
+                    self._stopped_since = now
+            else:
+                self._stopped_since = 0.0
+            stuck = (
+                self.stuck_release_sec > 0.0
+                and self._stopped_since > 0.0
+                and now - self._stopped_since >= self.stuck_release_sec
+            )
+
+            if held and (clear or stuck):
                 self._active = False
-                self.get_logger().info(
-                    f"emergency brake released — ttc={ttc:.2f}s "
+                self._stopped_since = 0.0
+                if stuck and not clear:
+                    self._open_escape_window(now)
+                why = "clear" if clear else "stuck-escape"
+                log = (
+                    self.get_logger().info
+                    if clear
+                    else self.get_logger().warn
+                )
+                log(
+                    f"emergency brake released [{why}] — ttc={ttc:.2f}s "
                     f"closest={closest:.2f}m v={self._speed:.2f}m/s"
                 )
 

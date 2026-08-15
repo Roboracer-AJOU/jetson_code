@@ -129,17 +129,20 @@ CFG = {
     "exit_csv_clear_radius_m": 0.45,
     "avoid_forward_step_m": 0.15,
     "avoid_forward_num_points": 30,
-    "rejoin_enable": False,
+    # 회피 후 레이스라인 복귀를 Frenet quintic 으로. 이전 기본값 False.
+    "rejoin_enable": True,
     "rejoin_min_length_m": 0.50,
+    # 재합류 길이는 속도 연동: clip(rejoin_time_sec * v_ego, min, max).
+    # 예전엔 항상 min(0.50m) 이라 3m/s 에서 0.17초 만에 붙으라는 소리였다.
     "rejoin_time_sec": 0.8,
-    "rejoin_max_length_m": 0.70,
+    "rejoin_max_length_m": 2.50,  # 이전 기본값 0.70
     "rejoin_sample_count": 30,
     "rejoin_tail_count": 40,
     "rejoin_finish_lateral_m": 0.20,
     "rejoin_finish_require_heading": False,
     "rejoin_finish_heading_deg": 15.0,
     "avoid_skip_rejoin_if_cte_ok": False,
-    "rejoin_speed_scale": 0.5,
+    "rejoin_speed_scale": 0.7,  # 이전 기본값 0.5 (avoid_speed_enable=False 일 때만 쓰임)
     # ---- 회피 경로 충돌검사 ----
     # 회피 경로는 FGM 목표점 너머로 avoid_forward_num_points 만큼 직선 연장된다.
     # 그 구간은 아무도 검사한 적이 없어서 코너에서는 그대로 벽을 향한다.
@@ -150,6 +153,13 @@ CFG = {
     "path_check_obstacle_margin_m": 0.10,
     "path_check_backoff_m": 0.20,     # 충돌 지점에서 이만큼 더 물러나 끝냄
     "path_check_min_length_m": 0.6,   # 잘라낸 경로가 이보다 짧으면 회피를 포기
+    # 회피 경로가 막혔을 때 AVOID 를 재시도할 주기 [s].
+    # 예전엔 "막혔음" 이 한 프레임짜리 bool 이라, AVOID→TRAILING 전이에서
+    # 바로 리셋돼 다음 프레임에 TRAILING→AVOID 로 튕겨 나갔다. 2 프레임 주기로
+    # 왕복(≈20 Hz)하면서 AEB 완화 기준까지 같이 깜빡였다 — AVOID 프레임은
+    # 완화, TRAILING 프레임은 엄격. 시간 래치로 바꿔 이 주기만큼 붙들어 둔다.
+    # 대가는 "틈이 생겼는데 최대 이 시간만큼 늦게 AVOID 복귀" 뿐이다.
+    "avoid_retry_sec": 0.5,
     # ---- 회피 구간 속도 ----
     # 회피 중엔 CSV 속도가 의미 없다 (레이싱라인 곡률 기준으로 뽑은 값이라).
     # 아래 물리값으로 매 주기 목표속도를 구해 CSV 대비 배율로 내보낸다.
@@ -162,6 +172,69 @@ CFG = {
     "avoid_lateral_margin_m": 0.10,
     "avoid_speed_min_mps": 0.6,   # 이 아래로는 안 줄인다 (기어가지 않게)
     "avoid_speed_ref_mps": 2.0,   # CSV 에 속도 열이 없을 때 쓸 기준속도
+    # ---- AVOID 경로 생성 방식 ----
+    # "straight" = FGM 목표점까지 직선 + 전방 직선 연장 (기존, 검증된 쪽)
+    # "frenet"   = 레이스라인을 기준선으로 d(s) quintic → 진입/유지/복귀
+    # frenet 쪽이 고속에서 조향이 덜 급하고 복귀가 매끄럽지만, 기준선에서
+    # 멀리 떨어진 상태에서는 straight 가 더 직관적이다. 실차 검증 후 전환.
+    "avoid_path_mode": "straight",
+    "avoid_frenet_step_m": 0.10,
+    "avoid_frenet_hold_m": 0.60,       # apex 통과용 오프셋 유지 구간
+    "avoid_frenet_enter_len_m": 1.2,   # 목표 오프셋까지 붙는 데 쓸 s 길이
+    "avoid_frenet_exit_len_m": 1.5,    # d → 0 복귀에 쓸 s 길이
+    "avoid_frenet_max_offset_m": 0.65,  # |d| 상한. 넘으면 클램프 → 막히면 TRAILING
+    # ---- TRAILING (못 지나갈 때 갭 두고 따라가기) ----
+    # 앞차를 옆으로 못 지나가는 상황에서 예전에는 AVOID 를 계속 시도하다
+    # AEB 로 급정거했다. TRAILING 은 CSV 를 그대로 타면서 속도만 줄여
+    # 일정 갭을 유지한다. 경로는 발행하지 않는다(override=False).
+    "trailing_enable": True,
+    "trailing_enter_m": 3.0,       # 전방 s 갭이 이 안이면 진입 (회피 불가일 때)
+    "trailing_exit_m": 4.5,        # 이 밖으로 벗어나야 해제 (히스테리시스)
+    "trailing_exit_count_th": 5,
+    "trailing_target_gap_m": 1.5,  # 유지할 갭
+    # 트랙 진행방향 절대속도가 이 값 이상이어야 "따라갈 앞차" 로 본다.
+    # 미만이면(정지·역주행) 정적 장애물처럼 AVOID 로 넘긴다 — 서 있는 차
+    # 뒤에 붙으면 갭만 지키며 영원히 안 움직인다.
+    "trailing_min_leader_speed_mps": 0.5,
+    # 앞차가 우리보다 이만큼 느리면 따라가지 않고 AVOID 로 비켜 간다.
+    # 절대속도만 보면 1 m/s 로 기어가는 차 뒤에 붙어 같이 1 m/s 로 간다.
+    # 레이싱이므로 기본 ON. 대신 임계를 넉넉히 잡는다 — 움직이는 차 옆을
+    # 지나는 건 콘을 지나는 것과 달라서, 반응형 회피는 상대의 라인 변경을
+    # 예측하지 못한다. 비슷한 속도면 붙어 가고, 확실히 느릴 때만 비켜 간다.
+    "trailing_speed_deficit_enable": True,
+    "trailing_max_speed_deficit_mps": 0.5,
+    # 앞차 판정 히스테리시스 (40Hz 기준 프레임 수). 추적기의 static/dynamic
+    # 플리커가 모드 떨림으로 새어 나오는 걸 막는다. → _update_leader_latch
+    "leader_enter_count_th": 3,
+    "leader_lost_count_th": 8,
+    "trailing_kp": 0.45,
+    "trailing_ki": 0.0,            # windup 위험 — 기본 0
+    "trailing_kd": 0.25,
+    # trailing_min_speed_scale 은 제거했다. 갭 제어가 "CSV 속도 × 배율" 에서
+    # "앞차 속도 기준 절대속도" 로 바뀌면서 쓰이지 않게 됐고, 하한을 두면
+    # 갭이 무너졌을 때 필요한 만큼 못 늦춰서 오히려 AEB 를 부른다.
+    # TRAILING 이 제 몫을 하면 AEB 발동이 줄어야 한다. 그걸 눈으로 보려고
+    # AEB 상승엣지를 세서 같이 찍는다 (AEB 노드는 건드리지 않는다).
+    "trailing_log_hz": 1.0,
+    "emergency_brake_topic": "/emergency_brake",
+    # ---- AEB 탈출 (정지 후 회피경로 찾아 빠져나가기) ----
+    # AEB 는 최종 안전망이라 "멈추는" 것까지만 한다. 그 뒤 빠져나가는 건
+    # 플래너 몫인데, TRAILING 은 /local_path 를 안 내고 CSV 를 그대로 타므로
+    # 장애물 정면에 멈춘 경우 조향할 경로가 없다. 결과는 0.6 m/s 로 기어가
+    # 다시 AEB → 해제 → 또 기어감의 반복이고, 조금씩 장애물에 닿는다.
+    #
+    # 그래서 AEB 로 멈춘 뒤에는 TRAILING 대신 FGM 회피 경로를 강제로 발행한다.
+    # 정지 중에 조향을 미리 돌려 두고, AEB 노드의 탈출 창이 열리면 그 방향으로
+    # 빠져나간다.
+    "aeb_escape_enable": True,
+    # 이 속도 이하로 실제로 멈춘 뒤에만 경로를 바꾼다. 제동 중 고속에서
+    # 조향을 새 경로로 틀면 거동이 예측 밖으로 간다.
+    "aeb_escape_arm_speed_mps": 0.20,
+    "aeb_escape_hold_sec": 2.0,      # AEB 해제 후 이만큼 더 탈출 모드 유지
+    "aeb_escape_speed_mps": 0.8,     # 탈출 중 속도 상한 (기어 나가는 수준)
+    # 탈출 중에는 짧은 경로도 받는다. 여기서 path_check_min_length_m(0.6) 를
+    # 그대로 요구하면 정면이 막힌 상황에서 경로가 늘 기각돼 탈출이 안 된다.
+    "aeb_escape_min_path_m": 0.25,
     "avoid_merge_tail_max": 180,
     "publish_hz": 40.0,
     "path_window_size": 140,
@@ -185,6 +258,17 @@ CFG = {
     "planner_speed_scale_out_topic": "/planner/speed_scale",
     "planner_speed_condition_out_topic": "/planner/speed_condition",
     "planner_mode_topic": "/planner/mode",
+    # ---- Frenet 스냅샷 (판정 로직 교체 아님, 정보 추가) ----
+    # 매 주기 자차와 장애물을 CSV 폐곡선에 투영해 (s, d) 로 갖고 있는다.
+    # 진행방향 거리를 유클리드가 아니라 s 차이로 재야 코너에서 "옆에 있는데
+    # 앞이라고" 보는 오차가 없어진다.
+    "publish_frenet_debug": False,
+    "frenet_debug_topic": "/planner/frenet_debug",
+    # 상대속도 등속 예측. True 면 회피 진입·갭 계산에 "현재 s" 대신
+    # "pred_horizon_sec 뒤 s" 를 쓴다. 앞차가 빠르게 멀어지는 중이면
+    # 불필요한 회피/감속을 줄여 준다. 궤적 학습 같은 건 하지 않는다.
+    "use_predicted_s": False,
+    "pred_horizon_sec": 1.0,
     "status_log_hz": 0.0,  # ego/obs/rel 속도 STATUS (0=끔)
     "verbose_logs": False,
 }
@@ -259,6 +343,10 @@ class LocalPlannerNode(Node):
         self._obstacle_tf_timeout = float(
             self.get_parameter("obstacle_tf_timeout_sec").value
         )
+        # laser→map TF 주기 캐시 → _lookup_laser_to_map_transform
+        self._tf_cycle_id = 0
+        self._tf_cache_cycle = -1
+        self._tf_cache = None
 
         self.avoid_on_m = float(self.get_parameter("avoid_on_m").value)
         self.avoid_off_m = float(self.get_parameter("avoid_off_m").value)
@@ -363,6 +451,87 @@ class LocalPlannerNode(Node):
         self._slew_prev_v: float | None = None
         self._slew_prev_ns = 0
         self._override_active = False
+
+        # Frenet 스냅샷 (매 주기 갱신). None = 이번 주기에 pose/TF 가 없었음.
+        self._s_ego: float | None = None
+        self._d_ego: float | None = None
+        self._static_sd: list = []   # [(s, d, r), ...]
+        self._dynamic_sd: list = []  # [(s, d, r, vs, closing), ...]
+        self._publish_frenet_debug_enable = param_bool(g("publish_frenet_debug").value)
+        self._use_predicted_s = param_bool(g("use_predicted_s").value)
+        self._pred_horizon_sec = max(0.0, float(g("pred_horizon_sec").value))
+
+        # AVOID 경로 모드
+        self.avoid_path_mode = str(g("avoid_path_mode").value).strip().lower()
+        if self.avoid_path_mode not in ("straight", "frenet"):
+            self.get_logger().warn(
+                f"avoid_path_mode='{self.avoid_path_mode}' 는 모르는 값 — straight 로 둔다"
+            )
+            self.avoid_path_mode = "straight"
+        self.avoid_frenet_step_m = max(0.02, float(g("avoid_frenet_step_m").value))
+        self.avoid_frenet_hold_m = max(0.0, float(g("avoid_frenet_hold_m").value))
+        self.avoid_frenet_enter_len_m = max(
+            0.3, float(g("avoid_frenet_enter_len_m").value)
+        )
+        self.avoid_frenet_exit_len_m = max(
+            0.3, float(g("avoid_frenet_exit_len_m").value)
+        )
+        self.avoid_frenet_max_offset_m = max(
+            0.05, float(g("avoid_frenet_max_offset_m").value)
+        )
+        self._last_frenet_avoid_warn_ns = 0
+
+        # TRAILING
+        self.trailing_enable = param_bool(g("trailing_enable").value)
+        self.trailing_enter_m = max(0.1, float(g("trailing_enter_m").value))
+        self.trailing_exit_m = max(
+            self.trailing_enter_m + 0.1, float(g("trailing_exit_m").value)
+        )
+        self.trailing_exit_count_th = max(1, int(g("trailing_exit_count_th").value))
+        self.trailing_target_gap_m = max(0.1, float(g("trailing_target_gap_m").value))
+        self.trailing_min_leader_speed_mps = max(
+            0.0, float(g("trailing_min_leader_speed_mps").value)
+        )
+        self.trailing_speed_deficit_enable = param_bool(
+            g("trailing_speed_deficit_enable").value
+        )
+        self.trailing_max_speed_deficit_mps = max(
+            0.1, float(g("trailing_max_speed_deficit_mps").value)
+        )
+        self.leader_enter_count_th = max(1, int(g("leader_enter_count_th").value))
+        self.leader_lost_count_th = max(1, int(g("leader_lost_count_th").value))
+        self._leader_latched = False
+        self._leader_seen_count = 0
+        self._leader_lost_count = 0
+        self.trailing_kp = float(g("trailing_kp").value)
+        self.trailing_ki = float(g("trailing_ki").value)
+        self.trailing_kd = float(g("trailing_kd").value)
+        self._trailing_exit_count = 0
+        self._trail_prev_err: float | None = None
+        self._trail_prev_ns = 0
+        self._trail_integral = 0.0
+        # 회피 경로가 막혀 있는 동안의 시간 래치 (AVOID → TRAILING 근거).
+        # bool 이면 전이 한 번에 리셋돼 모드가 프레임 단위로 떨린다.
+        self.avoid_retry_ns = int(max(0.0, float(g("avoid_retry_sec").value)) * 1e9)
+        self._avoid_blocked_until_ns = 0
+        self._aeb_count = 0
+        self._aeb_active = False
+        self.aeb_escape_enable = param_bool(g("aeb_escape_enable").value)
+        self.aeb_escape_arm_speed = max(
+            0.0, float(g("aeb_escape_arm_speed_mps").value)
+        )
+        self.aeb_escape_hold_ns = int(
+            max(0.0, float(g("aeb_escape_hold_sec").value)) * 1e9
+        )
+        self.aeb_escape_speed_mps = max(0.1, float(g("aeb_escape_speed_mps").value))
+        self.aeb_escape_min_path_m = max(
+            0.0, float(g("aeb_escape_min_path_m").value)
+        )
+        self._aeb_escape_until_ns = 0
+        self._aeb_escape_logged = False
+        _tl_hz = max(0.0, float(g("trailing_log_hz").value))
+        self._trailing_log_period_ns = int(1e9 / _tl_hz) if _tl_hz > 0.0 else 0
+        self._last_trailing_log_ns = 0
 
         self.use_fgm = param_bool(self.get_parameter("use_fgm").value)
         cone_deg = float(self.get_parameter("forward_cone_deg").value)
@@ -481,6 +650,13 @@ class LocalPlannerNode(Node):
         self.sub_fgm = self.create_subscription(
             PointStamped, fgm_topic, self.cb_fgm_target, 10
         )
+        # 탈출 동작이 이 토픽에 걸려 있으므로 로그가 꺼져 있어도 구독한다.
+        if self.aeb_escape_enable or (
+            self.trailing_enable and self._trailing_log_period_ns > 0
+        ):
+            self.create_subscription(
+                Bool, str(g("emergency_brake_topic").value), self._cb_aeb, 10
+            )
         if self.path_check_enable:
             # 맵은 latch 로 한 번만 오므로 transient_local 이어야 늦게 떠도 받는다
             self.sub_map = self.create_subscription(
@@ -507,6 +683,13 @@ class LocalPlannerNode(Node):
         self.pub_planner_speed_condition = self.create_publisher(UInt8, out_co, 10)
         mode_topic = self.get_parameter("planner_mode_topic").value
         self.pub_planner_mode = self.create_publisher(String, mode_topic, 10)
+        self.pub_frenet_debug = (
+            self.create_publisher(
+                Float32MultiArray, str(g("frenet_debug_topic").value), 10
+            )
+            if self._publish_frenet_debug_enable
+            else None
+        )
         fgm_en_topic = self.get_parameter("fgm_enable_topic").value
         self.pub_fgm_enable = self.create_publisher(Bool, fgm_en_topic, 10)
         self._strategy_mul_recv = 1.0
@@ -597,15 +780,30 @@ class LocalPlannerNode(Node):
         )
 
     def _lookup_laser_to_map_transform(self):
+        """laser→map TF. 한 주기 안에서는 한 번만 조회한다.
+
+        한 주기에 이 함수가 4~6번 불린다 (코리도 필터 ×3, 이탈 판정, 경로
+        충돌검사…). TF 가 정상일 때는 버퍼 조회라 싸지만, 끊기면 호출마다
+        timeout(기본 0.15초) 만큼 블로킹돼 40 Hz 주기가 1~2 Hz 로 주저앉는다.
+        측정값: TF 없는 상태에서 _update_mode 한 번에 650 ms.
+
+        같은 주기 안에서 TF 가 변할 이유는 없으니 첫 결과를 재사용한다.
+        실패도 캐시한다 — 비싼 쪽이 실패다.
+        """
+        if self._tf_cache_cycle == self._tf_cycle_id:
+            return self._tf_cache
         try:
-            return self.tf_buffer.lookup_transform(
+            tf = self.tf_buffer.lookup_transform(
                 self.map_frame,
                 self.laser_frame,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=self._obstacle_tf_timeout),
             )
         except TransformException:
-            return None
+            tf = None
+        self._tf_cache_cycle = self._tf_cycle_id
+        self._tf_cache = tf
+        return tf
 
     def _filter_obstacles_for_planner(self, raw: list) -> list:
         corridor_on, laser_to_map = self._corridor_lookup(warn=True)
@@ -904,13 +1102,19 @@ class LocalPlannerNode(Node):
             disks.append((mx, my, float(dyn[k + 5]) + grow))
         return disks
 
-    def _truncate_path_at_collision(self, path: Path, tf_lm) -> tuple[Path, bool]:
+    def _truncate_path_at_collision(
+        self, path: Path, tf_lm, min_length_m: float | None = None
+    ) -> tuple[Path, bool]:
         """회피 경로를 첫 충돌 지점 앞에서 자른다. (경로, 쓸만한가).
 
         FGM 목표점 너머 직선 연장이 벽을 향하는 경우가 이걸로 걸린다.
         남은 길이가 너무 짧으면 회피 자체를 포기한다 — 그 짧은 경로를 주면
         Stanley 가 끝점에서 이상하게 돌고, 차라리 CSV 로 두고 AEB 에 맡기는
         편이 안전하다.
+
+        min_length_m 은 그 최소 길이를 이번 호출에만 바꾼다. AEB 탈출 중에는
+        기본값(0.6 m)을 요구하면 경로가 늘 기각돼 빠져나갈 방법이 없어서,
+        저속인 걸 전제로 더 짧은 경로를 받는다.
         """
         if not self.path_check_enable or len(path.poses) < 2:
             return path, True
@@ -939,7 +1143,10 @@ class LocalPlannerNode(Node):
         for i in range(1, kept):
             length += math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
 
-        if length < self.path_check_min_length_m:
+        min_len = (
+            self.path_check_min_length_m if min_length_m is None else min_length_m
+        )
+        if length < min_len:
             return path, False
 
         path.poses = path.poses[:kept]
@@ -956,6 +1163,15 @@ class LocalPlannerNode(Node):
             "안 나와 회피 포기, CSV 유지. 감속 후 AEB 가 받는다."
         )
 
+    def _warn_frenet_avoid_fallback(self) -> None:
+        now = self.get_clock().now().nanoseconds
+        if now - self._last_frenet_avoid_warn_ns < 2_000_000_000:
+            return
+        self._last_frenet_avoid_warn_ns = now
+        self.get_logger().warn(
+            "frenet 회피 경로 생성 실패 — straight 방식으로 대체한다."
+        )
+
     def _csv_speed_near(self, x: float, y: float) -> float:
         """현재 위치에서 가장 가까운 CSV 웨이포인트의 목표속도 [m/s].
 
@@ -968,17 +1184,12 @@ class LocalPlannerNode(Node):
         v = float(self.csv_speeds[int(np.argmin(d2))])
         return v if v > 0.05 else self.avoid_speed_ref_mps
 
-    def _avoid_speed_scale(
-        self, current: PoseStamped | None, *, avoiding: bool
-    ) -> float:
-        """속도 배율. 물리로 목표속도를 구해 CSV 속도로 나눈다.
+    def _avoid_target_speed(self, *, avoiding: bool) -> tuple[float, str]:
+        """회피 물리 목표속도 [m/s] — slew 전 원본.
 
         avoiding=False 는 접근 구간(GLOBAL) 선감속. 조향 한계는 빼고 거리
         기반만 건다.
         """
-        if not self.avoid_speed_enable:
-            return self.rejoin_speed_scale if avoiding else 1.0
-
         # FGM 목표점을 차량 기준 (전방, 횡) 으로 — 조향이 얼마나 급한지가 여기서 나온다
         fwd, lat = 2.0, 0.0
         tgt = self._fgm_target_fresh()
@@ -990,7 +1201,7 @@ class LocalPlannerNode(Node):
             # 목표가 없거나 오래됐으면 조향 한계를 걸 근거가 없다
             avoiding = False
 
-        v_target, reason = avoid_speed_limit(
+        return avoid_speed_limit(
             self._speed_static_obs,
             self._speed_dynamic_obs,
             self._ego_speed_mps,
@@ -1000,24 +1211,110 @@ class LocalPlannerNode(Node):
             laser_to_base_x_m=self.laser_to_base_x_m,
             include_maneuver=avoiding,
         )
-        v_target = self._slew_limit_speed(v_target)
+
+    def _trailing_target_speed(self, v_csv: float) -> float:
+        """갭 유지 목표속도 [m/s] (slew 전).
+
+        기준은 **앞차 속도** 다. 예전에는 CSV 속도에 배율을 곱했다:
+
+            raw = 1.0 + kp*err + kd*derr      # err = gap - target_gap
+            v   = raw * v_csv
+
+        갭이 목표에 맞으면 err=0 → raw=1.0 → **CSV 전속** 이 나온다. 앞차가
+        1.2 m/s 로 가는데 자차는 5 m/s 를 명령하니 갭이 순식간에 무너지고,
+        그때서야 err 가 음수로 커져 급제동한다. 서면 갭이 벌어져 다시 전속.
+        이 왕복이 "갔다 멈췄다" 하는 버벅임의 정체다. 정상상태가 없는 제어다.
+
+        앞차 속도를 기준으로 두면 err=0 에서 v = v_lead 라 정상상태가 생긴다.
+        갭 오차는 그 위에 얹는 보정이다 (adaptive cruise 의 기본형).
+        """
+        gap, v_lead = self._forward_leader()
+        if not math.isfinite(gap):
+            self._trail_prev_err = None
+            self._trail_integral = 0.0
+            return v_csv
+
+        now_ns = self.get_clock().now().nanoseconds
+        err = gap - self.trailing_target_gap_m
+        derr = 0.0
+        if self._trail_prev_err is not None and self._trail_prev_ns > 0:
+            dt = (now_ns - self._trail_prev_ns) * 1e-9
+            if 0.0 < dt < 0.5:
+                derr = (err - self._trail_prev_err) / dt
+                if self.trailing_ki != 0.0:
+                    self._trail_integral = max(
+                        -2.0, min(2.0, self._trail_integral + err * dt)
+                    )
+        self._trail_prev_err = err
+        self._trail_prev_ns = now_ns
+
+        v = (
+            max(0.0, v_lead)
+            + self.trailing_kp * err
+            + self.trailing_ki * self._trail_integral
+            + self.trailing_kd * derr
+        )
+
+        # 제동거리 상한. P 항만 두면 갭이 넓을 때(err 가 클 때) CSV 전속을
+        # 명령하고, 목표갭에 닿았을 땐 이미 그 거리 안에서 못 서는 속도가 돼
+        # 있다. 그러면 AEB 가 대신 잡는데, AEB 는 역토크라 급정거 → 갭이
+        # 벌어짐 → 다시 전속 … 으로 버벅인다. 접근 자체를 "목표갭에 맞춰
+        # 설 수 있는 속도" 로 제한해야 AEB 를 안 부른다.
+        #   v ≤ v_lead + √(2·a·여유)      (여유 = gap - target_gap)
+        slack = max(0.0, err)
+        v_cap = max(0.0, v_lead) + math.sqrt(
+            2.0 * self.avoid_speed_params.a_brake * slack
+        )
+        v = min(v, v_cap)
+
+        # 앞차보다 빨리 갈 이유는 없고(추월 로직 없음), CSV 속도도 못 넘는다.
+        return min(v_csv, max(0.0, v))
+
+    def _planner_speed_scale(self) -> float:
+        """회피 선감속과 TRAILING 갭 유지 중 더 느린 쪽. slew 는 마지막에 한 번만.
+
+        두 정책이 각자 slew 를 돌리면 두 번째 호출이 dt≈0 이라 제한이 풀린다.
+        """
+        v_csv = self._csv_speed_now()
+        trailing = self.trailing_enable and self.mode == "TRAILING"
+
+        if not self.avoid_speed_enable:
+            base = self.rejoin_speed_scale if self._override_active else 1.0
+            if not trailing:
+                return base
+            scale = self._trailing_target_speed(v_csv) / max(0.05, v_csv)
+            return min(base, scale)
+
+        v_target, reason = self._avoid_target_speed(avoiding=self._override_active)
+        if trailing:
+            v_trail = self._trailing_target_speed(v_csv)
+            if v_trail < v_target:
+                v_target, reason = v_trail, "trailing"
+
+        if self._aeb_escape_active():
+            # 탈출은 "기어 나가는" 동작이다. 여기서 상한을 안 걸면 장애물이
+            # 시야에서 빠지는 순간 CSV 전속으로 튀어 나간다.
+            if self.aeb_escape_speed_mps < v_target:
+                v_target, reason = self.aeb_escape_speed_mps, "aeb_escape"
+
+        v_target = self._slew_limit_speed(v_target, ceiling=v_csv)
         self._last_avoid_speed = v_target
         self._last_avoid_reason = reason
-
-        v_csv = self.avoid_speed_ref_mps
-        if current is not None:
-            v_csv = self._csv_speed_near(
-                float(current.pose.position.x), float(current.pose.position.y)
-            )
         return min(1.0, v_target / max(0.05, v_csv))
 
-    def _slew_limit_speed(self, v_target: float) -> float:
+    def _slew_limit_speed(self, v_target: float, ceiling: float | None = None) -> float:
         """감속 명령이 차가 낼 수 있는 감속도를 넘지 않게 완만화.
 
         장애물이 검출 범위에 처음 들어오는 순간 목표속도가 뚝 떨어지는데,
         그대로 내보내면 못 따라가는 명령이라 속도 PI 가 포화되고 적분이
         쌓인다. a_brake 로 기울기를 제한하면 명령 자체가 추종 가능해진다.
         가속 방향은 제한하지 않는다 (위험이 사라지면 바로 회복).
+
+        ceiling 은 이력의 상한이다. 장애물이 없을 때 목표속도는 정책 상한
+        (8 m/s) 에 머무는데, 실제로 나가는 명령은 CSV 속도(~3 m/s) 로
+        잘린다. 이력을 8 로 들고 있으면 위협이 나타났을 때 3 까지 내려오는
+        1.6초 동안 배율이 1.0 에 붙어 있어 감속이 그만큼 늦는다. 의미 없는
+        여유분을 잘라 두면 첫 프레임부터 제대로 된 기울기로 내려간다.
         """
         now = self.get_clock().now().nanoseconds
         prev = self._slew_prev_v
@@ -1031,6 +1328,8 @@ class LocalPlannerNode(Node):
         if dt <= 0.0 or dt > 0.5:  # 오래 끊겼으면 이력 버림
             self._slew_prev_v = v_target
             return v_target
+        if ceiling is not None and math.isfinite(ceiling):
+            prev = min(prev, float(ceiling))
 
         floor = prev - self.avoid_speed_params.a_brake * dt
         v = max(v_target, floor)
@@ -1082,12 +1381,7 @@ class LocalPlannerNode(Node):
         # mode 가 아니라 실제로 회피 경로를 내보내는 중인지로 판단한다.
         # 장애물이 사라진 뒤에도 mode 는 잠시 AVOID 로 남는데, 그동안 조향
         # 한계까지 걸면 아무것도 없는 구간에서 속도가 묶인다.
-        sc = min(
-            sc,
-            self._avoid_speed_scale(
-                self._last_pose_for_speed, avoiding=self._override_active
-            ),
-        )
+        sc = min(sc, self._planner_speed_scale())
 
         self.pub_planner_speed_scale.publish(Float64(data=sc))
         self.pub_planner_speed_condition.publish(UInt8(data=cd))
@@ -1344,6 +1638,218 @@ class LocalPlannerNode(Node):
         d0pp = 0.0
         return s0, d0, d0p, d0pp, yaw_ref, yaw_err
 
+    # ------------------------------------------------------------------
+    # Frenet 공용 유틸 — REJOIN 전용이던 투영을 플래너 전역에서 쓴다.
+    # ------------------------------------------------------------------
+    def _delta_s(self, s_a: float, s_b: float) -> float:
+        """랩을 감안한 s_a − s_b. [-L/2, +L/2) 로 정규화.
+
+        +면 a 가 b 보다 진행방향 앞이다. 폐곡선이라 그냥 빼면 결승선 부근에서
+        한 바퀴만큼 튄다.
+        """
+        total = self._total_l
+        if total <= 1e-6:
+            return 0.0
+        d = (float(s_a) - float(s_b)) % total
+        if d >= 0.5 * total:
+            d -= total
+        return d
+
+    def _frenet_xy(self, mx: float, my: float) -> Tuple[float, float]:
+        """맵 점 → (s, d). d 는 진행방향 왼쪽이 +."""
+        qx, qy, seg_i, t = self._closest_on_loop(mx, my)
+        s = self._seg_start[seg_i] + t * self._seg_len[seg_i]
+        j = (seg_i + 1) % self._n
+        yaw_ref = math.atan2(self._ys[j] - self._ys[seg_i], self._xs[j] - self._xs[seg_i])
+        d = (mx - qx) * (-math.sin(yaw_ref)) + (my - qy) * math.cos(yaw_ref)
+        return s, d
+
+    def _track_yaw_at_s(self, s: float) -> float:
+        return self._xy_yaw_at_s(s)[2]
+
+    def _update_frenet_snapshot(
+        self, current: PoseStamped | None, filtered: list, filtered_dynamic: list, tf_lm
+    ) -> None:
+        """자차/장애물의 (s, d) 를 매 주기 갱신. 판정은 바꾸지 않고 정보만 만든다."""
+        self._s_ego = None
+        self._d_ego = None
+        self._static_sd = []
+        self._dynamic_sd = []
+
+        if current is not None:
+            self._s_ego, self._d_ego = self._frenet_xy(
+                float(current.pose.position.x), float(current.pose.position.y)
+            )
+
+        if tf_lm is None:
+            return
+        to_map = self._make_laser_to_map_fn(tf_lm)
+        q = tf_lm.transform.rotation
+        yaw_lm = _quat_to_yaw(q)
+        cos_l, sin_l = math.cos(yaw_lm), math.sin(yaw_lm)
+
+        for k in range(0, max(0, len(filtered) - 3), 4):
+            mx, my = to_map(float(filtered[k + 1]), float(filtered[k + 2]))
+            s, d = self._frenet_xy(mx, my)
+            self._static_sd.append((s, d, float(filtered[k + 3])))
+
+        # 동적: vx,vy 는 laser frame 상대속도다. 절대속도 ≈ 상대 + 자차속도.
+        # 자차 요레이트로 생기는 항은 무시한다 (1초 예측이라 영향이 작다).
+        ego_yaw = (
+            _quat_to_yaw(current.pose.orientation) if current is not None else yaw_lm
+        )
+        ego_vx = self._ego_speed_mps * math.cos(ego_yaw)
+        ego_vy = self._ego_speed_mps * math.sin(ego_yaw)
+        for k in range(0, max(0, len(filtered_dynamic) - 5), 6):
+            lx = float(filtered_dynamic[k + 1])
+            ly = float(filtered_dynamic[k + 2])
+            vlx = float(filtered_dynamic[k + 3])
+            vly = float(filtered_dynamic[k + 4])
+            r = float(filtered_dynamic[k + 5])
+            mx, my = to_map(lx, ly)
+            s, d = self._frenet_xy(mx, my)
+            vmx = cos_l * vlx - sin_l * vly + ego_vx
+            vmy = sin_l * vlx + cos_l * vly + ego_vy
+            tyaw = self._track_yaw_at_s(s)
+            vs = vmx * math.cos(tyaw) + vmy * math.sin(tyaw)
+            rng = math.hypot(lx, ly)
+            closing = -(lx * vlx + ly * vly) / rng if rng > 1e-3 else 0.0
+            self._dynamic_sd.append((s, d, r, vs, closing))
+
+    def _obstacle_s_for_gap(self, entry) -> float:
+        """장애물의 s. use_predicted_s 면 등속 예측을 적용한 s."""
+        s = float(entry[0])
+        if not self._use_predicted_s or len(entry) < 4:
+            return s
+        return s + float(entry[3]) * self._pred_horizon_sec
+
+    def _forward_leader(self) -> tuple[float, float]:
+        """전방 최근접 동적 장애물의 (s 갭 [m], 트랙방향 절대속도 [m/s]).
+
+        없으면 (inf, 0.0). 표면 기준으로 반경과 앞범퍼 여유를 뺀다
+        (XY 게이트와 같은 규약).
+
+        속도를 같이 돌려주는 이유: 추종 속도는 CSV 속도가 아니라 **앞차
+        속도** 를 기준으로 잡아야 하기 때문이다. 자세한 건
+        `_trailing_target_speed` 주석 참고.
+        """
+        if self._s_ego is None or not self._dynamic_sd:
+            return float("inf"), 0.0
+        best = float("inf")
+        best_vs = 0.0
+        for entry in self._dynamic_sd:
+            # 전방 여부는 "지금" 기준으로 판정한다. 예측 s 로 걸러 버리면
+            # 마주 오는 물체가 자차를 지나친 것으로 계산되어 갭 계산에서
+            # 통째로 사라진다 — 가장 위험한 대상이 없어지는 셈이다.
+            if self._delta_s(float(entry[0]), self._s_ego) <= 0.0:
+                continue
+            ds = self._delta_s(self._obstacle_s_for_gap(entry), self._s_ego)
+            gap = ds - float(entry[2]) - self.ego_front_safety_m
+            gap = max(0.0, gap)
+            if gap < best:
+                best = gap
+                best_vs = float(entry[3])
+        return best, best_vs
+
+    def _forward_gap_s_m(self) -> float:
+        return self._forward_leader()[0]
+
+    def _has_followable_leader(self) -> bool:
+        """전방 동적 장애물이 '따라갈 수 있는 앞차' 인가.
+
+        추월 로직이 아직 없으므로, 같은 방향으로 달리는 차는 비켜 가려
+        하지 말고 뒤에 붙어야 한다. 반대로 아래 둘은 따라갈 대상이 아니다.
+
+          - 역주행(vs < 0): 마주 오는 차 뒤에 붙는다는 말은 성립하지 않는다.
+          - 사실상 정지(|vs| 가 임계 미만): 서 있는 차를 따라가면 영원히
+            그 뒤에 서 있게 된다. 정지한 순간 '정적 장애물' 로 넘겨서
+            회피가 돌아가게 해야 한다.
+
+        둘 다 AVOID 로 보낸다.
+
+        trailing_speed_deficit_enable 을 켜면 여기에 상대속도 조건이 하나
+        더 붙는다 — 아래 _leader_too_slow 참고.
+        """
+        gap, vs = self._forward_leader()
+        if not math.isfinite(gap):
+            return False
+        if vs < self.trailing_min_leader_speed_mps:
+            return False
+        return not self._leader_too_slow(vs)
+
+    def _csv_speed_now(self) -> float:
+        """현재 위치의 CSV 목표속도 [m/s]. 포즈가 없으면 기준속도."""
+        current = self._last_pose_for_speed
+        if current is None:
+            return self.avoid_speed_ref_mps
+        return self._csv_speed_near(
+            float(current.pose.position.x), float(current.pose.position.y)
+        )
+
+    def _leader_too_slow(self, vs: float) -> bool:
+        """우리보다 한참 느린 앞차인가 (→ 따라가지 말고 비켜 간다).
+
+        절대속도만 보면 1 m/s 로 기어가는 차 뒤에 5 m/s 를 낼 수 있는 우리가
+        붙어서 1 m/s 로 간다. 레이싱에서 그건 지는 것이다. CSV 목표속도와의
+        차이가 이 임계를 넘으면 '따라갈 만한 앞차' 로 보지 않고 AVOID 로
+        넘겨서, 정적 장애물과 똑같이 FGM 반응형 회피로 지나가게 한다.
+
+        새 상태나 추월 판단 로직은 넣지 않는다 — 분류 기준만 하나 늘린 것이다.
+
+        기본 OFF 인 이유: 움직이는 차를 옆으로 지나는 건 콘을 지나는 것과
+        다르다. 상대는 우리가 옆에 붙은 순간 라인을 바꿀 수 있고 반응형
+        회피는 그걸 예측하지 못한다. 임계를 낮게 잡으면 접촉 위험이 실제로
+        올라간다.
+        """
+        if not self.trailing_speed_deficit_enable:
+            return False
+        deficit = self._csv_speed_now() - float(vs)
+        return deficit > self.trailing_max_speed_deficit_mps
+
+    def _update_leader_latch(self) -> bool:
+        """따라갈 앞차가 있는가 — 프레임 단위 흔들림을 걸러낸 값.
+
+        클러스터 추적(integrated_obstacle_node)은 같은 물체를 한두 프레임씩
+        static/dynamic 으로 오간다. speed_threshold_mps=0.45 경계에서 속도
+        추정 노이즈가 그대로 분류를 뒤집기 때문이다. 그 값을 매 프레임
+        그대로 쓰면 avoid_on 이 같이 뒤집혀 TRAILING↔AVOID↔GLOBAL 을 오가고,
+        모드가 바뀔 때마다 속도 정책이 통째로 바뀌어 명령속도가 1.2 →
+        3.9 m/s 로 튄다. 실제 파형이 그랬다 — 갭 제어는 멀쩡한데 그 위에서
+        모드가 떨려서 버벅였다.
+
+        그래서 판정을 양방향 히스테리시스로 굳힌다.
+          진입: enter_th 프레임 연속 — 정적 콘이 노이즈로 한 프레임 dynamic
+                으로 튀었다고 "앞차" 로 붙잡지 않게.
+          해제: lost_th 프레임 연속 — 실제 앞차를 한 프레임 놓쳤다고
+                회피로 튕겨 나가지 않게.
+        """
+        if self._has_followable_leader():
+            self._leader_lost_count = 0
+            if not self._leader_latched:
+                self._leader_seen_count += 1
+                if self._leader_seen_count >= self.leader_enter_count_th:
+                    self._leader_latched = True
+        else:
+            self._leader_seen_count = 0
+            if self._leader_latched:
+                self._leader_lost_count += 1
+                if self._leader_lost_count >= self.leader_lost_count_th:
+                    self._leader_latched = False
+        return self._leader_latched
+
+    def _publish_frenet_debug(self) -> None:
+        if self.pub_frenet_debug is None:
+            return
+        data = [
+            float(self._s_ego if self._s_ego is not None else float("nan")),
+            float(self._d_ego if self._d_ego is not None else float("nan")),
+        ]
+        for s, d, _r in self._static_sd:
+            data.extend([float(s), float(d)])
+        for s, d, _r, _vs, _c in self._dynamic_sd:
+            data.extend([float(s), float(d)])
+        self.pub_frenet_debug.publish(Float32MultiArray(data=data))
+
     @staticmethod
     def _solve_quintic(
         d0: float,
@@ -1408,8 +1914,12 @@ class LocalPlannerNode(Node):
 
         s0, d0, d0p, d0pp, _, _ = self._project_to_frenet(x, y, yaw)
 
-        L = self.rejoin_min_length_m
-        L = min(L, self.rejoin_max_length_m)
+        # 재합류 거리는 속도에 비례해야 한다. 고정 길이로 두면 고속에서
+        # 0.2초 만에 붙으라는 요구가 되어 조향이 튄다.
+        L = min(
+            self.rejoin_max_length_m,
+            max(self.rejoin_min_length_m, self.rejoin_time_sec * self._ego_speed_mps),
+        )
 
         coeff = self._solve_quintic(d0, d0p, d0pp, 0.0, 0.0, 0.0, L)
         self._rejoin_target_s = (s0 + L) % self._total_l
@@ -1438,9 +1948,23 @@ class LocalPlannerNode(Node):
         if len(out.poses) < 2:
             return None
 
+        # 재합류 경로도 벽/장애물 검사를 받아야 한다. 회피 직후라 옆으로
+        # 나가 있는 상태이고, 그 상태에서 레이스라인으로 비스듬히 붙는
+        # 경로는 안쪽 벽이나 아직 남은 장애물을 스칠 수 있다.
+        out, usable = self._truncate_path_at_collision(
+            out, self._lookup_laser_to_map_transform()
+        )
+        if not usable or len(out.poses) < 2:
+            if self.verbose_logs:
+                self.get_logger().warn(
+                    f"REJOIN path blocked at idx={self._last_path_cut} — 재합류 포기, CSV 유지"
+                )
+            return None
+
         if self.verbose_logs:
             self.get_logger().info(
-                f"REJOIN path generated: d0={d0:.2f}m, L={L:.2f}m, samples={len(out.poses)}"
+                f"REJOIN path generated: d0={d0:.2f}m, L={L:.2f}m, "
+                f"v_ego={self._ego_speed_mps:.2f}m/s, samples={len(out.poses)}"
             )
         return out
 
@@ -1469,6 +1993,103 @@ class LocalPlannerNode(Node):
         self._rejoin_path_msg = None
         self._avoid_on_count = 0
         self._avoid_off_count = 0
+        self._reset_trailing_state()
+
+    def _avoid_blocked(self) -> bool:
+        """회피 경로가 막힌 상태인가 (시간 래치)."""
+        if self._avoid_blocked_until_ns <= 0:
+            return False
+        if self.get_clock().now().nanoseconds >= self._avoid_blocked_until_ns:
+            self._avoid_blocked_until_ns = 0
+            return False
+        return True
+
+    def _mark_avoid_blocked(self) -> None:
+        self._avoid_blocked_until_ns = (
+            self.get_clock().now().nanoseconds + self.avoid_retry_ns
+        )
+
+    def _clear_avoid_blocked(self) -> None:
+        self._avoid_blocked_until_ns = 0
+
+    def _cb_aeb(self, msg: Bool) -> None:
+        active = bool(msg.data)
+        if active and not self._aeb_active:
+            self._aeb_count += 1
+        if self._aeb_active and not active and self.aeb_escape_enable:
+            # 하강엣지 — AEB 가 풀렸다. AEB 노드의 탈출 창이 열려 있는 동안
+            # 실제로 빠져나가야 하므로 그 시간만큼 탈출 모드를 유지한다.
+            self._aeb_escape_until_ns = (
+                self.get_clock().now().nanoseconds + self.aeb_escape_hold_ns
+            )
+        self._aeb_active = active
+
+    def _aeb_escape_active(self) -> bool:
+        """AEB 탈출 모드인가.
+
+        두 구간을 합친다.
+          1. AEB 가 걸린 채 **실제로 멈춘** 동안 — 정지 상태에서 조향을 미리
+             돌려 둔다. control_node 는 AEB 중에도 조향은 /drive 를 따르므로
+             바퀴가 탈출 방향으로 꺾인 채 대기하게 된다.
+          2. AEB 해제 후 aeb_escape_hold_sec — 그 방향으로 빠져나가는 구간.
+
+        1 에 속도 조건을 거는 이유: 아직 고속으로 제동 중일 때 조향을 새
+        경로로 틀면 거동이 예측 밖으로 간다. 멈춘 뒤에만 바꾼다.
+        """
+        if not self.aeb_escape_enable:
+            return False
+        if self._aeb_active:
+            return self._ego_speed_mps <= self.aeb_escape_arm_speed
+        return (
+            self._aeb_escape_until_ns > 0
+            and self.get_clock().now().nanoseconds < self._aeb_escape_until_ns
+        )
+
+    def _log_aeb_escape(self, active: bool) -> None:
+        if active == self._aeb_escape_logged:
+            return
+        self._aeb_escape_logged = active
+        if active:
+            self.get_logger().warn(
+                f"AEB 탈출 모드 진입 — FGM 회피경로 강제 발행, "
+                f"속도 ≤{self.aeb_escape_speed_mps:.2f}m/s "
+                f"(aeb_total={self._aeb_count})"
+            )
+        else:
+            self.get_logger().info("AEB 탈출 모드 종료 — 정상 판정 복귀")
+
+    def _maybe_log_trailing(self) -> None:
+        if self._trailing_log_period_ns <= 0:
+            return
+        now_ns = self.get_clock().now().nanoseconds
+        if now_ns - self._last_trailing_log_ns < self._trailing_log_period_ns:
+            return
+        self._last_trailing_log_ns = now_ns
+        gap, v_lead = self._forward_leader()
+        gap_s = "inf" if not math.isfinite(gap) else f"{gap:.2f}"
+        self.get_logger().info(
+            f"[TRAILING] gap={gap_s}m target={self.trailing_target_gap_m:.2f}m "
+            f"lead={v_lead:.2f}m/s cmd={self._last_avoid_speed:.2f}m/s "
+            f"ego={self._ego_speed_mps:.2f}m/s aeb_total={self._aeb_count}"
+        )
+
+    def _trailing_should_enter(self) -> bool:
+        """GLOBAL → TRAILING 조건. 호출부에서 AVOID 진입이 안 선 것이 이미 확인됐다."""
+        if not self.trailing_enable:
+            return False
+        # 따라갈 수 있는 앞차일 때만. 서 있는 차 뒤에 TRAILING 으로 붙으면
+        # 갭만 지키며 영원히 그 자리에 선다 — 그건 AVOID 가 할 일이다.
+        # _update_mode 가 이번 주기에 갱신해 둔 래치를 그대로 쓴다.
+        if not self._leader_latched:
+            return False
+        gap = self._forward_gap_s_m()
+        return math.isfinite(gap) and gap <= self.trailing_enter_m
+
+    def _reset_trailing_state(self) -> None:
+        self._trailing_exit_count = 0
+        self._trail_prev_err = None
+        self._trail_prev_ns = 0
+        self._trail_integral = 0.0
 
     def _log_mode_transition(self, old_mode: str, d_closest: float) -> None:
         if not self.verbose_logs:
@@ -1502,28 +2123,97 @@ class LocalPlannerNode(Node):
 
         on_m, _off_m, fgm_m = self._effective_avoid_gates()
         static_obstacle_on = d_closest <= on_m
+        # use_predicted_s 면 XY 최근접 대신 "예측 s 갭" 으로 진입을 본다.
+        # 앞차가 빠르게 멀어지는 중이면 지금 가까워도 회피할 이유가 없다.
+        d_dyn_for_gate = d_dyn_closest
+        if self._use_predicted_s:
+            gap_s = self._forward_gap_s_m()
+            if math.isfinite(gap_s):
+                d_dyn_for_gate = gap_s
         dynamic_obstacle_on = (
             len(filtered_dynamic) >= 6
-            and math.isfinite(d_dyn_closest)
-            and d_dyn_closest <= on_m
+            and math.isfinite(d_dyn_for_gate)
+            and d_dyn_for_gate <= on_m
             and rel_speed > 0.0
         )
         obstacle_on = static_obstacle_on or dynamic_obstacle_on
+        # ---- 분류: 이 장애물을 무엇으로 볼 것인가 ----
+        # 추월 로직이 없으므로 "같은 방향으로 달리는 앞차" 는 회피 대상이
+        # 아니다. 뒤에 붙는다. 예전에는 dynamic 도 AVOID 를 트리거해서 앞차를
+        # 만날 때마다 AVOID↔TRAILING↔GLOBAL 을 오갔고, 그때마다 속도 정책이
+        # 통째로 바뀌어 버벅였다.
+        #
+        #   정적 / 사실상 정지 / 역주행  → AVOID    (비켜 간다)
+        #   같은 방향 주행 앞차          → TRAILING (뒤에 붙는다)
+        #   여유 안쪽으로 들어온 것      → AEB (emergency_brake_node)
+        #
+        # 모든 분기가 이 하나를 봐야 한다. GLOBAL 만 고치고 TRAILING 분기가
+        # obstacle_on 을 보면, 붙자마자 다시 AVOID 로 튕겨 나간다.
+        followable = self.trailing_enable and self._update_leader_latch()
+        avoid_on = static_obstacle_on or (dynamic_obstacle_on and not followable)
         still_blocking = self._obstacles_remain(filtered)
         fully_cleared = self._avoidance_fully_cleared(filtered, current_pose)
 
         old_mode = self.mode
 
+        # AEB 로 멈췄으면 다른 전이보다 탈출이 먼저다. TRAILING 은 CSV 를
+        # 그대로 타므로 정면이 막힌 상황에서는 조향할 경로가 없다. AVOID 로
+        # 밀어 넣어 FGM 경로가 나오게 한다.
+        escaping = self._aeb_escape_active()
+        self._log_aeb_escape(escaping)
+        if escaping:
+            self._clear_avoid_blocked()
+            if self.mode != "AVOID":
+                self.mode = "AVOID"
+                self._avoid_off_count = 0
+                self._rejoin_path_msg = None
+                self._reset_trailing_state()
+                self._log_mode_transition(old_mode, d_closest)
+            return
+
         if self.mode == "GLOBAL":
-            if obstacle_on and self.use_fgm:
+            if avoid_on and self.use_fgm:
                 self._avoid_on_count += 1
             else:
                 self._avoid_on_count = 0
 
-            if self._avoid_on_count >= self.avoid_on_count_th:
+            # 래치가 살아 있으면 방금 회피 경로가 막힌 것이다. 바로 다시
+            # AVOID 로 올라가면 같은 실패를 반복하며 모드만 떤다. 카운트는
+            # 계속 세서 래치가 풀리는 즉시 재시도하게 둔다.
+            if (
+                self._avoid_on_count >= self.avoid_on_count_th
+                and not self._avoid_blocked()
+            ):
                 self.mode = "AVOID"
                 self._avoid_off_count = 0
                 self._rejoin_path_msg = None
+                self._clear_avoid_blocked()
+            elif self._trailing_should_enter():
+                # 앞차가 s 방향으로 가까운데 회피 진입 조건은 안 선다
+                # = 옆으로 못 간다. 붙어서 따라가되 갭만 지킨다.
+                self.mode = "TRAILING"
+                self._reset_trailing_state()
+
+        elif self.mode == "AVOID" and self._avoid_blocked():
+            # 회피 경로가 쓸 만한 길이로 안 나온다 = 지나갈 틈이 없다.
+            # 래치는 지우지 않는다 — 지우면 다음 프레임에 바로 AVOID 로 튕긴다.
+            #
+            # 어디로 보낼지는 "따라갈 앞차가 있나" 로 갈린다.
+            #   있다  → TRAILING. 갭을 지키며 뒤에 붙는다.
+            #   없다  → GLOBAL.  정적 장애물을 TRAILING 으로 보내면 전방 갭이
+            #           inf 라 5 프레임 뒤 곧바로 GLOBAL 로 빠져나가고,
+            #           AVOID→TRAILING→GLOBAL→AVOID 가 200 ms 주기로 돈다.
+            #           그 사이 AEB 완화 기준이 같이 깜빡인다. 처음부터
+            #           GLOBAL 로 보내면 완화 없이 엄격한 기준을 유지한다.
+            #
+            # 어느 쪽이든 경로는 발행되지 않으므로 Stanley 는 CSV 를 탄다.
+            # 감속은 모드와 무관한 속도 정책이 하고, 그래도 못 서면 AEB 가
+            # 잡은 뒤 탈출 로직(_aeb_escape_active)이 빠져나간다.
+            if self.trailing_enable and followable:
+                self.mode = "TRAILING"
+                self._reset_trailing_state()
+            else:
+                self._go_global()
 
         elif self.mode == "AVOID":
             static_still_ahead = (
@@ -1580,15 +2270,94 @@ class LocalPlannerNode(Node):
                     self._go_global()
 
         elif self.mode == "REJOIN":
-            if obstacle_on and self.use_fgm:
+            if avoid_on and self.use_fgm:
                 self.mode = "AVOID"
                 self._rejoin_path_msg = None
                 self._avoid_off_count = 0
+                self._clear_avoid_blocked()
             elif current_pose is not None and self._is_rejoin_finished(current_pose):
                 self._go_global()
 
+        elif self.mode == "TRAILING":
+            gap = self._forward_gap_s_m()
+            if avoid_on and self.use_fgm and not self._avoid_blocked():
+                # 앞차가 서거나 돌아섰다(=따라갈 대상이 아니다) 또는 정적
+                # 장애물이 새로 들어왔다 — 회피로 넘긴다. 래치가 아직 살아
+                # 있으면 방금 막혔던 것이므로 재시도 주기까지 기다린다.
+                self.mode = "AVOID"
+                self._avoid_off_count = 0
+                self._rejoin_path_msg = None
+                self._reset_trailing_state()
+            elif self._s_ego is None:
+                # pose 가 없어서 갭을 못 잰 것뿐이다. 이걸 "앞차가 사라졌다"
+                # 로 세면 TF 가 한 번 끊길 때마다 TRAILING 이 풀려서 앞차
+                # 쪽으로 다시 가속한다. 판단 못 할 때는 상태를 유지한다.
+                pass
+            else:
+                if (not math.isfinite(gap)) or gap > self.trailing_exit_m:
+                    self._trailing_exit_count += 1
+                else:
+                    self._trailing_exit_count = 0
+                if self._trailing_exit_count >= self.trailing_exit_count_th:
+                    self._go_global()
+
         if old_mode != self.mode:
             self._log_mode_transition(old_mode, d_closest)
+
+    def _build_avoid_path_frenet(
+        self, current: PoseStamped, fgm_x: float, fgm_y: float
+    ) -> Path | None:
+        """레이스라인을 기준선으로 d(s) quintic 회피 경로.
+
+        진입(자차 d → 목표 d) → 유지(apex) → 복귀(d → 0) 3단이다. 직선
+        방식과 달리 기준선 곡률을 따라가므로 코너에서 조향이 튀지 않는다.
+        기하만 만들고 안전성은 호출부의 _truncate_path_at_collision 이 본다.
+        """
+        cx = float(current.pose.position.x)
+        cy = float(current.pose.position.y)
+        yaw = _quat_to_yaw(current.pose.orientation)
+        s0, d0, d0p, d0pp, _, _ = self._project_to_frenet(cx, cy, yaw)
+        s_target, d_target = self._frenet_xy(float(fgm_x), float(fgm_y))
+
+        lim = self.avoid_frenet_max_offset_m
+        d_goal = max(-lim, min(lim, d_target))
+
+        # 목표까지 남은 s 가 설정값보다 짧으면 그만큼만 쓴다 — 장애물 옆을
+        # 지날 때는 이미 오프셋에 올라와 있어야 한다.
+        ds_to_target = self._delta_s(s_target, s0)
+        l_enter = self.avoid_frenet_enter_len_m
+        if ds_to_target > 0.3:
+            l_enter = min(l_enter, ds_to_target)
+        l_enter = max(0.3, l_enter)
+        l_exit = self.avoid_frenet_exit_len_m
+
+        enter = self._solve_quintic(d0, d0p, d0pp, d_goal, 0.0, 0.0, l_enter)
+        exit_ = self._solve_quintic(d_goal, 0.0, 0.0, 0.0, 0.0, 0.0, l_exit)
+
+        out = Path()
+        out.header.frame_id = self.map_frame
+        out.header.stamp = self.get_clock().now().to_msg()
+
+        step = self.avoid_frenet_step_m
+        total = l_enter + self.avoid_frenet_hold_m + l_exit
+        n = int(total / step)
+        for k in range(n + 1):
+            ds = min(total, k * step)
+            if ds <= l_enter:
+                d = self._eval_quintic(enter, ds)
+            elif ds <= l_enter + self.avoid_frenet_hold_m:
+                d = d_goal
+            else:
+                d = self._eval_quintic(exit_, ds - l_enter - self.avoid_frenet_hold_m)
+            d = max(-lim, min(lim, d))
+            x_ref, y_ref, yaw_ref = self._xy_yaw_at_s(s0 + ds)
+            self._append_pose(
+                out, x_ref - d * math.sin(yaw_ref), y_ref + d * math.cos(yaw_ref)
+            )
+
+        if len(out.poses) < 2:
+            return None
+        return out
 
     def _build_avoid_path(
         self,
@@ -1723,6 +2492,7 @@ class LocalPlannerNode(Node):
         self.pub_fgm_enable.publish(msg)
 
     def timer_publish(self):
+        self._tf_cycle_id += 1  # laser→map TF 캐시 무효화 (주기당 1회 조회)
         filtered = self._filter_obstacles_for_planner(self._obstacle_data)
         filtered_dynamic = self._filter_dynamic_for_planner(self._dynamic_obstacle_data)
         # 뒷축 거리 − 전방 오버행 → 앞범퍼 기준으로 게이트 판단
@@ -1742,6 +2512,16 @@ class LocalPlannerNode(Node):
         self._last_pose_for_speed = current
         self._speed_static_obs = filtered
         self._speed_dynamic_obs = filtered_dynamic
+
+        # 투영할 장애물이 없으면 TF 를 굳이 찾지 않는다 — TF 가 끊긴 동안
+        # lookup 이 timeout 만큼 블로킹돼 타이머 주기가 흔들린다.
+        tf_lm = (
+            self._lookup_laser_to_map_transform()
+            if (filtered or filtered_dynamic)
+            else None
+        )
+        self._update_frenet_snapshot(current, filtered, filtered_dynamic, tf_lm)
+        self._publish_frenet_debug()
 
         self._update_mode(
             d_closest,
@@ -1764,14 +2544,23 @@ class LocalPlannerNode(Node):
             self._publish_override_gate(False)
             return
 
+        if self.mode == "TRAILING":
+            # 경로는 CSV 그대로 — 속도만 줄여서 갭을 지킨다.
+            self._publish_override_gate(False)
+            self._maybe_log_trailing()
+            return
+
         if self.mode == "AVOID":
+            escaping = self._aeb_escape_active()
             static_path = self._static_wants_fgm_local_path(
                 filtered, d_closest, d_gate
             )
             dynamic_path = self._dynamic_wants_fgm_local_path(
                 filtered_dynamic, d_dyn_closest, rel_speed
             )
-            if not static_path and not dynamic_path:
+            # 탈출 중에는 이 게이트를 건너뛴다. 여기서 걸러 버리면 정면에 멈춰
+            # 선 상황에서 경로가 안 나와 빠져나갈 방법이 없다.
+            if not escaping and not static_path and not dynamic_path:
                 self._publish_override_gate(False)
                 return
 
@@ -1789,16 +2578,27 @@ class LocalPlannerNode(Node):
                 return
 
             fgm_x, fgm_y = fgm_xy[0], fgm_xy[1]
-            out = self._build_avoid_path(
-                current, fgm_x, fgm_y, merge_csv_tail=False
-            )
+            out = None
+            if self.avoid_path_mode == "frenet":
+                out = self._build_avoid_path_frenet(current, fgm_x, fgm_y)
+                if out is None:
+                    self._warn_frenet_avoid_fallback()
+            if out is None:
+                out = self._build_avoid_path(
+                    current, fgm_x, fgm_y, merge_csv_tail=False
+                )
             out, usable = self._truncate_path_at_collision(
-                out, self._lookup_laser_to_map_transform()
+                out,
+                tf_lm,
+                min_length_m=self.aeb_escape_min_path_m if escaping else None,
             )
             if not usable:
+                # 다음 주기 _update_mode 가 이걸 보고 TRAILING 으로 넘긴다
+                self._mark_avoid_blocked()
                 self._warn_avoid_path_blocked()
                 self._publish_override_gate(False)
                 return
+            self._clear_avoid_blocked()
 
             if len(out.poses) >= 2:
                 base_path = (
