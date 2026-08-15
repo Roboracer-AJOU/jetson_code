@@ -2,7 +2,14 @@
 # CPU 정책 적용 (재시작 후에도 런치/데몬이 이걸 호출)
 #
 #   로컬(위치추정): 코어1~4 = CPU 0-3
-#   패스(경로추종): 코어5~6 = CPU 4-5 + nice 우선순위
+#   패스(경로추종): 코어4~6 = CPU 3-5 + nice 우선순위
+#
+# CPU 3 은 두 그룹이 공유한다. 패스 쪽이 CPU 4-5 만으로는 부족해서
+# (stanley+planner+AEB+obstacle+control+fgm 합이 코어 2개에 거의 꽉 찬다)
+# 한 코어를 더 빌려주는 것이다. 대신 CPU 3 에서는 두 그룹이 경합하므로,
+# 여기서는 nice 순서가 실제로 중요해진다. 음수 nice 가 적용되지 않으면
+# (sudo 없음) 공유 코어에서 cartographer 가 stanley 를 밀어낼 수 있다:
+#   한 번만: sudo bash scripts/install_cpu_policy_sudoers.sh
 #
 # 사용:
 #   sudo bash scripts/apply_cpu_policy.sh --once
@@ -115,7 +122,7 @@ apply_policy() {
     local cmd
     cmd=$(ps -p "${lp}" -o args= 2>/dev/null || true)
     echo "${cmd}" | grep -q 'ros2 run path_following control_node' && continue
-    apply_one "4-5" -15 "${lp}" "control"
+    apply_one "3-5" -15 "${lp}" "control"
   done < <(pids_matching 'path_following/lib/path_following/control_node|python[0-9.]* control_node\.py')
 
   # FGM enable 중이면 FGM을 패스 코어 1순위 (nice -20). 플래그: /tmp/f1tenth_fgm_boost
@@ -127,16 +134,16 @@ apply_policy() {
     esac
   fi
 
-  while read -r lp; do apply_one "4-5" -10 "${lp}" "stanley"; done < <(pids_matching 'stanley_waypoint_follow_node')
-  while read -r lp; do apply_one "4-5" -5 "${lp}" "planner"; done < <(pids_matching 'local_planner_node')
-  while read -r lp; do apply_one "4-5" 0 "${lp}" "obstacle"; done < <(pids_matching 'integrated_obstacle_node|static_obstacle_node')
+  while read -r lp; do apply_one "3-5" -10 "${lp}" "stanley"; done < <(pids_matching 'stanley_waypoint_follow_node')
+  while read -r lp; do apply_one "3-5" -5 "${lp}" "planner"; done < <(pids_matching 'local_planner_node')
+  while read -r lp; do apply_one "3-5" 0 "${lp}" "obstacle"; done < <(pids_matching 'integrated_obstacle_node|static_obstacle_node')
   local fgm_label="fgm"
   [[ "${fgm_boost}" -eq 1 ]] && fgm_label="fgm-boost"
   while read -r lp; do
-    apply_one "4-5" "${fgm_nice}" "${lp}" "${fgm_label}"
+    apply_one "3-5" "${fgm_nice}" "${lp}" "${fgm_label}"
   done < <(pids_matching 'fgm_node')
-  while read -r lp; do apply_one "4-5" 10 "${lp}" "path-launch"; done < <(pgrep -af 'ros2 launch path_following' | awk '/path_follow_/ {print $1}')
-  while read -r lp; do apply_one "4-5" 19 "${lp}" "viz"; done < <(pids_matching 'stack_status_node|drive_monitor')
+  while read -r lp; do apply_one "3-5" 10 "${lp}" "path-launch"; done < <(pgrep -af 'ros2 launch path_following' | awk '/path_follow_/ {print $1}')
+  while read -r lp; do apply_one "3-5" 19 "${lp}" "viz"; done < <(pids_matching 'stack_status_node|drive_monitor')
 }
 
 run_once() {

@@ -53,6 +53,14 @@ SCAN_MIN_M = 0.12
 SCAN_HZ = 20.0
 SCAN_NOISE_M = 0.01
 
+# ---------------------------------------------------------------- 맵
+# 시뮬 전체가 쓰는 단일 출처. render.py / check_map.py / run_scenario.py 가
+# 각자 문자열을 들고 있다가 맵이 지워지면 셋 다 따로 깨진다.
+# raceline.csv 는 이 맵에서 뽑은 것이라 둘은 반드시 같이 움직인다.
+MAP_YAML = (
+    "/home/nvidia/f1tenth_ajou/maps/cartographer_map_20260814_232850_rosmap.yaml"
+)
+
 
 @dataclass
 class Obstacle:
@@ -64,10 +72,74 @@ class Obstacle:
     vx: float = 0.0
     vy: float = 0.0
     name: str = "obs"
+    # t 초 뒤부터 decel [m/s^2] 로 감속해 정지. 앞차가 갑자기 서는 상황용.
+    brake_after_s: float = -1.0
+    brake_decel: float = 3.0
+
+    def __post_init__(self) -> None:
+        self._t = 0.0
 
     def step(self, dt: float) -> None:
+        self._t += dt
+        if self.brake_after_s >= 0.0 and self._t >= self.brake_after_s:
+            sp = math.hypot(self.vx, self.vy)
+            if sp > 1e-6:
+                new = max(0.0, sp - self.brake_decel * dt)
+                k = new / sp
+                self.vx *= k
+                self.vy *= k
         self.x += self.vx * dt
         self.y += self.vy * dt
+
+
+class PathObstacle(Obstacle):
+    """레이스라인을 따라 달리는 장애물 (앞차/역주행차).
+
+    Obstacle 의 등속 직진 모델은 곡선 트랙에서 몇 초 만에 코스를 벗어난다.
+    실제로 lead/oncoming 시나리오를 돌려 보면 장애물이 레이스라인에서
+    3~30m 떨어진 곳으로 날아가 버려서, 자차는 아무것도 안 만나고 완주한다.
+    "통과" 가 나오지만 아무것도 검증하지 않은 것이다. 앞차는 트랙을 따라
+    달려야 앞차다.
+    """
+
+    def __init__(self, path, s_index: int, speed: float, r: float = 0.20,
+                 name: str = "pathobs", reverse: bool = False,
+                 brake_after_s: float = -1.0, brake_decel: float = 3.0):
+        self._path = [(float(a), float(b)) for a, b in path]
+        self._i = int(s_index) % len(self._path)
+        self._speed = float(speed)
+        self._rev = bool(reverse)
+        x, y = self._path[self._i]
+        super().__init__(x, y, r, 0.0, 0.0, name,
+                         brake_after_s=brake_after_s, brake_decel=brake_decel)
+
+    def step(self, dt: float) -> None:
+        self._t += dt
+        if self.brake_after_s >= 0.0 and self._t >= self.brake_after_s:
+            self._speed = max(0.0, self._speed - self.brake_decel * dt)
+
+        n = len(self._path)
+        remain = self._speed * dt
+        while remain > 1e-9:
+            j = (self._i - 1) % n if self._rev else (self._i + 1) % n
+            ax, ay = self._path[self._i]
+            bx, by = self._path[j]
+            seg = math.hypot(bx - ax, by - ay)
+            if seg <= 1e-9:
+                self._i = j
+                continue
+            if remain < seg:
+                k = remain / seg
+                self.x = ax + (bx - ax) * k
+                self.y = ay + (by - ay) * k
+                # 진행 방향 속도 — 플래너의 상대속도 계산이 이걸 본다
+                self.vx = (bx - ax) / seg * self._speed
+                self.vy = (by - ay) / seg * self._speed
+                return
+            remain -= seg
+            self._i = j
+            self.x, self.y = bx, by
+        self.vx = self.vy = 0.0
 
 
 @dataclass
@@ -84,6 +156,24 @@ class SimResult:
     aeb_events: int = 0
     modes: dict = field(default_factory=dict)
     speed_trace: list = field(default_factory=list)
+    # 경로추종 오차. 회피 중에는 일부러 라인을 벗어나므로 GLOBAL 모드일 때만
+    # 모은 값을 따로 둔다 — 이게 "추종이 정상인가" 의 판정 대상이다.
+    cte_all: list = field(default_factory=list)
+    cte_global: list = field(default_factory=list)
+
+    def cte_stats(self, which: str = "global") -> dict:
+        import numpy as _np
+
+        a = _np.asarray(self.cte_global if which == "global" else self.cte_all)
+        if a.size == 0:
+            return {"n": 0, "mean": float("nan"), "p95": float("nan"),
+                    "max": float("nan")}
+        return {
+            "n": int(a.size),
+            "mean": float(a.mean()),
+            "p95": float(_np.percentile(a, 95)),
+            "max": float(a.max()),
+        }
 
 
 class GridMap:
@@ -142,7 +232,11 @@ class GridMap:
 class RayCaster:
     """맵 + 원형 장애물에 대한 벡터화 레이캐스트."""
 
-    def __init__(self, gmap: GridMap):
+    def __init__(self, gmap: GridMap, seed: int = 0):
+        # 시드를 고정한다. 예전엔 np.random 전역을 써서 매 실행 스캔 노이즈가
+        # 달라졌고, 같은 시나리오가 완주와 충돌 사이를 오갔다. 그러면 A/B 를
+        # 못 한다. 노이즈 민감도를 보고 싶으면 시드를 바꿔 여러 번 돌린다.
+        self._rng = np.random.default_rng(seed)
         self.m = gmap
         self.step = gmap.res * 0.5
         self.n_steps = int(SCAN_MAX_M / self.step)
@@ -179,16 +273,23 @@ class RayCaster:
             rng = np.minimum(rng, d)
 
         rng = np.where(np.isfinite(rng), rng, SCAN_MAX_M + 1.0)
-        rng += np.random.normal(0.0, SCAN_NOISE_M, rng.shape)
+        rng += self._rng.normal(0.0, SCAN_NOISE_M, rng.shape)
         return np.clip(rng, SCAN_MIN_M, SCAN_MAX_M + 1.0).astype(np.float32)
 
 
 class RaceSim(Node):
-    def __init__(self, gmap: GridMap, start_xy, start_yaw, obstacles=None):
+    def __init__(self, gmap: GridMap, start_xy, start_yaw, obstacles=None,
+                 ref_line=None, seed: int = 0):
         super().__init__("race_sim")
         self.m = gmap
-        self.rc = RayCaster(gmap)
+        self.rc = RayCaster(gmap, seed=seed)
         self.obstacles = list(obstacles or [])
+        # 추종오차 기준선 (x, y[, v]) 리스트. 없으면 CTE 를 안 잰다.
+        self._ref = (
+            np.asarray([[p[0], p[1]] for p in ref_line], dtype=np.float64)
+            if ref_line
+            else None
+        )
 
         self.x, self.y = start_xy
         self.yaw = start_yaw
@@ -331,6 +432,31 @@ class RaceSim(Node):
         if self.aeb and not self._aeb_prev:
             self.res.aeb_events += 1
         self._aeb_prev = self.aeb
+
+        if self._ref is not None:
+            e = self._cte()
+            self.res.cte_all.append(e)
+            # 회피/재합류 중 라인 이탈은 오차가 아니라 의도된 동작이다.
+            if self.mode in ("GLOBAL", "?"):
+                self.res.cte_global.append(e)
+
+    def _cte(self) -> float:
+        """레퍼런스 폐폴리라인까지 최단거리 [m] (세그먼트 투영)."""
+        p = self._ref
+        ax, ay = p[:, 0], p[:, 1]
+        bx, by = np.roll(ax, -1), np.roll(ay, -1)
+        abx, aby = bx - ax, by - ay
+        ab2 = abx * abx + aby * aby
+        t = np.divide(
+            (self.x - ax) * abx + (self.y - ay) * aby,
+            ab2,
+            out=np.zeros_like(ab2),
+            where=ab2 >= 1e-14,
+        )
+        np.clip(t, 0.0, 1.0, out=t)
+        dx = self.x - (ax + t * abx)
+        dy = self.y - (ay + t * aby)
+        return float(np.sqrt((dx * dx + dy * dy).min()))
 
     def check_collision(self) -> bool:
         """차량 외곽 코너로 벽/장애물 충돌 확인."""

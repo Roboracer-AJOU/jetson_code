@@ -5,9 +5,8 @@ import sys
 sys.path.insert(0, "/home/nvidia/f1tenth_ajou/sim")
 import numpy as np
 from PIL import Image, ImageDraw
+from race_sim import MAP_YAML as MAP
 from race_sim import GridMap
-
-MAP = "/home/nvidia/f1tenth_ajou/maps/cartographer_map_20260814_232850_rosmap.yaml"
 
 
 def render(trace=None, obstacles=None, out="/tmp/sim_view.png", scale=6, line="raceline"):  # noqa: E501

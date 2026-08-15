@@ -3,9 +3,9 @@ import sys
 
 sys.path.insert(0, "/home/nvidia/f1tenth_ajou/sim")
 import numpy as np
+from race_sim import MAP_YAML as MAP
 from race_sim import GridMap
 
-MAP = "/home/nvidia/f1tenth_ajou/maps/cartographer_map_20260814_232850_rosmap.yaml"
 m = GridMap(MAP)
 print(f"map {m.w}x{m.h} res={m.res} origin=({m.ox:.2f},{m.oy:.2f})")
 print(f"  free={m.free.sum()}px wall={m.wall.sum()}px unknown={(~m.free & ~m.wall).sum()}px")
