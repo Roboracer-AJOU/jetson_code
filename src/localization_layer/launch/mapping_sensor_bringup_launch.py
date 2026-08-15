@@ -173,10 +173,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'angle_offset',
             default_value='3.141592653589793',
-            description='LiDAR scan angle offset (rad)',
+            description='LiDAR 드라이버 레벨 스캔 각도 오프셋(rad). 원본 커밋값(π)으로 복원됨. '
+                        'sensor_static_tf.cpp의 lidar_yaw(TF 레벨)와는 다른 레이어이니 같이 확인할 것',
         ),
         DeclareLaunchArgument('scan_mode', default_value='Sensitivity'),
-        DeclareLaunchArgument('scan_frequency', default_value='40.0'),
+        DeclareLaunchArgument('scan_frequency', default_value='20.0'),
         DeclareLaunchArgument('ebimu_port', default_value='/dev/ttyUSB0'),
         DeclareLaunchArgument('ebimu_baud', default_value='115200'),
         DeclareLaunchArgument('use_ebimu', default_value='true'),

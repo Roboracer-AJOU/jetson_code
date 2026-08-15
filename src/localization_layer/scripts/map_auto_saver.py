@@ -12,6 +12,19 @@ from cartographer_ros_msgs.srv import TrajectoryQuery, WriteState
 from PIL import Image
 from rclpy.node import Node
 
+# ROS 맵 규약에서 unknown 픽셀은 205 다. 그 점유도는
+#   1 - 205/255 = 0.196078
+# 이라서 free_thresh 는 이 값보다 **작아야** unknown 이 free 로 안 넘어온다.
+# ROS 기본값 0.196 은 우연이 아니라 딱 이 목적으로 정해진 값이다.
+#
+# 그런데 map_saver_cli 와 cartographer_pbstream_to_ros_map 은 0.25 를 써 놓는다.
+# 그러면 미탐색 영역(맵 대부분)이 전부 주행 가능으로 분류된다. 실제로
+# 332x494 맵에서 free 가 98.1% 로 잡혀 중앙선 추출이 폐루프를 못 찾았다 —
+# 트랙 밖으로 도로가 새어 나가 인필드 섬이 섬이 아니게 되기 때문이다.
+#
+# 두 툴 다 이 값을 인자로 받지 않으므로 내보낸 뒤 YAML 을 고친다.
+MAP_FREE_THRESH = 0.196
+
 
 class MapAutoSaver(Node):
     def __init__(self):
@@ -147,6 +160,54 @@ class MapAutoSaver(Node):
             yaml.safe_dump(data, f, sort_keys=False)
         self.get_logger().info(f'Saved mapping origin -> {origin_path}')
 
+    def _fix_map_yaml_free_thresh(self, yaml_path: str) -> None:
+        """내보낸 맵 YAML 의 free_thresh 를 ROS 규약값으로 되돌린다."""
+        name = os.path.basename(yaml_path)
+        if not os.path.exists(yaml_path):
+            # 내보내기 자체가 실패한 경우다. 그건 호출부가 이미 보고한다.
+            return
+
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                meta = yaml.safe_load(f) or {}
+        except Exception as exc:
+            self.get_logger().warn(f'맵 YAML 을 읽지 못해 free_thresh 보정 생략: {exc}')
+            return
+
+        old = meta.get('free_thresh')
+        if old is not None and abs(float(old) - MAP_FREE_THRESH) < 1e-9:
+            self.get_logger().info(f'맵 YAML free_thresh 이미 {MAP_FREE_THRESH} {name}')
+            return
+
+        meta['free_thresh'] = MAP_FREE_THRESH
+        try:
+            with open(yaml_path, 'w', encoding='utf-8') as f:
+                yaml.safe_dump(meta, f, sort_keys=False, default_flow_style=None)
+        except Exception as exc:
+            self.get_logger().warn(f'맵 YAML free_thresh 보정 실패: {exc}')
+            return
+
+        # 되읽어 확인한다. 여기서 어긋나면 다른 프로세스가 덮어쓴 것이므로
+        # 조용히 넘기면 안 된다. 이걸 놓쳐서 0.25 맵이 계속 저장됐다.
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                got = (yaml.safe_load(f) or {}).get('free_thresh')
+        except Exception as exc:
+            self.get_logger().warn(f'맵 YAML free_thresh 재확인 실패: {exc}')
+            return
+
+        if got is None or abs(float(got) - MAP_FREE_THRESH) >= 1e-9:
+            self.get_logger().error(
+                f'맵 YAML free_thresh 보정이 유지되지 않았다 (={got}). '
+                f'다른 프로세스가 덮어쓰는지 확인 필요: {name}'
+            )
+            return
+
+        self.get_logger().info(
+            f'맵 YAML free_thresh {old} -> {MAP_FREE_THRESH} '
+            f'(unknown 을 free 로 세지 않게) {name}'
+        )
+
     def _save_ros_map(self, map_filestem: str, reason: str, timeout_sec: float) -> bool:
         if timeout_sec <= 0.0:
             return True
@@ -179,6 +240,11 @@ class MapAutoSaver(Node):
         except Exception as exc:
             self.get_logger().error(f'Failed to run map_saver_cli: {exc}')
             return False
+
+        # 보정은 종료코드와 무관하게 시도한다. map_saver_cli 는 파일을 다 써
+        # 놓고도 1 을 반환하는 경우가 있어, 성공 코드에만 걸어 두면 0.25 인
+        # YAML 이 그대로 남는다.
+        self._fix_map_yaml_free_thresh(f'{map_filestem}.yaml')
 
         if completed.returncode == 0:
             self.get_logger().info('ROS map export succeeded.')
@@ -258,6 +324,7 @@ class MapAutoSaver(Node):
                 self.get_logger().error(f'Failed to convert fallback map to png: {exc}')
                 return False
 
+        self._fix_map_yaml_free_thresh(f'{out_filestem}.yaml')
         self.get_logger().info('Fallback ROS map export from pbstream succeeded.')
         return True
 

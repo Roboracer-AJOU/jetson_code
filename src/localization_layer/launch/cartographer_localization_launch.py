@@ -91,9 +91,12 @@ def _launch_setup(context, *args, **kwargs):
 def generate_launch_description():
     ensure_policy_script_executable()
     maps_dir = '/home/nvidia/f1tenth_ajou/maps'
+    # path_following 의 raceline.csv / centerline.csv 와 static/integrated
+    # obstacle_node 의 map_name 이 모두 이 맵 기준이다. 맵을 바꾸려면 네 곳을
+    # 같이 바꿔야 한다 (여기 + 장애물 노드 2개 + CSV 재생성).
     default_pbstream = os.path.join(
         maps_dir,
-        'cartographer_map_20260814_232850.pbstream',
+        'cartographer_map_20260816_004549.pbstream',
     )
 
     return LaunchDescription([

@@ -142,6 +142,9 @@ CFG = {
     "rejoin_finish_require_heading": False,
     "rejoin_finish_heading_deg": 15.0,
     "avoid_skip_rejoin_if_cte_ok": False,
+    # CTE 가 줄기를 기다리며 AVOID 를 붙드는 시간 상한. 차가 서 있으면 CTE 는
+    # 절대 줄지 않아서, 상한이 없으면 장애물이 하나도 없는데 AVOID 에 갇힌다.
+    "rejoin_wait_max_sec": 1.5,
     "rejoin_speed_scale": 0.7,  # 이전 기본값 0.5 (avoid_speed_enable=False 일 때만 쓰임)
     # ---- 회피 경로 충돌검사 ----
     # 회피 경로는 FGM 목표점 너머로 avoid_forward_num_points 만큼 직선 연장된다.
@@ -410,6 +413,9 @@ class LocalPlannerNode(Node):
         )
         self.avoid_skip_rejoin_if_cte_ok = param_bool(
             self.get_parameter("avoid_skip_rejoin_if_cte_ok").value
+        )
+        self.rejoin_wait_max_ns = int(
+            max(0.0, float(self.get_parameter("rejoin_wait_max_sec").value)) * 1e9
         )
         self.rejoin_speed_scale = max(
             0.05, float(self.get_parameter("rejoin_speed_scale").value)
@@ -2244,18 +2250,28 @@ class LocalPlannerNode(Node):
                 not obstacle_still_ahead
                 and self._avoid_off_count >= self.avoid_off_count_th
             ):
+                # pose 가 없으면 rejoin 경로를 만들 수도, CTE 를 잴 수도 없다.
+                # 그 상태로 기다리면 영구히 못 나온다.
+                can_rejoin = self.rejoin_enable and current_pose is not None
                 cte_ok = (
                     current_pose is not None
                     and self._csv_cte_abs_m(current_pose)
                     <= self.rejoin_finish_lateral_m
                 )
+                # 기다림에는 상한이 있어야 한다. 차가 서 있으면 CTE 는 절대
+                # 줄지 않아서, 상한이 없으면 장애물이 하나도 없는데 AVOID 에
+                # 갇힌 채 fgm_enable 이 계속 True 로 나간다.
+                wait_frames = int(self.rejoin_wait_max_ns * self.publish_hz / 1e9)
+                waited_out = (
+                    self._avoid_off_count >= self.avoid_off_count_th + wait_frames
+                )
                 # rejoin 을 쓸 때만 CTE 가 줄 때까지 AVOID 를 붙든다. rejoin 이
                 # 꺼져 있으면 이미 override 를 내려 Stanley 가 CSV 로 복귀하는
                 # 중이라, mode 만 AVOID 로 남겨두면 AEB 완화와 속도 캡이
                 # 이유 없이 길어진다.
-                if not cte_ok and self.rejoin_enable:
+                if can_rejoin and not cte_ok and not waited_out:
                     pass
-                elif current_pose is not None and self.rejoin_enable:
+                elif can_rejoin:
                     self._rejoin_path_msg = self._build_frenet_quintic_rejoin_path(
                         current_pose
                     )

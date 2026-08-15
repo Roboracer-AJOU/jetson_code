@@ -12,6 +12,11 @@ ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765
 ros2 launch path_following path_follow_static_dynamic_avoid_launch.py
 
 
+source /opt/ros/humble/setup.bash
+source /home/nvidia/f1tenth_ajou/install/setup.bash
+
+ros2 run path_following control_node
+
 
 
 # localization_layer 수정 기록
@@ -503,3 +508,193 @@ POSE_GRAPH.max_num_final_iterations = 4
 2. 한 번에 하나씩만 바꾸고, 최소 여러 번 반복 주행 테스트 후 결론 낼 것
 3. 바꾼 이유와 결과를 반드시 이 파일에 새 "수정 N" 항목으로 남길 것
 4. 이 조합으로 안 되면, 최소한 **되돌아올 수 있는 값이 바로 이 섹션**이라는 걸 기억할 것
+
+---
+
+## 수정 11 — 2026-08-15 (라이다 TF 회전값 + 맵핑 Hz)
+
+**배경**: Foxglove에서 맵핑 중 constraint 시각화(무지개색 삼각형들)가 라이다 벽
+스캔이랑 안 맞고 어긋나 보이는 문제. "라이다 앵글 오프셋을 예전엔 π로 뒀다가
+0으로 바꿨던 것 같다"는 제보 + 실측 화면에서 좌우 반전으로 보임.
+
+**수정 1) `src/tf_manager_cpp/src/sensor_static_tf.cpp`** — `publish_lidar_tf()`가
+`base_link → laser` 회전을 **항상 0(회전 없음)으로 하드코딩**하고 있었음
+(바로 아래 `publish_imu_tf()`는 `imu_roll/pitch/yaw` 파라미터로 조정 가능한데
+라이다만 이 보정이 빠져 있었음). IMU와 동일한 패턴으로
+**`lidar_roll`/`lidar_pitch`/`lidar_yaw` 파라미터 추가, `lidar_yaw` 기본값 π(180°)**
+로 설정.
+
+```cpp
+// 변경 전: rotation.x/y/z=0, w=1 고정
+// 변경 후:
+const double roll = declare_parameter("lidar_roll", 0.0);
+const double pitch = declare_parameter("lidar_pitch", 0.0);
+const double yaw = declare_parameter("lidar_yaw", M_PI);
+tf2::Quaternion q; q.setRPY(roll, pitch, yaw);
+```
+
+**⚠️ 미해결 — 좌우 반전(mirror)과 회전(rotation)은 다른 문제임**: 실측 화면이
+"좌우 반전"으로 보인다면, 방금 넣은 `lidar_yaw`(회전)로는 근본적으로 못 고침
+(회전은 손잡이 방향을 안 바꾸지만 거울상은 바꿈). 진짜 좌우 반전이면
+`src/localization_layer/launch/mapping_sensor_bringup_launch.py:171`의
+**`inverted` 파라미터(현재 기본값 `false`)를 `true`로 바꿔야 할 가능성이 높음.**
+또한 같은 파일 173~176번째 줄에 별도로 **`angle_offset`**(기본 0, 설명:
+"pi면 좌우 거울이 됨, 드라이버가 이미 pi-theta 보정함")이라는 파라미터가
+있는데 이건 `lidar_yaw`(TF)와 다른 레이어(드라이버 자체 각도 보정)라서, 실측
+테스트할 땐 이 값도 같이 확인 필요. **다음 실측 시 확인할 것: `inverted`,
+`angle_offset`, `lidar_yaw` 세 가지를 하나씩만 바꿔가며 어느 게 실제 원인인지
+구분.**
+
+**수정 2) 맵핑 LiDAR Hz — 40 유지 (20 테스트 후 되돌림)**: 맵핑 중
+`range_data_collator.cc:82 Dropped N earlier points` 경고가 대량(수백 개
+단위)으로 발생 + `Remaining work items in queue: 1076`까지 확인 → CPU 과부하
+의심되어 40→20Hz로 테스트 시도. 그러나 `cartographer_mapping_launch.py`의
+기존 주석에 **"20Hz는 회전 중 한 스캔이 더 오래 걸려서 코너가 휘어 보이는
+문제 때문에 40으로 올렸었다"**는 기록이 있어, **최종적으로 40Hz로 재복귀
+결정** (`mapping_sensor_bringup_launch.py:179`, `cartographer_mapping_launch.py:379`
+둘 다 `default_value='40.0'`).
+
+**즉 CPU 과부하(Dropped points)와 코너 스캔 왜곡, 두 문제가 Hz를 반대 방향으로
+당기고 있는 상태.** 아직 근본 해결 안 됨 — 다음 후보:
+- 맵핑용 lua(`cartographer_2d_mapping_imu_lidar_no_odom.lua`)의 탐색범위/스레드
+  수는 원래도 좁고 낮아서(0.16/8°, 3스레드) 40Hz에서 왜 이렇게 밀리는지 재확인 필요
+  (로컬라이제이션 lua와 달리 이 파일 자체는 안 건드림)
+- 또는 Dropped points가 실제 맵 품질에 얼마나 영향 주는지 실측으로 확인 후,
+  "버텨지는 정도면 그냥 40 유지"로 갈 수도 있음
+
+**확인 필요**: 다음 맵핑 세션에서 (1) 라이다 방향(좌우반전 여부, `inverted`/
+`angle_offset`/`lidar_yaw` 조합), (2) 40Hz에서의 Dropped points 빈도와 실제
+맵 품질 영향, 둘 다 재확인.
+
+**빌드**:
+```bash
+cd ~/f1tenth_ajou
+colcon build --packages-select tf_manager_cpp localization_layer
+source install/setup.bash
+```
+
+**되돌리는 법**:
+```bash
+git diff HEAD -- src/tf_manager_cpp/src/sensor_static_tf.cpp \
+  src/localization_layer/launch/mapping_sensor_bringup_launch.py \
+  src/localization_layer/launch/cartographer_mapping_launch.py
+```
+
+## 수정 12 — 2026-08-15 (좌우반전 원인 재조사 → IMU 축 하드웨어 결함으로 결론)
+
+**배경**: 수정11에서 남겨둔 "좌우반전 미해결" 이슈를 실측으로 계속 추적.
+
+**1) `inverted` 인자 이름 버그 발견 + 수정**: `cartographer_mapping_launch.py`
+최상위에서 `inverted:=true`로 넘겨도 실제론 무시되고 있었음 — 이 launch 파일이
+선언하는 인자 이름은 `inverted`가 아니라 **`lidar_inverted`**
+(`cartographer_mapping_launch.py:363`, 내부적으로
+`mapping_sensor_bringup_launch.py`의 `inverted`로 전달). `lidar_inverted:=true`로
+정정 후 `ros2 param get /sllidar_node inverted` → `True` 확인. **근데 이렇게
+정확히 켜도 좌우반전은 그대로** — 라이다 드라이버 쪽은 원인이 아닌 걸로 결론.
+
+**2) 중복 프로세스 / Hz 불일치 가설 기각**: `ps aux | grep sllidar_node` 확인 결과
+프로세스 1개만 존재 (respawn 중복 아님). `ros2 topic hz /scan` 실측 결과
+평균 39.8Hz로 설정값(40Hz)과 일치 — 로그에 찍히던 `scan rate: ~398Hz`는
+Cartographer 내부 스캔 서브디비전 처리 빈도였을 뿐 실제 토픽 속도 아님
+(정상 동작, 에러 아님).
+
+**3) 진짜 원인 — IMU 하드웨어 결함**: 사용자 확인 결과, 최근 물리적으로 위치가
+바뀐 건 라이다가 아니라 **IMU**였고, "하드웨어 오류로 X축이 원래 의도(오른쪽)와
+반대로 왼쪽을 향하고 있다"는 사실이 새로 확인됨. `src/ebimu_pkg/ebimu_pkg/ebimu_driver.py:14-16`의
+축 변환 가정("칩 +X 오른쪽, +Y 뒤, +Z 아래")이 실제 하드웨어와 어긋난 상태.
+Y/Z는 정상, X만 반전된 상태라 이건 회전이 아니라 **진짜 거울반사(determinant -1)**
+이고, 이게 자이로 yaw 부호까지 반전시켜서 SLAM 궤적 추정이 반대로 돌고
+그 결과 맵이 거울처럼 보였던 것으로 결론.
+
+**⚠️ 미적용 — 다음에 할 것**: `src/ebimu_pkg/ebimu_pkg/ebimu_driver.py:25-26`의
+```python
+def _chip_vec_to_ros(x, y, z):
+    return (-y, -x, -z)   # 현재
+```
+를
+```python
+def _chip_vec_to_ros(x, y, z):
+    return (-y, x, -z)    # X만 부호 반전 (하드웨어 결함 반영)
+```
+로 고쳐야 함 (accel/gyro 공용 함수). **아직 코드 수정 안 함** — 다음 세션에서
+적용 후 반드시 라이브 테스트로 검증할 것: `ros2 run ebimu_pkg ebimu_driver ...`
+켜고 `ros2 topic echo /imu/data --field angular_velocity.z` 보면서 차 앞부분을
+왼쪽으로 돌렸을 때 양수 나오는지 확인. 또한 `_ROS_FROM_CHIP_Q`(orientation
+쿼터니언, 17~22번째 줄)도 같은 결함을 반영해서 같이 고쳐야 하는지 재검토 필요
+(현재는 벡터 변환 함수만 분석함, 쿼터니언 쪽은 미검토).
+
+**4) 맵핑 Hz 40 → 20 재복귀**: 40Hz에서 `range_data_collator.cc:82 Dropped N
+earlier points`와 `sensor_bridge.cpp:211 Ignored subdivision...` 경고가 계속
+반복 발생 확인 (`/scan` 메시지 도착 간격이 20~50ms로 들쭉날쭉해서 Cartographer의
+스캔 서브디비전 타임스탬프 보간이 깨지는 것으로 추정, 근본 원인 미해결 —
+IMU 버스트 타이밍 문제와 같은 계열로 의심됨). 수정11에서 "코너 왜곡 때문에
+40 유지" 결정했었지만, 사용자 지시로 **20Hz로 재복귀**
+(`cartographer_mapping_launch.py:379`, `mapping_sensor_bringup_launch.py:179`
+둘 다 `default_value='20.0'`). 코너 스캔 왜곡 재발 여부 다음 맵핑 세션에서 확인 필요.
+
+**빌드**: 둘 다 심볼릭 링크 설치라 빌드 불필요 (launch 파일 Python, 저장 즉시 반영).
+`ebimu_driver.py` 수정 적용 시에도 마찬가지로 빌드 불필요 (ament_python 심볼릭 링크).
+
+**되돌리는 법**:
+```bash
+git diff HEAD -- src/localization_layer/launch/cartographer_mapping_launch.py \
+  src/localization_layer/launch/mapping_sensor_bringup_launch.py \
+  src/ebimu_pkg/ebimu_pkg/ebimu_driver.py
+```
+
+## 수정 13 — 2026-08-15 (`lidar_yaw` 기본값 π → 0 되돌림)
+
+**배경**: 수정11에서 넣은 `lidar_yaw=π`가 실제 라이다 실측이 아니라, 수정12에서
+찾아낸 IMU 축 결함(아직 미수정)과 뒤섞인 진단에서 나온 값일 수 있다는 게
+밝혀짐 — 검증 안 된 값이라 판단, 사용자 지시로 0(회전 없음)으로 되돌림.
+
+**수정**: `src/tf_manager_cpp/src/sensor_static_tf.cpp` — `publish_lidar_tf()`의
+`declare_parameter("lidar_yaw", M_PI)` → `declare_parameter("lidar_yaw", 0.0)`.
+컴파일 패키지라 `colcon build --packages-select tf_manager_cpp` 완료함.
+
+**⚠️ 중요 — 맵 일관성 깨짐**: 22:38(π 빌드) ~ 이 수정 사이에 만들어진 맵
+(`20260815_224047`~`224547` 등)은 라이다가 π로 회전된 좌표계 기준으로
+저장됨. 이 맵들에 지금(yaw=0) 상태로 로컬라이제이션 걸면 스캔이 180도
+어긋나서 매칭 실패 가능성 높음 — **재사용하려면 반드시 새로 맵핑부터
+다시 떠야 함.**
+
+**확인 필요**: 다음 맵핑 세션에서 yaw=0이 실제로 맞는지 Foxglove로 재검증.
+IMU 축 버그(수정12, `ebimu_driver.py` 미적용)를 먼저 고치고 나서 판단하는 게
+정확함 — 순서 바뀌면 또 원인 구분 안 됨.
+
+**되돌리는 법**:
+```bash
+git diff HEAD -- src/tf_manager_cpp/src/sensor_static_tf.cpp
+# 원상복구(π로) 하려면 M_PI로 다시 바꾸고:
+cd ~/f1tenth_ajou && colcon build --packages-select tf_manager_cpp && source install/setup.bash
+```
+
+## 수정 14 — 2026-08-16 (`angle_offset` 원본값 π로 복원)
+
+**배경**: 원본 커밋(`7768a99`) 대비 uncommitted 상태로 `angle_offset` 기본값이
+`π`에서 `0.0`으로 바뀌어 있던 게 git diff로 확인됨 — 누가/언제 바꿨는지는
+특정 안 됨(이번 세션에서 Claude가 바꾼 게 아님, 대화 시작 전부터 이미 이 상태).
+사용자 지시로 원본값(π)으로 복원.
+
+**수정**: 두 파일 모두 `angle_offset` 기본값 `0.0` → `3.141592653589793`(π)로
+복원, description도 "pi면 좌우 거울"이라는 경고 문구(0이 기본이던 시절 문구,
+지금 값이랑 모순됨) 대신 사실 기술로 정리:
+- `src/localization_layer/launch/mapping_sensor_bringup_launch.py:173-178`
+- `src/sensor_layer/launch/sensor_layer_launch.py:59`
+
+둘 다 Python launch 파일(심볼릭 링크 설치)이라 빌드 불필요, 저장 즉시 반영.
+
+**참고**: `sllidar_ros2/launch/sllidar_t1_launch.py:23`에도 `angle_offset`
+기본값 `0.0`이 있으나 이건 git 원본과 동일(아무도 안 건드림) + 실제 launch
+체인에서 안 쓰이는 벤더 예제 파일로 확인됨 — 그대로 둠.
+
+**⚠️ 미해결**: 이 값(드라이버 레벨 각도 보정)과 `sensor_static_tf.cpp`의
+`lidar_yaw`(TF 레벨 회전, 수정13에서 0으로 되돌림)는 서로 다른 레이어라 각각
+독립적으로 맞는지 확인 필요 — 아직 "이 조합으로 맵/스캔이 정확히 정렬되는지"
+실측 검증 안 됨.
+
+**되돌리는 법**:
+```bash
+git diff HEAD -- src/localization_layer/launch/mapping_sensor_bringup_launch.py \
+  src/sensor_layer/launch/sensor_layer_launch.py
+```

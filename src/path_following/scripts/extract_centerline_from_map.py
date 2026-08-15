@@ -73,9 +73,13 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _WS_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
 _DEFAULT_MAP_DIR = os.path.join(_WS_ROOT, "maps")
 
+# ROS 맵 규약의 unknown 픽셀값 205 에 해당하는 점유도 = 1 - 205/255.
+# free_thresh 가 이 값 이상이면 unknown 이 free 로 넘어온다.
+UNKNOWN_OCC = 1.0 - 205.0 / 255.0
+
 CFG = {
     # maps/ 아래 yaml 파일명만 (절대경로 넣어도 됨)
-    "map_name": "cartographer_map_20260814_232850_rosmap.yaml",
+    "map_name": "cartographer_map_20260816_004549.yaml",
     "map_dir": _DEFAULT_MAP_DIR,
     "out_csv": os.path.join(_SCRIPT_DIR, "..", "config", "centerline.csv"),
 }
@@ -139,6 +143,16 @@ def load_map(yaml_path: str, invert_free: bool = False):
     origin = meta.get("origin", [0.0, 0.0, 0.0])
     origin_x, origin_y = float(origin[0]), float(origin[1])
     free_thresh = float(meta.get("free_thresh", 0.196))
+    # unknown 픽셀(205)의 점유도가 정확히 1 - 205/255 = 0.196 이라, 임계가 이보다
+    # 크면 미탐색 영역이 전부 도로로 잡힌다. 그러면 트랙 밖으로 도로가 새어
+    # 나가 인필드 섬이 사라지고 폐루프를 못 찾는다. map_saver_cli 가 0.25 를
+    # 써 놓는 일이 있어서 여기서 막는다.
+    if free_thresh > UNKNOWN_OCC + 1e-9:
+        print(
+            f"  WARNING: free_thresh={free_thresh} 는 unknown(205) 을 도로로 셉니다. "
+            f"{UNKNOWN_OCC} 로 낮춰서 진행합니다 (맵 YAML 을 고치는 게 좋습니다)."
+        )
+        free_thresh = UNKNOWN_OCC
 
     occ = gray / 255.0 if int(meta.get("negate", 0)) else (255.0 - gray) / 255.0
     free = occ < free_thresh

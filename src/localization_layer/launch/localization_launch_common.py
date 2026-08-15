@@ -64,7 +64,7 @@ def sensor_launch_arguments() -> list:
         DeclareLaunchArgument(
             'lidar_inverted',
             default_value='false',
-            description='LiDAR inverted flag',
+            description='LiDAR inverted flag. 라이다를 뒤집어서 달았을 때만 true',
         ),
         DeclareLaunchArgument(
             'lidar_angle_compensate',
@@ -275,6 +275,8 @@ def build_localization_cartographer_nodes(context):
                 'imu_topic': imu_topic_str,
                 # gz/gy 중 어느 축이 실제 yaw인지 실측 확인 후 필요하면 'y'로 변경.
                 'imu_yaw_axis': 'z',
+                # /imu/data 는 ROS 축(+Z 위). 왼쪽 회전이 +yaw.
+                'imu_yaw_sign': 1.0,
                 # 모터/VESC 근처 지자기 간섭으로 EBIMU orientation 자체가 정지 중에도
                 # 계속 도는 게 실측 확인됨(fused였을 때 odom이 제자리에서 계속 회전) →
                 # 지자기 보정 경로를 끄고 순수 자이로 적분만 사용.

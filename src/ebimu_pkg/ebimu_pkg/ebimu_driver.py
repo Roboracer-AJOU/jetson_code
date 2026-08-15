@@ -2,8 +2,8 @@ import glob
 import math
 
 import rclpy
-from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time
 import serial
 
 from sensor_msgs.msg import Imu
@@ -11,13 +11,62 @@ from std_msgs.msg import Header
 
 STANDARD_GRAVITY = 9.80665
 
+# 칩 축(뒤에서 앞): +X 왼쪽, +Y 앞, +Z 아래.
+#
+# 원래 의도는 +X 오른쪽 / +Y 뒤 / +Z 아래였다. 그런데 IMU 를 물리적으로 다시
+# 달면서 수평면에서 180° 돌아간 상태가 됐다 (+X 가 왼쪽으로). Z 는 그대로
+# 아래다 — 정지 상태 가속도 실측 (-0.007, -0.052, -0.989) g 에서 az ≈ -1 g 이
+# 나오는 건 +Z 가 중력 방향(아래)일 때뿐이다. 오른손계를 유지하려면
+# Y = Z × X = 아래 × 왼쪽 = 앞 이므로, 결국 Z축 기준 180° 회전이다.
+#
+# 이걸 반영하지 않으면 yaw 가 정확히 180° 뒤집힌 값으로 나간다 (실측:
+# 같은 자세에서 128.27° vs -51.73°). Cartographer 가 그걸 그대로 믿으므로
+# 맵이 뒤집히고 /scan 이 occupancy grid 에 안 붙는다.
+#
+# ROS imu_link: +X 앞, +Y 왼쪽, +Z 위.
+# v_ros = M v_chip, M = M^{-1} (180° 회전이라 스스로가 역행렬)
+_ROS_FROM_CHIP_Q = (
+    math.sqrt(0.5),  # x
+    math.sqrt(0.5),  # y   ← 예전 값 -sqrt(0.5) (+X 오른쪽 가정)
+    0.0,  # z
+    0.0,  # w
+)
+
+
+def _chip_vec_to_ros(x: float, y: float, z: float) -> tuple[float, float, float]:
+    # 앞 = +Y_chip, 왼쪽 = +X_chip, 위 = -Z_chip.  예전: (-y, -x, -z)
+    return (y, x, -z)
+
+
+def _quat_mul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
 
 def gravity_from_orientation(roll_deg: float, pitch_deg: float) -> tuple[float, float, float]:
+    """orientation-only 스트림용 중력 벡터 (칩 축, 비력 규약).
+
+    가속도계는 비력(specific force)을 재므로 정지 시 -g 를 읽는다.
+    칩 자세 R(roll, pitch, yaw) 에 대해
+
+        a_chip = Rᵀ (0, 0, +g) = g·(−sin p, cos p·sin r, cos p·cos r)
+
+    az 부호가 반대로 들어가 있었다. 실측(정지)이 az ≈ −0.99 g 인데 예전 식은
+    +0.99 g 를 내고, 그게 _chip_vec_to_ros 를 통과하면서 ROS 에서 −1 g 가 됐다
+    — 정지 상태에서 위쪽으로 1 g 가 아니라 아래쪽으로 1 g 를 보고하는 셈이다.
+    9필드 스트림에서는 이 함수가 안 쓰이므로 지금까지 드러나지 않았다.
+    """
     roll = math.radians(roll_deg)
     pitch = math.radians(pitch_deg)
     ax = -math.sin(pitch) * STANDARD_GRAVITY
     ay = math.sin(roll) * math.cos(pitch) * STANDARD_GRAVITY
-    az = -math.cos(roll) * math.cos(pitch) * STANDARD_GRAVITY
+    az = math.cos(roll) * math.cos(pitch) * STANDARD_GRAVITY  # 예전: 부호 반대
     return ax, ay, az
 
 
@@ -48,11 +97,19 @@ class EbimuDriver(Node):
         # EBIMU 실측 평균 주기(초). 한 타이머 틱에 프레임이 여러 개 몰려 들어왔을 때
         # 각 프레임에 이 간격만큼 역산한 timestamp를 매겨 burst를 보정하는 데 씀.
         self.declare_parameter("imu_sample_period_s", 0.01)
+        # Cartographer tracking_frame Z는 위여야 함. 칩 Z가 아래라 그대로 내면
+        # 맵이 기존 맵 대비 뒤집히고 /scan 이 occupancy grid에 안 붙음.
+        self.declare_parameter("publish_ros_axes", True)
 
         requested_port = self.get_parameter("port").value
         baud = self.get_parameter("baud").value
         self.accel_in_g = bool(self.get_parameter("accel_in_g").value)
         self.nominal_period_s = float(self.get_parameter("imu_sample_period_s").value)
+        # 마지막으로 발행한 stamp. 배치 역산이 이 값보다 과거로 내려가지 않게
+        # 붙잡는 데 쓴다. Cartographer 의 imu_tracker 는 IMU stamp 가 한 번만
+        # 뒤로 가도 CHECK 실패로 즉시 abort 한다.
+        self._last_stamp_ns: int | None = None
+        self.publish_ros_axes = bool(self.get_parameter("publish_ros_axes").value)
         port = self.resolve_port(requested_port)
         self.seen_full_imu_frame = False
         self.serial_buffer = ""
@@ -72,7 +129,14 @@ class EbimuDriver(Node):
         self.imu_pub = self.create_publisher(Imu, "/imu/data", 10)
         self.timer = self.create_timer(0.01, self.read_serial)
 
-        self.get_logger().info(f"EBIMU Driver Started on {port} @ {baud} baud")
+        axes = (
+            "ROS(+X fwd, +Y left, +Z up)"
+            if self.publish_ros_axes
+            else "chip(+X left, +Y fwd, +Z down)"
+        )
+        self.get_logger().info(
+            f"EBIMU Driver Started on {port} @ {baud} baud, imu_link axes={axes}"
+        )
 
     def resolve_port(self, requested_port: str) -> str:
         if requested_port and requested_port != "auto":
@@ -178,15 +242,28 @@ class EbimuDriver(Node):
 
         프레임을 버리지 않고, 가장 오래된 프레임일수록 과거 시각을,
         가장 최신 프레임은 지금 시각을 갖도록 역산한다.
+
+        단, 역산한 시각이 직전에 발행한 시각보다 과거면 안 된다. 배치 안에서는
+        증가해도 배치 사이에서는 뒤로 갈 수 있기 때문이다. 틱 A 에 1 프레임이
+        오면 now_A 가 찍히고, 곧이어 틱 B 에 3 프레임이 오면 now_B - 2주기부터
+        찍히는데, 두 틱 간격이 2주기보다 짧으면 그 값이 now_A 보다 과거다.
+        Cartographer 는 이걸 만나면 imu_tracker.cc CHECK 로 죽는다.
         """
         if not frames:
             return
 
-        now = self.get_clock().now()
+        now_ns = self.get_clock().now().nanoseconds
+        period_ns = max(1, int(self.nominal_period_s * 1e9))
+        # 역행을 막으려 시각을 앞으로 밀 때의 최소 간격. 주기보다 훨씬 작게
+        # 둬서, 밀린 만큼은 다음 배치에서 자연히 흡수되게 한다.
+        step_ns = max(1, period_ns // 10)
         n = len(frames)
         for i, frame in enumerate(frames):
-            offset = Duration(seconds=self.nominal_period_s * (n - 1 - i))
-            self.process_frame(frame, stamp=now - offset)
+            stamp_ns = now_ns - (n - 1 - i) * period_ns
+            if self._last_stamp_ns is not None and stamp_ns <= self._last_stamp_ns:
+                stamp_ns = self._last_stamp_ns + step_ns
+            self._last_stamp_ns = stamp_ns
+            self.process_frame(frame, stamp=Time(nanoseconds=stamp_ns))
 
     def process_frame(self, frame: str, stamp=None):
         cleaned_line = frame.strip()
@@ -250,6 +327,8 @@ class EbimuDriver(Node):
             math.radians(pitch),
             math.radians(yaw),
         )
+        if self.publish_ros_axes:
+            q = _quat_mul(q, _ROS_FROM_CHIP_Q)
 
         imu_msg.orientation.x = q[0]
         imu_msg.orientation.y = q[1]
@@ -257,35 +336,35 @@ class EbimuDriver(Node):
         imu_msg.orientation.w = q[3]
 
         if has_gyro_accel:
-            imu_msg.angular_velocity.x = math.radians(gx)
-            imu_msg.angular_velocity.y = math.radians(gy)
-            imu_msg.angular_velocity.z = math.radians(gz)
-
+            wx, wy, wz = math.radians(gx), math.radians(gy), math.radians(gz)
             if self.accel_in_g:
                 ax *= STANDARD_GRAVITY
                 ay *= STANDARD_GRAVITY
                 az *= STANDARD_GRAVITY
-
-            imu_msg.linear_acceleration.x = ax
-            imu_msg.linear_acceleration.y = ay
-            imu_msg.linear_acceleration.z = az
         else:
             ax, ay, az = gravity_from_orientation(roll, pitch)
-            imu_msg.linear_acceleration.x = ax
-            imu_msg.linear_acceleration.y = ay
-            imu_msg.linear_acceleration.z = az
-
+            wx = wy = wz = 0.0
             if self.last_orientation_time is not None:
                 dt = (now - self.last_orientation_time).nanoseconds * 1e-9
                 if dt > 1e-4 and self.last_roll is not None:
-                    imu_msg.angular_velocity.x = math.radians(roll - self.last_roll) / dt
-                    imu_msg.angular_velocity.y = math.radians(pitch - self.last_pitch) / dt
-                    imu_msg.angular_velocity.z = math.radians(yaw - self.last_yaw) / dt
-
+                    wx = math.radians(roll - self.last_roll) / dt
+                    wy = math.radians(pitch - self.last_pitch) / dt
+                    wz = math.radians(yaw - self.last_yaw) / dt
             self.last_orientation_time = now
             self.last_roll = roll
             self.last_pitch = pitch
             self.last_yaw = yaw
+
+        if self.publish_ros_axes:
+            wx, wy, wz = _chip_vec_to_ros(wx, wy, wz)
+            ax, ay, az = _chip_vec_to_ros(ax, ay, az)
+
+        imu_msg.angular_velocity.x = wx
+        imu_msg.angular_velocity.y = wy
+        imu_msg.angular_velocity.z = wz
+        imu_msg.linear_acceleration.x = ax
+        imu_msg.linear_acceleration.y = ay
+        imu_msg.linear_acceleration.z = az
 
         self.imu_pub.publish(imu_msg)
 

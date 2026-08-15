@@ -56,7 +56,7 @@ def generate_launch_description():
         DeclareLaunchArgument("frame_id", default_value="laser", description="LiDAR frame_id"),
         DeclareLaunchArgument("inverted", default_value="false", description="스캔 데이터 반전 여부"),
         DeclareLaunchArgument("angle_compensate", default_value="false", description="각도 보정 여부"),
-        DeclareLaunchArgument("angle_offset", default_value="3.141592653589793", description="LiDAR scan 각도 오프셋(rad)"),
+        DeclareLaunchArgument("angle_offset", default_value="3.141592653589793", description="LiDAR 드라이버 레벨 스캔 각도 오프셋(rad). 원본 커밋값(π)으로 복원됨"),
         DeclareLaunchArgument("scan_mode", default_value="Sensitivity", description="스캔 모드"),
         DeclareLaunchArgument("scan_frequency", default_value="40.0", description="목표 스캔 주파수(Hz)"),
 

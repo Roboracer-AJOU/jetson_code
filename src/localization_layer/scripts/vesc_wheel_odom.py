@@ -41,9 +41,10 @@ class VescWheelOdom(Node):
 
         self.declare_parameter('speed_topic', '/vehicle/speed_mps')
         self.declare_parameter('imu_topic', '/imu/data')
-        # 아직 gz/gy 중 어느 축이 실제 yaw(좌우 회전)인지 실측 확인 전 — 확인되면 여기만 바꾸면 됨.
-        # az≈1g로 측정돼서 z축이 위(수직)로 추정 → 기본은 'z'.
+        # gz가 yaw. /imu/data 는 ROS 축이라 기본 'z'.
         self.declare_parameter('imu_yaw_axis', 'z')
+        # /imu/data 는 ROS 축(+Z 위). 왼쪽 회전이 +yaw → 기본 +1.
+        self.declare_parameter('imu_yaw_sign', 1.0)
         # 'gyro': 각속도만 직접 적분 (지자기 간섭 영향 없지만 장기 드리프트).
         # 'orientation': EBIMU 자체 지자기 융합 yaw(msg.orientation)를 그대로 사용
         #   (장기 드리프트는 덜하지만, 모터 근처 지자기 간섭에 취약할 수 있음).
@@ -65,6 +66,8 @@ class VescWheelOdom(Node):
         self._imu_yaw_axis = self.get_parameter(
             'imu_yaw_axis'
         ).get_parameter_value().string_value
+        sign = float(self.get_parameter('imu_yaw_sign').value)
+        self._imu_yaw_sign = -1.0 if sign < 0.0 else 1.0
         self._yaw_source = self.get_parameter('yaw_source').get_parameter_value().string_value
         self._yaw_fusion_tau = max(0.0, float(self.get_parameter('yaw_fusion_tau_sec').value))
         self._min_speed_yaw = max(0.0, float(self.get_parameter('min_speed_for_yaw_mps').value))
@@ -96,7 +99,8 @@ class VescWheelOdom(Node):
 
         self.get_logger().info(
             f'VESC wheel odom: speed_fb={speed_topic}, imu_fb={imu_topic} '
-            f'(yaw_axis={self._imu_yaw_axis}, yaw_source={self._yaw_source}), '
+            f'(yaw_axis={self._imu_yaw_axis}, yaw_sign={self._imu_yaw_sign:.0f}, '
+            f'yaw_source={self._yaw_source}), '
             f'speed_scale={self._speed_scale:.3f}, '
             f'yaw_filter_tau={self._yaw_tau:.2f}s, out={odom_topic} @ {hz:.0f}Hz (no TF)'
         )
@@ -111,6 +115,7 @@ class VescWheelOdom(Node):
         omega = w.z if self._imu_yaw_axis == 'z' else w.y
         if not math.isfinite(omega):
             return
+        omega *= self._imu_yaw_sign
         self._omega_imu = omega
         self._have_imu = True
 
@@ -194,7 +199,7 @@ def main(args=None) -> None:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-
+    
 
 if __name__ == '__main__':
     main()

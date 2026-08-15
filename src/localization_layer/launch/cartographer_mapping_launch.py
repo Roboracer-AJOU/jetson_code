@@ -75,6 +75,9 @@ def _build_cartographer_stack(context):
         # 모터/VESC 근처 지자기 간섭으로 EBIMU orientation이 정지 중에도 계속 도는 게
         # 실측 확인됨(fused였을 때 odom이 제자리에서 계속 회전) → 순수 자이로 적분만 사용.
         'yaw_source': 'gyro',
+        'imu_yaw_axis': 'z',
+        # /imu/data 는 ROS 축(+Z 위). 왼쪽 회전이 +yaw.
+        'imu_yaw_sign': 1.0,
         'center_servo_deg': 90.0,
         'servo_span_deg': 40.0,
         'max_steer_rad': 0.45,
@@ -359,11 +362,11 @@ def generate_launch_description():
     DeclareLaunchArgument(
       'lidar_inverted',
       default_value='false',
-      description='LiDAR inverted flag (used when sensor bringup is enabled)',
+      description='LiDAR inverted flag. 라이다를 뒤집어서 달았을 때만 true',
     ),
     DeclareLaunchArgument(
       'lidar_angle_compensate',
-      default_value='false',
+      default_value='true',
       description='LiDAR angle compensation flag (used when sensor bringup is enabled)',
     ),
     DeclareLaunchArgument(
@@ -374,7 +377,8 @@ def generate_launch_description():
     DeclareLaunchArgument(
       'lidar_scan_frequency',
       default_value='20.0',
-      description='LiDAR scan frequency in Hz for mapping (40: 장애물 인지용 해상도 확보, Jetson 부하 확인 필요)',
+      description='LiDAR scan frequency in Hz for mapping. 40Hz에서 CPU 과부하로 '
+                  'range_data_collator Dropped points/Ignored subdivision 지속 발생 확인되어 20Hz로 재복귀 (수정12)',
     ),
     DeclareLaunchArgument(
       'use_wheel_odom_tf',

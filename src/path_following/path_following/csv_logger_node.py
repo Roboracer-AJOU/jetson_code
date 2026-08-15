@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List
 import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
 from rclpy.node import Node
+from sensor_msgs.msg import Imu
 from std_msgs.msg import Float64MultiArray
 
 
@@ -24,10 +25,12 @@ CSV_COLUMNS = [
     "vehicle_valid",
     "rc_valid",
     "safety_valid",
+    "imu_valid",
     "vesc_age_ms",
     "vehicle_age_ms",
     "rc_age_ms",
     "safety_age_ms",
+    "imu_age_ms",
     "mode",
     "estop_active",
     "manual_override",
@@ -66,9 +69,46 @@ CSV_COLUMNS = [
     "filtered_or_limited_steering_cmd_rad",
     "stanley_speed_mps",
     "closest_path_index",
+    "path_curvature_1pm",
+    "steering_ff_rad",
+    "steering_before_saturation_rad",
+    "active_path_lateral_error_m",
+    "active_path_x_m",
+    "active_path_y_m",
+    "csv_path_lateral_error_m",
+    "vehicle_x_m",
+    "vehicle_y_m",
+    "vehicle_yaw_rad",
+    "imu_stamp_sec",
+    "yaw_rate_radps",
+    "imu_accel_x_mps2",
+    "lateral_accel_mps2",
+    "imu_accel_z_mps2",
 ]
 
-TOPIC_KEYS = ("vesc", "vehicle", "rc", "safety")
+STANLEY_COLUMNS = (
+    "cross_track_error_m",
+    "heading_error_rad",
+    "heading_term_rad",
+    "cross_track_term_rad",
+    "stanley_steering_sum_rad",
+    "raw_steering_cmd_rad",
+    "filtered_or_limited_steering_cmd_rad",
+    "stanley_speed_mps",
+    "closest_path_index",
+    "path_curvature_1pm",
+    "steering_ff_rad",
+    "steering_before_saturation_rad",
+    "active_path_lateral_error_m",
+    "active_path_x_m",
+    "active_path_y_m",
+    "csv_path_lateral_error_m",
+    "vehicle_x_m",
+    "vehicle_y_m",
+    "vehicle_yaw_rad",
+)
+
+TOPIC_KEYS = ("vesc", "vehicle", "rc", "safety", "imu")
 LIMIT_REASONS = {
     0: "NONE",
     1: "ESTOP",
@@ -94,6 +134,8 @@ class CsvLoggerNode(Node):
         self.declare_parameter("wheel_radius", 0.05)
         self.declare_parameter("nominal_voltage", 14.4)
         self.declare_parameter("subscribe_legacy_telemetry", True)
+        self.declare_parameter("imu_topic", "/imu/data")
+        self.declare_parameter("imu_sample_hz", 20.0)
 
         self._log_hz = max(0.1, float(self.get_parameter("log_hz").value))
         self._flush_every_rows = max(
@@ -117,6 +159,11 @@ class CsvLoggerNode(Node):
         self._nominal_voltage = float(
             self.get_parameter("nominal_voltage").value
         )
+        self._imu_sample_hz = max(
+            0.1, float(self.get_parameter("imu_sample_hz").value)
+        )
+        self._imu_sample_period = 1.0 / self._imu_sample_hz
+        self._last_imu_sample_monotonic: float | None = None
 
         self._latest: Dict[str, object] = {
             column: math.nan for column in CSV_COLUMNS
@@ -179,6 +226,8 @@ class CsvLoggerNode(Node):
         self.create_subscription(
             Float64MultiArray, "/stanley/debug", self._on_stanley_debug, 10
         )
+        imu_topic = str(self.get_parameter("imu_topic").value)
+        self.create_subscription(Imu, imu_topic, self._on_imu, 20)
         if bool(self.get_parameter("subscribe_legacy_telemetry").value):
             self.create_subscription(
                 Float64MultiArray,
@@ -317,21 +366,51 @@ class CsvLoggerNode(Node):
     def _on_stanley_debug(self, msg: Float64MultiArray) -> None:
         """Atomically cache one /stanley/debug control-cycle snapshot.
 
-        Array units are m, rad, rad, rad, rad, rad, rad, m/s, index.
+        The publisher provides 19 coherent values; see STANLEY_COLUMNS.
         """
-        if len(msg.data) < 9:
+        if len(msg.data) < len(STANLEY_COLUMNS):
             self.get_logger().warning(
-                f"Ignoring /stanley/debug with {len(msg.data)} values; expected 9"
+                "Ignoring /stanley/debug with "
+                f"{len(msg.data)} values; expected {len(STANLEY_COLUMNS)}"
             )
             return
-        values = [float(value) for value in msg.data[:9]]
+        values = [
+            float(value) for value in msg.data[: len(STANLEY_COLUMNS)]
+        ]
         if not all(math.isfinite(value) for value in values):
             return
-        self._latest_stanley = dict(
-            zip(
-                CSV_COLUMNS[-9:],
-                values,
-            )
+        self._latest_stanley = dict(zip(STANLEY_COLUMNS, values))
+
+    def _on_imu(self, msg: Imu) -> None:
+        """Cache ROS-frame IMU data (+X forward, +Y left, +Z up)."""
+        now_monotonic = time.monotonic()
+        if (
+            self._last_imu_sample_monotonic is not None
+            and now_monotonic - self._last_imu_sample_monotonic
+            < self._imu_sample_period
+        ):
+            return
+
+        values = (
+            float(msg.angular_velocity.z),
+            float(msg.linear_acceleration.x),
+            float(msg.linear_acceleration.y),
+            float(msg.linear_acceleration.z),
+        )
+        if not all(math.isfinite(value) for value in values):
+            return
+        self._last_imu_sample_monotonic = now_monotonic
+        self._mark_received("imu")
+        stamp_sec = (
+            float(msg.header.stamp.sec)
+            + float(msg.header.stamp.nanosec) * 1e-9
+        )
+        self._update(
+            imu_stamp_sec=stamp_sec,
+            yaw_rate_radps=values[0],
+            imu_accel_x_mps2=values[1],
+            lateral_accel_mps2=values[2],
+            imu_accel_z_mps2=values[3],
         )
 
     def _on_legacy_telemetry(self, msg: Float64MultiArray) -> None:
@@ -429,6 +508,7 @@ class CsvLoggerNode(Node):
             f'csv_file: "{os.path.basename(self._csv_path)}"',
             f"log_hz: {self._log_hz}",
             f"valid_timeout_sec: {self._valid_timeout_sec}",
+            f"imu_sample_hz: {self._imu_sample_hz}",
             "latest_value_logging: true",
             "subscribe_only: true",
             "vehicle_parameters:",
@@ -442,7 +522,8 @@ class CsvLoggerNode(Node):
             "  - /rc/state",
             "  - /control/state",
             "  - /safety/state",
-            "  - /stanley/debug       # [m, rad, rad, rad, rad, rad, rad, m/s, index]",
+            "  - /stanley/debug       # 19-value coherent control snapshot",
+            f"  - {self.get_parameter('imu_topic').value}",
             "  - /vehicle/telemetry  # legacy fallback",
             "  - /drive              # legacy fallback",
         ]
