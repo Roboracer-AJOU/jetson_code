@@ -379,10 +379,15 @@ public:
             start_scan_time = this->now();
             op_result = drv->grabScanDataHq(nodes, count);
             end_scan_time = this->now();
-            // publish_scan()에 end_scan_time을 header.stamp로 넘김: cartographer_ros는
-            // LaserScan.header.stamp를 "마지막 포인트" 시각으로 해석하는데, start_scan_time을
-            // 쓰면 한 회전 주기(스캔당 ~25ms@40Hz)만큼 과거로 찍혀 IMU/odom과 어긋남
-            // → 회전 중에만 heading 오차가 도드라지는 원인이었음(실측: /imu 지연 ~1ms vs /scan ~25ms).
+            // header.stamp = start_scan_time (ROS 표준).
+            // sensor_msgs/LaserScan.msg 정의: "timestamp in the header is the
+            // acquisition time of the FIRST ray in the scan". cartographer_ros도 이 규약을
+            // 따라 header.stamp를 첫 점 시각으로 보고, 점별 time(i*time_increment)의
+            // 마지막 값(=scan_time)을 stamp에 더해서 마지막 점 시각을 만든다.
+            // 따라서 end_scan_time을 넣으면 거기에 한 주기가 또 더해져 전체가
+            // 한 회전 주기(50ms@20Hz)만큼 미래로 찍힌다.
+            // /scan stamp가 publish 시각보다 한 주기 과거인 것은 버그가 아니라 정상이며
+            // (한 바퀴 다 돌아야 스캔이 완성됨), cartographer가 그만큼 도로 더해준다.
             scan_duration = (end_scan_time - start_scan_time).seconds();
 
             if (op_result == SL_RESULT_OK) {
@@ -423,7 +428,7 @@ public:
                         }
     
                         publish_scan(scan_pub, angle_compensate_nodes, angle_compensate_nodes_count,
-                                end_scan_time, scan_duration, inverted,
+                                start_scan_time, scan_duration, inverted,
                                 angle_min, angle_max, angle_offset, max_distance,
                                 frame_id);
 
@@ -445,7 +450,7 @@ public:
                         angle_max = DEG2RAD(getAngle(nodes[end_node]));
 
                         publish_scan(scan_pub, &nodes[start_node], end_node-start_node +1,
-                                end_scan_time, scan_duration, inverted,
+                                start_scan_time, scan_duration, inverted,
                                 angle_min, angle_max, angle_offset, max_distance,
                                 frame_id);
                     }
@@ -454,7 +459,7 @@ public:
                     float angle_min = DEG2RAD(0.0f);
                     float angle_max = DEG2RAD(359.0f);
                     publish_scan(scan_pub, nodes, count,
-                                end_scan_time, scan_duration, inverted,
+                                start_scan_time, scan_duration, inverted,
                                 angle_min, angle_max, angle_offset, max_distance,
                                 frame_id);
                 }

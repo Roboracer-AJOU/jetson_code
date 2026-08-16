@@ -285,8 +285,11 @@ def build_localization_cartographer_nodes(context):
                 'odom_topic': odom_topic_str,
                 'min_speed_for_yaw_mps': 0.08,
                 'speed_scale': 1.0,
-                # IMU 자이로 실측이라 조향각 추정보다 신뢰도 높음 → 약하게만 눌러줌.
-                'yaw_filter_tau_sec': 0.1,
+                # 1차 지연이라 정상선회 중 헤딩 지연 = tau * omega. 0.1s면 코너에서
+                # 10~20도 밀린 헤딩으로 병진이 적분됨. gyro 적분값은 이미 깨끗해서 끔.
+                'yaw_filter_tau_sec': 0.0,
+                # 발행 주기일 뿐 적분 주기가 아니다. 적분은 _on_imu에서 IMU stamp
+                # 기준 ~100Hz로 돌고, 여기서는 그 상태를 발행만 한다.
                 'publish_hz': 50.0,
             }],
         ),

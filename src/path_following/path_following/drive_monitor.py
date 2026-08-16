@@ -21,8 +21,10 @@ from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Bool, Float32MultiArray, Float64, Float64MultiArray, String, UInt8
 from tf2_ros import Buffer, TransformListener
 
+from path_following import vehicle_geometry as vg
 
-_WHEELBASE_M = 0.33  # stanley_waypoint_follow_node / control_node 와 동일
+
+_WHEELBASE_M = vg.WHEELBASE_M
 
 
 def _rad2deg(r: float) -> float:

@@ -33,7 +33,9 @@ _DEFAULT_MAP_DIR = "/home/nvidia/f1tenth_ajou/maps"
 
 CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
-    "map_name": "cartographer_map_20260816_004549.yaml",
+    # CSV(centerline/raceline)·로컬라이제이션 pbstream·static_obstacle_node 와
+    # 반드시 같은 맵이어야 한다. 어긋나면 벽을 장애물로 보거나 그 반대가 된다.
+    "map_name": "cartographer_map_20260816_234629.yaml",  # 이전 20260816_211739
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",
@@ -97,7 +99,12 @@ CFG = {
     # ---- [A5] 벽 잔차 오검출 강건화 ----
     # 측위가 흔들리면 벽이 팽창 밴드를 벗어나 "장애물"로 샌다. 팽창 경계에
     # 붙어 있는 클러스터에는 더 높은 기준을 요구한다.
-    "wall_residual_guard": False,
+    #
+    # 20260816 맵 기준으로 wall_clearance_m=0.12 에 걸리는 영역은 트랙
+    # 자유공간의 7.8% 뿐이다. 나머지 92% (= 주행선이 지나는 트랙 한가운데)
+    # 에서는 이 가드가 아무 일도 하지 않는다. 그래서 실장애를 놓칠 위험
+    # 없이 벽 잔차만 골라 억제한다. 끄려면 False.
+    "wall_residual_guard": True,
     "wall_clearance_m": 0.12,
     "near_wall_min_points": 14,
     "near_wall_min_span_m": 0.20,

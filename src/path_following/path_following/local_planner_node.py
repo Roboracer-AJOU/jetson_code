@@ -39,6 +39,7 @@ from std_msgs.msg import UInt8
 from geometry_msgs.msg import PointStamped, PoseStamped
 from tf2_ros import Buffer, TransformListener, TransformException
 
+from path_following import vehicle_geometry as vg
 from path_following.obstacle_filter import (
     closest_dynamic_obstacle_speed_mps,
     closest_dynamic_obstacle_surface_m,
@@ -91,12 +92,19 @@ CFG = {
     "corridor_max_lateral_from_raceline_m": 0.40,
     "obstacle_forward_min_m": 0.30,
     "obstacle_forward_max_m": 12.0,
+    # laser frame |y| 검출 게이트. 차폭보다 넉넉해야 한다 — 여기서 버리면
+    # 뒤에서 되살릴 방법이 없다. 실측 반폭 0.15 에 0.27 여유.
     "obstacle_lateral_abs_max_m": 0.42,
     "obstacle_tf_timeout_sec": 0.15,
-    "laser_to_base_x_m": 0.275,
+    # sensor_static_tf.cpp 의 base_link->laser translation.x 와 같아야 한다.
+    # 이전 0.275 는 TF(0.31)와 어긋나 있어서, 라이다 거리를 base_link 로 옮길 때
+    # 3.5 cm 씩 가깝게 봤다.
+    "laser_to_base_x_m": vg.LASER_X_M,      # 이전 0.275 (TF 는 0.31)
     # [차량 버블] 뒷축→전방 길이. 게이트 거리 d에서 빼서 앞범퍼 기준으로 회피.
     # 폭(ego_safety_width)은 fgm_node 에서 섹터 반폭으로 사용.
-    "ego_front_safety_m": 0.30,
+    # 실측 앞끝은 0.50 인데 0.30 이라, 앞범퍼 기준 여유를 20 cm 더 있는 것으로
+    # 착각하고 있었다.
+    "ego_front_safety_m": vg.FRONT_M,       # 이전 0.30
     "use_fgm": True,
     # 회피 거리 베이스 (avoid_timing_ref_mps 기준). 실제 게이트는 속도×마진으로 스케일.
     # 예: v=2m/s, margin=1.3 → avoid_on ≈ 3.5×1.3 = 4.55m (기존보다 ~30% 일찍)
@@ -152,7 +160,10 @@ CFG = {
     # 맵과 장애물로 잘라낸다. 맵이 없으면 장애물 검사만 동작한다.
     "path_check_enable": True,
     "map_topic": "/map",
-    "path_check_inflation_m": 0.25,   # 차량 반폭 + 여유. 이만큼 벽에서 떨어져야 통과
+    # 이만큼 벽에서 떨어져야 통과. 직선 반폭(0.15)이 아니라 코너 스윕폭을 쓴다 —
+    # 회피 경로는 급하게 휘고, 앞끝이 0.50 이라 반경 1 m 코너에서 앞 외측 코너가
+    # 경로보다 0.254 m 바깥을 지난다. 이전 0.25 는 우연히 거의 같은 값이었다.
+    "path_check_inflation_m": vg.PATH_CHECK_HALF_WIDTH_M,  # 이전 0.25
     "path_check_obstacle_margin_m": 0.10,
     "path_check_backoff_m": 0.20,     # 충돌 지점에서 이만큼 더 물러나 끝냄
     "path_check_min_length_m": 0.6,   # 잘라낸 경로가 이보다 짧으면 회피를 포기
@@ -440,7 +451,10 @@ class LocalPlannerNode(Node):
             a_brake=float(g("avoid_a_brake_mps2").value),
             safety_factor=float(g("avoid_safety_factor").value),
             standoff_m=float(g("avoid_standoff_m").value),
-            ego_half_width_m=0.5 * float(g("obstacle_lateral_abs_max_m").value),
+            # 검출 게이트(obstacle_lateral_abs_max_m)의 절반을 차 반폭으로 쓰던
+            # 것을 실측 치수로 바꿨다. 그 게이트는 "무엇을 볼지" 를 정하는 값이라
+            # 넉넉하게 잡혀 있어서, 반으로 나눠도 차폭이 되지 않았다 (0.21 vs 0.15).
+            ego_half_width_m=vg.HALF_WIDTH_M,  # 이전 0.5*0.42 = 0.21
             ego_front_m=float(g("ego_front_safety_m").value),
             lateral_margin_m=float(g("avoid_lateral_margin_m").value),
             v_min=float(g("avoid_speed_min_mps").value),
@@ -1093,10 +1107,10 @@ class LocalPlannerNode(Node):
         if tf_lm is None:
             return []
         to_map = self._make_laser_to_map_fn(tf_lm)
-        grow = (
-            self.avoid_speed_params.ego_half_width_m
-            + self.path_check_obstacle_margin_m
-        )
+        # 맵 팽창과 같은 기준(코너 스윕폭)을 써야 한다. 벽은 0.254 로 재고
+        # 장애물은 회피속도용 반폭 0.15 로 재면 같은 경로가 두 검사에서 다르게
+        # 판정된다.
+        grow = vg.PATH_CHECK_HALF_WIDTH_M + self.path_check_obstacle_margin_m
         disks = []
         obs = self._obstacle_data
         for k in range(0, max(0, len(obs) - 3), 4):

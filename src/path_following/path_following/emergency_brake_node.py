@@ -36,6 +36,7 @@ from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Float64, String
 
+from path_following import vehicle_geometry as vg
 from path_following.avoidance_safety import InflatedMap
 
 
@@ -58,8 +59,18 @@ CFG = {
     # TTC 판정이 꺼져서 조금씩 전진하다 결국 장애물을 들이받는다.
     "arm_speed_mps": 0.4,
     # 코리도 안 장애물과 최소 이격 [m]. 속도 무관. 기어가듯 다가가는 걸 막는다.
-    "min_standoff_m": 0.30,
-    "standoff_release_m": 0.40,   # 이만큼 멀어져야 해제 (히스테리시스)
+    #
+    # 주의: 이 값은 **라이다 원점 기준** 이다. _evaluate 가 스캔 range 를 그대로
+    # closest 로 쓰기 때문이다(closest = r.min()). 라이다는 base_link 에서
+    # 0.31 m 앞이고 차 앞끝은 0.50 m 이므로, 앞끝은 라이다보다 0.19 m 더 앞에
+    # 있다. 즉 여기 적은 값에서 0.19 를 빼야 실제 범퍼 여유다.
+    #
+    # 20260816 재산정 — 앞끝 기준으로 원하는 여유를 정하고 0.19 를 더한다.
+    #   평상시 트리거: 범퍼 여유 0.12  -> 0.19+0.12 = 0.31 (이전 0.30, 거의 동일)
+    #   해제:          범퍼 여유 0.22  -> 0.19+0.22 = 0.41 (이전 0.40)
+    # 평상시 값이 거의 안 바뀌는 게 중요하다 — AEB 는 좀처럼 안 걸려야 한다.
+    "min_standoff_m": round(vg.LASER_TO_FRONT_M + 0.12, 3),   # 이전 0.30
+    "standoff_release_m": round(vg.LASER_TO_FRONT_M + 0.22, 3),  # 이전 0.40
     # ---- 데드락 탈출구 ----
     # 여유 안쪽에 서 버렸을 때의 탈출구.
     # 정지 상태가 이만큼 이어지면 해제한다. 선 차는 아무것도 못 받으므로
@@ -83,19 +94,24 @@ CFG = {
     "escape_min_travel_m": 0.35,
     "escape_max_sec": 3.0,
     "escape_speed_end_mps": 1.0,
-    "escape_hard_stop_m": 0.12,
+    # 탈출 창 안에서도 살아 있는 절대 방어선. 이것도 라이다 기준이라,
+    # 0.12 는 범퍼가 장애물을 7 cm 지나간 지점이었다 (0.12 - 0.19 < 0).
+    # 범퍼 여유 5 cm 를 남긴다.
+    "escape_hard_stop_m": round(vg.LASER_TO_FRONT_M + 0.05, 3),  # 이전 0.12
     # 노이즈 빔 하나로 급정거하지 않도록, 조건을 만족하는 빔이 이 개수 이상일 때만
     "min_hit_beams": 3,
     # ---- 주행 코리도 (오작동의 대부분이 여기서 갈린다) ----
-    "ego_half_width_m": 0.17,      # 차폭 절반
-    "corridor_margin_m": 0.05,     # 여유. 키우면 민감해짐
+    # 실측 반폭 0.15. 이전 0.17 은 어림값이었다. 유효 코리도 반폭
+    # (half_width + margin) 은 0.22 로 그대로 유지해서 오작동률을 안 건드린다.
+    "ego_half_width_m": vg.HALF_WIDTH_M,  # 이전 0.17
+    "corridor_margin_m": 0.07,            # 이전 0.05 (합계 0.22 유지)
     "fov_deg": 100.0,              # 전방 ±50°만 검사
     "max_range_m": 6.0,
     "min_range_m": 0.05,
     # 조향각으로 코리도를 휘어 코너 진입 오작동을 줄인다. /drive 가 끊기면
     # 자동으로 직선 코리도(더 보수적)로 되돌아간다.
     "use_steering_corridor": True,
-    "wheelbase_m": 0.33,
+    "wheelbase_m": vg.WHEELBASE_M,
     "drive_stale_sec": 0.3,
     # ---- 맵 필터 (아는 벽은 AEB 대상이 아니다) ----
     # 빔 끝점이 맵의 점유 셀에서 이 거리 안이면 "아는 벽" 으로 보고 버린다.
@@ -125,7 +141,10 @@ CFG = {
     "avoid_ttc_scale": 0.6,
     "avoid_ttc_floor_s": 0.25,      # 이 아래로는 절대 완화 안 됨
     "avoid_standoff_scale": 0.6,
-    "avoid_standoff_floor_m": 0.18,  # 이 아래로는 절대 완화 안 됨
+    # 이 아래로는 절대 완화 안 됨. 라이다 기준이라 이전 0.18 은 범퍼가 장애물에
+    # 닿은 지점(0.18 - 0.19 < 0)이었다. 회피 중에는 여유를 줄여도 되지만
+    # 음수는 안 된다. 범퍼 여유 6 cm 를 남긴다.
+    "avoid_standoff_floor_m": round(vg.LASER_TO_FRONT_M + 0.06, 3),  # 이전 0.18
     # ---- 히스테리시스 ----
     # 한 번 걸리면 최소 이만큼 유지 (채터링 방지)
     "min_hold_sec": 0.4,
@@ -248,7 +267,11 @@ class EmergencyBrakeNode(Node):
 
         self.get_logger().info(
             f"Emergency brake (AEB) | ttc<{self.ttc_threshold:.2f}s "
-            f"(arm>{self.arm_speed:.2f}m/s) standoff<{self.min_standoff:.2f}m "
+            f"(arm>{self.arm_speed:.2f}m/s) "
+            # 라이다 기준값과 범퍼 기준 실제 여유를 같이 찍는다. 앞끝이 라이다보다
+            # 0.19 m 앞이라, 이 둘을 헷갈리면 여유를 그만큼 착각한다.
+            f"standoff<{self.min_standoff:.2f}m(라이다)"
+            f"={self.min_standoff - vg.LASER_TO_FRONT_M:+.2f}m(범퍼) "
             f"beams>={self.min_hit_beams} "
             f"corridor=±{self.half_width + self.corridor_margin:.2f}m "
             f"fov=±{math.degrees(self.fov_rad) / 2:.0f}° "

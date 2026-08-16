@@ -22,6 +22,8 @@ import math
 
 import numpy as np
 
+from path_following import vehicle_geometry as vg
+
 try:  # 인플레이션용. 없으면 맵 검사만 끄고 장애물 검사는 계속 동작한다.
     from scipy.ndimage import distance_transform_edt
 
@@ -145,8 +147,10 @@ class AvoidSpeedParams:
         a_brake: float = 3.0,
         safety_factor: float = 0.7,
         standoff_m: float = 0.35,
-        ego_half_width_m: float = 0.17,
-        ego_front_m: float = 0.30,
+        # 실측 치수. local_planner 가 같은 값으로 덮어쓰지만, 기본값이
+        # 실차와 다르면 이 모듈만 따로 쓰는 곳에서 조용히 틀린다.
+        ego_half_width_m: float = vg.HALF_WIDTH_M,  # 이전 0.17
+        ego_front_m: float = vg.FRONT_M,            # 이전 0.30
         lateral_margin_m: float = 0.10,
         v_min: float = 0.6,
         v_max: float = 8.0,

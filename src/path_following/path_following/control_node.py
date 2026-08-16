@@ -39,7 +39,17 @@ CFG = {
     "vesc_baud": 115200,
     # Stanley max_drive_speed / max_steering_angle 과 맞추면 1:1 스케일
     "max_speed_mps": 10.0,
-    "max_steering_angle_rad": 0.6981,  # ±40° — ESP normToAngle: S±1 → 50°/130°
+    # /drive 의 steering_angle [rad] 을 S∈[-1,1] 로 정규화할 때 쓰는 풀스케일.
+    #
+    # 0.8726646(=50°)은 ESP normToAngle 의 서보 혼 이동각(40°/140°)이지 전륜
+    # 조향각이 아니었다. 자전거 모델을 쓰는 Stanley 쪽과 단위가 안 맞아서,
+    # 곡률 FF 와 횡가속 상한이 전부 실제 필요량의 43% 로 나가고 있었다.
+    #
+    # 20260816 요레이트 실측: S=1.0 의 실제 전륜각 ≈ 21.4° (실효/명령 0.429).
+    # Stanley 의 max_steering_angle_real_rad 와 **반드시 같은 값**이어야 한다.
+    # 한쪽만 바꾸면 정규화가 어긋나 서보 가동범위를 못 쓰거나 넘겨버린다.
+    # 되돌릴 때는 Stanley steer_scale_calibrated=False 와 함께 0.8726646 으로.
+    "max_steering_angle_rad": 0.3735,  # 이전 0.8726646 (서보 혼 ±50°)
     "max_duty": 0.3,           # MANUAL mode CH2 duty limit
     "speed_scale": 1.0,         # 추가 감쇠 (1.0=끔)
     "min_move_duty": 0.06,      # 정지마찰 극복용 최소 duty (speed>threshold 일 때)
@@ -47,13 +57,13 @@ CFG = {
     "manual_duty_fall_rate_per_sec": 0.10,
     "min_move_speed_mps": 0.08,
     "status_log_hz": 2.0,         # 터미널 속도/제어 STATUS (0=끔)
-    "max_steer": 1.,          # ESP 조향 명령 범위. 1.0이면 서보 ±40°까지 사용
+    "max_steer": 1.,          # ESP 조향 명령 범위. 1.0이면 서보 ±50°까지 사용
     # 0 = 끔. 조향 변화율은 Stanley 쪽 steering_rate_limit_radps 에서만 건다
     # (여기서 한 번 더 자르면 회피용으로 올려둔 응답속도가 무효화된다).
     "steer_rate_limit_per_sec": 0.0,
     "steer_cmd_format": "prefixed",  # plain: "0.500\n" | prefixed: "S:0.500\n"
     "invert_speed": False,      # legacy AUTO sign flag; prefer auto_duty_output_sign
-    # 원본 ESP normToAngle: S:-1→좌(50°), S:+1→우(130°) — INVERT_RC_STEER 미적용
+    # ESP normToAngle: S:-1→좌(40°), S:+1→우(140°) — INVERT_RC_STEER 미적용
     # Stanley +steer=좌 → S:- 로 보내야 함 (False면 AUTO 조향 반대 → 옆으로 밀림)
     "invert_steer": False,
     "cmd_timeout_sec": 0.25,
@@ -103,7 +113,15 @@ CFG = {
     "target_change_threshold_mps": 0.1,
     "duty_rate_limit_per_sec": 0.60,
     "vesc_telemetry_timeout_sec": 0.3,
-    "vesc_poll_period_sec": 0.05,
+    # 20Hz(0.05)면 /vehicle/speed_mps 알맹이가 20Hz라 odom이 zero-order hold로
+    # 같은 속도를 2~3번 재사용하고, 응답도 최대 50ms 묵은 값이 된다(3m/s에서 ~15cm
+    # 뒤처진 prior). VESC는 /dev/ttyACM0 = USB CDC라 vesc_baud는 이름뿐이고
+    # GET_VALUES 응답 ~80B에 실제 대역폭 제약이 없어서 매 틱 폴링으로 올림.
+    # 폴링은 timer_period_sec(0.02) 틱에서만 일어나므로 상한이 곧 50Hz다.
+    # _last_vesc_poll_time을 now로 리셋하는 구조라 이 값을 틱 주기와 같은 0.02로
+    # 두면 타이머 지터로 한 틱씩 건너뛰어 50/25Hz를 오간다. 틱보다 짧게 잡아
+    # 매 틱 확실히 폴링되게 함.
+    "vesc_poll_period_sec": 0.015,
     "invert_speed_sign": False,
     "pole_pairs": 2,
     "gear_ratio": 12.0,

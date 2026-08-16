@@ -26,6 +26,8 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Float32MultiArray, Float64
 from visualization_msgs.msg import Marker
 
+from path_following import vehicle_geometry as vg
+
 _FGM_BOOST_FLAG = Path("/tmp/f1tenth_fgm_boost")
 _CPU_POLICY = Path("/home/nvidia/f1tenth_ajou/scripts/apply_cpu_policy.sh")
 
@@ -68,8 +70,14 @@ CFG = {
     "bubble_max_m": 0.40,
     # [차량 버블] 뒷축 기준 발자국 — 전방 길이 / 좌우 폭(전체).
     # 폭은 FGM 섹터 반폭에 half_width로 들어가고, 전방은 planner 게이트(d−front)와 공유.
-    "ego_front_safety_m": 0.30,
-    "ego_safety_width_m": 0.15,
+    #
+    # 20260816: 두 값 다 실측과 어긋나 있었다.
+    #   ego_safety_width_m 은 "전체 폭" 인데 0.15 (= 실제 반폭) 가 들어가 있어서,
+    #   코드가 반으로 나눈 결과 섹터 반폭이 0.075 m — 실제의 절반이었다. 버블이
+    #   그만큼 좁아 갭을 실제보다 넓게 봤다. 실측 전폭 0.30 으로 바로잡는다.
+    #   ego_front_safety_m 은 실제 앞끝이 0.50 인데 0.30 이었다.
+    "ego_front_safety_m": vg.FRONT_M,       # 이전 0.30
+    "ego_safety_width_m": vg.WIDTH_M,       # 이전 0.15 (반폭이 잘못 들어가 있었음)
     "gap_threshold_primary_m": 1.5,
     "gap_threshold_fallback_m": 0.5,
     # 빔 개수가 아니라 각폭 기준 (라이다 분해능 바뀌어도 동일 동작)
@@ -84,7 +92,10 @@ CFG = {
     # 겨우 0.16 m). 차폭 코리도를 훑어 막히는 지점까지만 목표를 찍고, 그래도
     # 부족하면 갭 안에서 더 뚫린 각도로 목표를 옮긴다.
     "corridor_check_enable": True,
-    "corridor_half_width_m": 0.22,   # 차량 반폭 + 여유
+    # 차량 반폭 + 여유. 회피 경로는 급하게 휘므로 직선 반폭이 아니라 코너
+    # 스윕폭을 기준으로 잡는다 (반경 1 m 에서 0.254). 이전 0.22 는 우연히
+    # 근사값이었는데, 이제는 치수에서 유도한다.
+    "corridor_half_width_m": vg.PATH_CHECK_HALF_WIDTH_M,  # 이전 0.22
     "corridor_stop_margin_m": 0.15,  # 막히는 지점에서 이만큼 앞에 멈춰 찍는다
     "corridor_angle_samples": 11,    # 갭 안에서 시도할 목표 각도 후보 수
     # 크게 꺾는 데 매기는 벌점 [m/rad]. 키우면 정면 고집(회피 소극적),

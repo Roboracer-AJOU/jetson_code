@@ -92,7 +92,7 @@ TRAJECTORY_BUILDER_2D.imu_gravity_time_constant = 80.0
 -- ============================================================
 
 TRAJECTORY_BUILDER_2D.min_range = 0.08
-TRAJECTORY_BUILDER_2D.max_range = 16.0
+TRAJECTORY_BUILDER_2D.max_range = 25.0
 
 
 -- 기존값 유지
@@ -233,10 +233,18 @@ POSE_GRAPH.optimization_problem.local_slam_pose_translation_weight = 1e5
 POSE_GRAPH.optimization_problem.local_slam_pose_rotation_weight = 1e5
 
 
--- Odom = 50 Hz
-POSE_GRAPH.optimization_problem.odometry_translation_weight = 1e4
+-- 휠 오돔은 '속도'로만 쓴다 (절대 위치는 라이다/맵만).
+-- 이 두 weight가 pose graph 백엔드로 들어가는 유일한 통로이고,
+-- 휠 종방향 스케일 오차(실측 4~5% 과다)가 위치추정에 새는 곳도 여기다.
+-- "맵핑한 걸로 위치추정하면 직선 길이가 다르다"의 직접 원인.
+-- 0으로 잠가도 pose_extrapolator는 odom '속도'를 그대로 쓴다(use_odometry=true).
+--
+-- 주의: 베이스(맵핑 lua)가 이미 0/0인데 여기서 1e4/1e4로 되살려 놓았었다.
+-- 베이스가 "자이로를 두 번 잠근다"는 이유로 rotation을 0으로 둔 결정을
+-- 근거 없이 뒤집은 것이라 베이스 결정을 따르도록 되돌린다.
+POSE_GRAPH.optimization_problem.odometry_translation_weight = 0
 
-POSE_GRAPH.optimization_problem.odometry_rotation_weight = 1e4
+POSE_GRAPH.optimization_problem.odometry_rotation_weight = 0
 
 
 -- ============================================================

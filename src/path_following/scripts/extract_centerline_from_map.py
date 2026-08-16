@@ -48,6 +48,13 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
+# 차량 치수는 런타임 노드와 같은 정의를 쓴다 (ROS 의존 없는 순수 모듈).
+_pkg_dir = os.path.join(os.path.dirname(_script_dir), "path_following")
+if _pkg_dir not in sys.path:
+    sys.path.insert(0, _pkg_dir)
+
+import vehicle_geometry as vg  # noqa: E402
+
 from speed_profile import (  # noqa: E402
     UNMEASURED_WARNING,
     VEHICLE,
@@ -79,7 +86,7 @@ UNKNOWN_OCC = 1.0 - 205.0 / 255.0
 
 CFG = {
     # maps/ 아래 yaml 파일명만 (절대경로 넣어도 됨)
-    "map_name": "cartographer_map_20260816_004549.yaml",
+    "map_name": "cartographer_map_20260816_234629.yaml",
     "map_dir": _DEFAULT_MAP_DIR,
     "out_csv": os.path.join(_SCRIPT_DIR, "..", "config", "centerline.csv"),
 }
@@ -662,7 +669,11 @@ def main() -> int:
     parser.add_argument(
         "--min-clear-m",
         type=float,
-        default=0.20,
+        # 실측 반폭 + 5 cm. 값은 이전 기본값 0.20 과 같다 — 여기를 올리면 좁은
+        # 구간에서 폐루프를 못 찾는 일이 생기므로 건드리지 않는다.
+        # 센터라인은 레이싱라인의 시드이고, 코너 스윕폭까지 감안한 진짜 여유는
+        # generate_raceline_from_centerline.py 가 곡률별로 강제한다.
+        default=round(vg.HALF_WIDTH_M + 0.05, 3),
         help="벽에서 유지할 최소 거리 [m]. 이보다 가까워지는 이동은 버림",
     )
     parser.add_argument(
@@ -715,6 +726,16 @@ def main() -> int:
         f"  clearance min={clear_m.min():.3f} m median={np.median(clear_m):.3f} m, "
         f"center_ratio={path_center_ratio(centerline, free):.3f}"
     )
+    # 센터라인을 그대로 주행할 수도 있으므로(레이싱라인 fallback), 차체가
+    # 실제로 들어가는지 알려준다. 여기서 걸리면 그 구간은 트랙 자체가 좁다는
+    # 뜻이라 스크립트로 해결되지 않는다 — 통과 속도를 낮춰야 한다.
+    need = vg.HALF_WIDTH_M + 0.05
+    tight = int(np.count_nonzero(clear_m < need - 1e-6))
+    if tight:
+        print(
+            f"  NOTE: {tight}/{len(centerline)} 점이 차체 반폭+5cm"
+            f"({need:.2f} m) 보다 벽에 가깝습니다 — 그 구간은 트랙이 좁습니다."
+        )
     print(f"  wall_crossings={wall_x}, self_intersections={self_ix}")
     if wall_x or self_ix:
         print("WARNING: 경로가 벽을 지나거나 자기교차합니다.", file=sys.stderr)

@@ -85,6 +85,12 @@ def _build_cartographer_stack(context):
         'invert_steer': False,
         'use_steer_for_yaw': False,
         'min_speed_for_yaw_mps': 0.05,
+        # 1차 지연이라 정상선회 중 헤딩 지연 = tau * omega. 0.1s면 맵핑 속도에서도
+        # 10도 넘게 밀린 헤딩으로 병진이 적분됨. gyro 적분값은 이미 깨끗해서 끔.
+        'yaw_filter_tau_sec': 0.0,
+        # 발행 주기일 뿐 적분 주기가 아니다. x/y/yaw는 vesc_wheel_odom의 _on_imu에서
+        # IMU stamp 기준 ~100Hz로 적분되고, 여기서는 그 상태를 마지막 IMU stamp로
+        # 찍어 내보내기만 한다. VESC 속도 상한도 50Hz라 50이면 충분.
         'publish_hz': 50.0,
       }],
     ),

@@ -79,6 +79,9 @@ CSV_COLUMNS = [
     "vehicle_x_m",
     "vehicle_y_m",
     "vehicle_yaw_rad",
+    "long_accel_est_mps2",
+    "accel_hold_u",
+    "accel_hold_extra_steer_rad",
     "imu_stamp_sec",
     "yaw_rate_radps",
     "imu_accel_x_mps2",
@@ -106,6 +109,10 @@ STANLEY_COLUMNS = (
     "vehicle_x_m",
     "vehicle_y_m",
     "vehicle_yaw_rad",
+    # 가속 구간 라인 홀드 진단용. u>0 인 구간이 보정이 걸린 곳이다.
+    "long_accel_est_mps2",
+    "accel_hold_u",
+    "accel_hold_extra_steer_rad",
 )
 
 TOPIC_KEYS = ("vesc", "vehicle", "rc", "safety", "imu")
@@ -366,7 +373,7 @@ class CsvLoggerNode(Node):
     def _on_stanley_debug(self, msg: Float64MultiArray) -> None:
         """Atomically cache one /stanley/debug control-cycle snapshot.
 
-        The publisher provides 19 coherent values; see STANLEY_COLUMNS.
+        The publisher provides 22 coherent values; see STANLEY_COLUMNS.
         """
         if len(msg.data) < len(STANLEY_COLUMNS):
             self.get_logger().warning(
@@ -522,7 +529,7 @@ class CsvLoggerNode(Node):
             "  - /rc/state",
             "  - /control/state",
             "  - /safety/state",
-            "  - /stanley/debug       # 19-value coherent control snapshot",
+            "  - /stanley/debug       # 22-value coherent control snapshot",
             f"  - {self.get_parameter('imu_topic').value}",
             "  - /vehicle/telemetry  # legacy fallback",
             "  - /drive              # legacy fallback",
