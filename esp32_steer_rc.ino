@@ -191,7 +191,12 @@ uint8_t jetsonRxLen = 0;
 // PPM ISR
 // ==================================================
 
-static inline bool IRAM_ATTR inPpmRange(uint16_t value)
+/*
+  ISR 에서 부르므로 반드시 IRAM 에 있어야 한다.
+  inline 로 두면 컴파일러가 인라인하지 않았을 때 flash 에 놓일 수 있어서
+  섹션을 명시적으로 지정한다.
+*/
+bool IRAM_ATTR inPpmRange(uint16_t value)
 {
   return (value >= PPM_MIN_VALID_US && value <= PPM_MAX_VALID_US);
 }
@@ -760,6 +765,13 @@ void loop()
     sendTelemetry(0, 0, 0, 0);
     return;
   }
+
+  /*
+    정상 프레임이 들어오는 동안 워치독 타이머를 계속 밀어둔다.
+    이렇게 해야 재무장이 "페일세이프가 500ms 이상 이어질 때"만 걸린다.
+    안 그러면 순간적인 PPM 끊김에도 곧바로 재무장이 돌아서 warmup 만큼 복구가 늦어진다.
+  */
+  lastRearmMs = nowMs;
 
   // ==================================================
   // 정상 채널 읽기
