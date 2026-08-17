@@ -1,22 +1,25 @@
+-- Cartographer pose_graph.lua 기본값 (Humble / upstream 동일).
+-- 파일 이름만 pose_graph_mapping.lua — include 경로를 유지하기 위함.
+
 POSE_GRAPH = {
-  optimize_every_n_nodes = 90,
+  optimize_every_n_nodes = 80,
   constraint_builder = {
-    sampling_ratio = 0.12,
-    max_constraint_distance = 8.,
-    min_score = 0.70,
+    sampling_ratio = 0.04,
+    max_constraint_distance = 12.,
+    min_score = 0.68,
     global_localization_min_score = 0.82,
     loop_closure_translation_weight = 1.1e4,
     loop_closure_rotation_weight = 1e5,
     log_matches = false,
     fast_correlative_scan_matcher = {
-      linear_search_window = 2.,
+      linear_search_window = 0.9,
       angular_search_window = math.rad(10.),
       branch_and_bound_depth = 7,
     },
     ceres_scan_matcher = {
       occupied_space_weight = 20.,
       translation_weight = 10.,
-      rotation_weight = 1.,
+      rotation_weight = 10.,
       ceres_solver_options = {
         use_nonmonotonic_steps = true,
         max_num_iterations = 10,
@@ -45,16 +48,16 @@ POSE_GRAPH = {
       },
     },
   },
-  matcher_translation_weight = 6e2,
-  matcher_rotation_weight = 2e3,
+  matcher_translation_weight = 5e2,
+  matcher_rotation_weight = 1.6e3,
   optimization_problem = {
     huber_scale = 1e1,
     acceleration_weight = 1.1e2,
     rotation_weight = 1.6e4,
     local_slam_pose_translation_weight = 1e5,
     local_slam_pose_rotation_weight = 1e5,
-    odometry_translation_weight = 1e5,
-    odometry_rotation_weight = 1e5,
+    odometry_translation_weight = 1e4,
+    odometry_rotation_weight = 5e2,
     fixed_frame_pose_translation_weight = 1e1,
     fixed_frame_pose_rotation_weight = 1e2,
     fixed_frame_pose_use_tolerant_loss = false,
@@ -65,14 +68,14 @@ POSE_GRAPH = {
     fix_z_in_3d = false,
     ceres_solver_options = {
       use_nonmonotonic_steps = false,
-      max_num_iterations = 50,
-      num_threads = 6,
+      max_num_iterations = 8,
+      num_threads = 2,
     },
   },
-  max_num_final_iterations = 120,
-  global_sampling_ratio = 0.0,
+  max_num_final_iterations = 20,
+  global_sampling_ratio = 0.003,
   log_residual_histograms = false,
-  global_constraint_search_after_n_seconds = 1e9,
+  global_constraint_search_after_n_seconds = 15.,
 }
 
 return POSE_GRAPH

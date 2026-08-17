@@ -86,7 +86,7 @@ UNKNOWN_OCC = 1.0 - 205.0 / 255.0
 
 CFG = {
     # maps/ 아래 yaml 파일명만 (절대경로 넣어도 됨)
-    "map_name": "cartographer_map_20260816_234629.yaml",
+    "map_name": "cartographer_map_20260817_003202.yaml",
     "map_dir": _DEFAULT_MAP_DIR,
     "out_csv": os.path.join(_SCRIPT_DIR, "..", "config", "centerline.csv"),
 }

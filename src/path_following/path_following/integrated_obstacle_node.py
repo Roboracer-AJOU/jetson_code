@@ -35,7 +35,7 @@ CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
     # CSV(centerline/raceline)·로컬라이제이션 pbstream·static_obstacle_node 와
     # 반드시 같은 맵이어야 한다. 어긋나면 벽을 장애물로 보거나 그 반대가 된다.
-    "map_name": "cartographer_map_20260816_234629.yaml",  # 이전 20260816_211739
+    "map_name": "cartographer_map_20260817_003202.yaml",  # 이전 20260816_211739
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",

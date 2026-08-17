@@ -1391,7 +1391,7 @@ ros2 run path_following drive_monitor
 ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765
 
 
-ws://192.168.137.20:8765
+ws://192.168.137.181:8765
 
 로거 노드
 source /opt/ros/humble/setup.bash

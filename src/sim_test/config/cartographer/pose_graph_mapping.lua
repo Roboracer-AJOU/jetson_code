@@ -1,16 +1,18 @@
+-- Cartographer pose_graph.lua 기본값.
+
 POSE_GRAPH = {
   optimize_every_n_nodes = 90,
   constraint_builder = {
-    sampling_ratio = 0.12,
-    max_constraint_distance = 8.,
-    min_score = 0.70,
-    global_localization_min_score = 0.82,
+    sampling_ratio = 0.3,
+    max_constraint_distance = 15.,
+    min_score = 0.55,
+    global_localization_min_score = 0.6,
     loop_closure_translation_weight = 1.1e4,
     loop_closure_rotation_weight = 1e5,
-    log_matches = false,
+    log_matches = true,
     fast_correlative_scan_matcher = {
-      linear_search_window = 2.,
-      angular_search_window = math.rad(10.),
+      linear_search_window = 7.,
+      angular_search_window = math.rad(30.),
       branch_and_bound_depth = 7,
     },
     ceres_scan_matcher = {
@@ -45,8 +47,8 @@ POSE_GRAPH = {
       },
     },
   },
-  matcher_translation_weight = 6e2,
-  matcher_rotation_weight = 2e3,
+  matcher_translation_weight = 5e2,
+  matcher_rotation_weight = 1.6e3,
   optimization_problem = {
     huber_scale = 1e1,
     acceleration_weight = 1.1e2,
@@ -66,13 +68,13 @@ POSE_GRAPH = {
     ceres_solver_options = {
       use_nonmonotonic_steps = false,
       max_num_iterations = 50,
-      num_threads = 6,
+      num_threads = 7,
     },
   },
-  max_num_final_iterations = 120,
-  global_sampling_ratio = 0.0,
-  log_residual_histograms = false,
-  global_constraint_search_after_n_seconds = 1e9,
+  max_num_final_iterations = 200,
+  global_sampling_ratio = 0.003,
+  log_residual_histograms = true,
+  global_constraint_search_after_n_seconds = 10.,
 }
 
 return POSE_GRAPH

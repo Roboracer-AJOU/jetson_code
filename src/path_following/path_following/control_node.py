@@ -13,6 +13,7 @@ ESP → Jetson: RC,ch1_us,ch2_us,ch5_us,0  (raw PWM us, 1000~2000)
 from __future__ import annotations
 
 import math
+import os
 import select
 import struct
 import sys
@@ -33,9 +34,10 @@ from std_msgs.msg import Bool, Float32, Float64, Float64MultiArray
 # ============================================================
 CFG = {
     "drive_topic": "/drive",
-    "esp_port": "/dev/ttyTHS1",
-    "vesc_port": "/dev/ttyACM0",
-    "esp_baud": 115200,         # esp32_steer_rc_uart.ino (RC 텔레메트리 + S: 동일 UART)
+    # ESP: USB-C (C to C). auto = /dev/serial/by-id 에서 ESP 보드를 찾는다.
+    "esp_port": "auto",
+    "vesc_port": "/dev/serial/by-id/usb-STMicroelectronics_ChibiOS_RT_Virtual_COM_Port_304-if00",
+    "esp_baud": 115200,         # USB-C (RC 텔레메트리 + S:)
     "vesc_baud": 115200,
     # Stanley max_drive_speed / max_steering_angle 과 맞추면 1:1 스케일
     "max_speed_mps": 10.0,
@@ -68,7 +70,7 @@ CFG = {
     "invert_steer": False,
     "cmd_timeout_sec": 0.25,
     "timer_period_sec": 0.02,     # ESP loop 20ms — AUTO 조향 응답
-    "serial_open_delay_sec": 2.0,
+    "serial_open_delay_sec": 0.0,
     "enable_keyboard_estop": True,
     "estop_reset_key": "r",
     # RC (ESP -> RC,ch1_us,ch2_us,mode_us,0)  raw PWM us
@@ -127,6 +129,101 @@ CFG = {
     "gear_ratio": 12.0,
     "wheel_diameter": 0.10,
 }
+
+
+def _serial_by_id_ports() -> list[str]:
+    root = "/dev/serial/by-id"
+    if not os.path.isdir(root):
+        return []
+    return sorted(os.path.join(root, name) for name in os.listdir(root))
+
+
+def _is_vesc_id(path: str) -> bool:
+    name = os.path.basename(path)
+    return "ChibiOS" in name or "STMicroelectronics" in name
+
+
+def _is_imu_id(path: str) -> bool:
+    return "CP2102_USB_to_UART_Bridge_Controller_0001" in os.path.basename(path)
+
+
+def _is_esp_id(path: str) -> bool:
+    name = os.path.basename(path)
+    return any(
+        key in name
+        for key in (
+            "Espressif",
+            "USB_JTAG",
+            "USB_SERIAL",
+            "CH340",
+            "CH910",
+            "QinHeng",
+            "1a86",
+            "USB_Serial",
+        )
+    )
+
+
+def resolve_serial_port(role: str, configured: str) -> str:
+    configured = str(configured).strip()
+    if configured and configured != "auto" and os.path.exists(configured):
+        return configured
+
+    by_id = _serial_by_id_ports()
+    if role == "vesc":
+        for path in by_id:
+            if _is_vesc_id(path):
+                return path
+        raise RuntimeError(
+            "VESC USB를 못 찾음. 현재 by-id: " + (", ".join(by_id) or "없음")
+        )
+
+    for path in by_id:
+        if _is_vesc_id(path) or _is_imu_id(path):
+            continue
+        if _is_esp_id(path):
+            return path
+    extras = [
+        path for path in by_id if not _is_vesc_id(path) and not _is_imu_id(path)
+    ]
+    if extras:
+        return extras[0]
+    raise RuntimeError(
+        "ESP USB 시리얼을 못 찾음. /dev/ttyTHS1 UART는 쓰지 않음. "
+        "데이터 케이블로 ESP USB-C를 꽂은 뒤 ls -l /dev/serial/by-id 확인. "
+        "현재: " + (", ".join(by_id) or "없음")
+    )
+
+
+def _set_usb_latency_timer(port: str, latency_ms: int = 1) -> None:
+    name = os.path.basename(os.path.realpath(port))
+    for path in (
+        f"/sys/class/tty/{name}/device/latency_timer",
+        f"/sys/bus/usb-serial/devices/{name}/latency_timer",
+    ):
+        try:
+            with open(path, "w", encoding="ascii") as handle:
+                handle.write(str(int(latency_ms)))
+            return
+        except OSError:
+            continue
+
+
+def _open_serial(port: str, baud: int) -> serial.Serial:
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = int(baud)
+    ser.timeout = 0.0
+    ser.write_timeout = 0.0
+    ser.dsrdtr = False
+    ser.rtscts = False
+    # open() 전에 내려야 한다. pyserial 기본값이 True 라서 나중에 내리면
+    # 여는 순간 DTR 이 한 번 올라가고, ESP32 자동 리셋 회로가 이걸 리부팅으로 받는다.
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
+    _set_usb_latency_timer(port, 1)
+    return ser
 
 
 class VehicleControlNode(Node):
@@ -286,15 +383,12 @@ class VehicleControlNode(Node):
         self._esp_rx_buffer = bytearray()
         self._control_mode = "INIT"
 
-        self.get_logger().info(f"Opening ESP32 serial: {CFG['esp_port']}")
-        self.esp = serial.Serial(
-            str(CFG["esp_port"]), int(CFG["esp_baud"]), timeout=0.0
-        )
-
-        self.get_logger().info(f"Opening VESC serial: {CFG['vesc_port']}")
-        self.vesc = serial.Serial(
-            str(CFG["vesc_port"]), int(CFG["vesc_baud"]), timeout=0.0
-        )
+        esp_port = resolve_serial_port("esp", CFG["esp_port"])
+        vesc_port = resolve_serial_port("vesc", CFG["vesc_port"])
+        self.get_logger().info(f"Opening ESP32 USB-C: {esp_port}")
+        self.esp = _open_serial(esp_port, int(CFG["esp_baud"]))
+        self.get_logger().info(f"Opening VESC serial: {vesc_port}")
+        self.vesc = _open_serial(vesc_port, int(CFG["vesc_baud"]))
 
         time.sleep(float(CFG["serial_open_delay_sec"]))
 
@@ -506,10 +600,40 @@ class VehicleControlNode(Node):
         return -self._emergency_brake_duty * self._auto_duty_output_sign
 
     @staticmethod
+    def _parse_rc_kv_line(line: str):
+        """USB 디버그 포맷: COUNT=8 CH1=1505 CH2=1499 CH5=1000 CH6=1000 ... servo_cmd=90"""
+        fields = {}
+        for token in line.replace(",", " ").split():
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            fields[key.strip().upper()] = value.strip()
+        if "CH1" not in fields or "CH2" not in fields or "CH5" not in fields:
+            return None
+        try:
+            ch1 = int(float(fields["CH1"]))
+            ch2 = int(float(fields["CH2"]))
+            ch5 = int(float(fields["CH5"]))
+            ch6 = int(float(fields.get("CH6", "0")))
+        except ValueError:
+            return None
+        target_angle_deg = None
+        servo_command_deg = None
+        try:
+            if "TARGET" in fields:
+                target_angle_deg = float(fields["TARGET"])
+            if "SERVO_CMD" in fields:
+                servo_command_deg = float(fields["SERVO_CMD"])
+        except ValueError:
+            target_angle_deg = None
+            servo_command_deg = None
+        return (ch1, ch2, ch5, ch6, target_angle_deg, servo_command_deg)
+
+    @staticmethod
     def _parse_rc_line(line: str):
         parts = [item.strip() for item in line.strip().split(",")]
         if len(parts) < 5 or parts[0] != "RC":
-            return None
+            return VehicleControlNode._parse_rc_kv_line(line)
         try:
             ch1 = int(parts[1])
             ch2 = int(parts[2])

@@ -21,9 +21,10 @@ _LAUNCH_DIR = os.path.dirname(os.path.abspath(__file__))
 if _LAUNCH_DIR not in sys.path:
     sys.path.insert(0, _LAUNCH_DIR)
 
-from local_cpu_policy import local_cpu_prefix
+from local_cpu_policy import sensor_cpu_prefix
 
-_LOCAL_CPU = local_cpu_prefix()
+# LiDAR/IMU 드라이버는 로컬 처리 노드와 코어를 나눠 쓰지 않는다 (CPU 5 전용).
+_SENSOR_CPU = sensor_cpu_prefix()
 
 
 def _sensor_stack_actions(
@@ -51,7 +52,7 @@ def _sensor_stack_actions(
         executable='sllidar_node',
         name='sllidar_node',
         output='screen',
-        prefix=_LOCAL_CPU,
+        prefix=_SENSOR_CPU,
         respawn=True,
         respawn_delay=3.0,
         parameters=[{
@@ -74,7 +75,7 @@ def _sensor_stack_actions(
         executable='ebimu_driver',
         name='ebimu_driver',
         output='screen',
-        prefix=_LOCAL_CPU,
+        prefix=_SENSOR_CPU,
         respawn=True,
         respawn_delay=2.0,
         parameters=[{

@@ -1,3 +1,4 @@
+-- Cartographer trajectory_builder.lua 기본값.
 include "trajectory_builder_2d.lua"
 include "trajectory_builder_3d.lua"
 

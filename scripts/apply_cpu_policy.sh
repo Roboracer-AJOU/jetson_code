@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # CPU 정책 적용 (재시작 후에도 런치/데몬이 이걸 호출)
 #
-#   로컬(위치추정): 코어1~4 = CPU 0-3
-#   패스(경로추종): 코어4~6 = CPU 3-5 + nice 우선순위
+#   로컬 처리(위치추정): CPU 0-4  — cartographer/odom/map/rviz, 스케줄러가 분배
+#   로컬 센서:           CPU 5    — LiDAR/IMU 드라이버 전용
+#   패스(경로추종):      CPU 6-7  + nice 우선순위
 #
-# CPU 3 은 두 그룹이 공유한다. 패스 쪽이 CPU 4-5 만으로는 부족해서
-# (stanley+planner+AEB+obstacle+control+fgm 합이 코어 2개에 거의 꽉 찬다)
-# 한 코어를 더 빌려주는 것이다. 대신 CPU 3 에서는 두 그룹이 경합하므로,
-# 여기서는 nice 순서가 실제로 중요해진다. 음수 nice 가 적용되지 않으면
-# (sudo 없음) 공유 코어에서 cartographer 가 stanley 를 밀어낼 수 있다:
+# 8코어 전제다. nvpmodel 15W 는 CPU 4-7 을 오프라인으로 내리므로 MAXN 이어야 한다:
+#   sudo nvpmodel -m 0 && sudo jetson_clocks
+# 코어가 4개뿐이면 taskset 이 실패하고 커널 기본 스케줄링으로 돌아간다.
+#
+# 그룹끼리 코어를 공유하지 않으므로 예전처럼 경합으로 밀리는 일은 없다. 다만
+# 패스 그룹은 6개 노드가 코어 2개를 나눠 쓰므로 그룹 내부 nice 순서는 그대로
+# 중요하다. 음수 nice 는 root 가 필요하다:
 #   한 번만: sudo bash scripts/install_cpu_policy_sudoers.sh
 #
 # 사용:
@@ -29,7 +32,7 @@ for arg in "$@"; do
     --daemon) DAEMON=1; ONCE=0 ;;
     --once) ONCE=1 ;;
     --help|-h)
-      sed -n '2,12p' "$0"
+      sed -n '2,20p' "$0"
       exit 0
       ;;
   esac
@@ -94,12 +97,21 @@ pids_matching() {
 }
 
 apply_policy() {
-  # --- 로컬: CPU 0-3, nice 유지(0) ---
+  # --- 로컬 센서: CPU 5 전용 ---
+  # 스캔/IMU 주기가 밀리면 그 뒤 스택 전체가 같이 밀리므로 코어를 독점시킨다.
   local lp
   for pat in \
-    'cartographer_ros/cartographer_node' \
     'sllidar_node' \
-    'ebimu_driver' \
+    'ebimu_driver'
+  do
+    while read -r lp; do
+      apply_one "5" 0 "${lp}" "sensor"
+    done < <(pids_matching "${pat}")
+  done
+
+  # --- 로컬 처리: CPU 0-4, nice 유지(0) ---
+  for pat in \
+    'cartographer_ros/cartographer_node' \
     'vesc_wheel_odom\.py' \
     'sensor_static_tf' \
     'static_map_publisher' \
@@ -108,21 +120,21 @@ apply_policy() {
     'foxglove_bridge'
   do
     while read -r lp; do
-      apply_one "0-3" 0 "${lp}" "local"
+      apply_one "0-4" 0 "${lp}" "local"
     done < <(pids_matching "${pat}")
   done
   # localization launch parent
   while read -r lp; do
-    apply_one "0-3" 0 "${lp}" "local-launch"
+    apply_one "0-4" 0 "${lp}" "local-launch"
   done < <(pgrep -af 'ros2 launch localization_layer' | awk '/localization_layer/ {print $1}')
 
-  # --- 패스: CPU 4-5 + nice ---
+  # --- 패스: CPU 6-7 + nice ---
   # control (ros2 run / python .py 둘 다)
   while read -r lp; do
     local cmd
     cmd=$(ps -p "${lp}" -o args= 2>/dev/null || true)
     echo "${cmd}" | grep -q 'ros2 run path_following control_node' && continue
-    apply_one "3-5" -15 "${lp}" "control"
+    apply_one "6-7" -15 "${lp}" "control"
   done < <(pids_matching 'path_following/lib/path_following/control_node|python[0-9.]* control_node\.py')
 
   # FGM enable 중이면 FGM을 패스 코어 1순위 (nice -20). 플래그: /tmp/f1tenth_fgm_boost
@@ -134,16 +146,17 @@ apply_policy() {
     esac
   fi
 
-  while read -r lp; do apply_one "3-5" -10 "${lp}" "stanley"; done < <(pids_matching 'stanley_waypoint_follow_node')
-  while read -r lp; do apply_one "3-5" -5 "${lp}" "planner"; done < <(pids_matching 'local_planner_node')
-  while read -r lp; do apply_one "3-5" 0 "${lp}" "obstacle"; done < <(pids_matching 'integrated_obstacle_node|static_obstacle_node')
+  while read -r lp; do apply_one "6-7" -10 "${lp}" "stanley"; done < <(pids_matching 'stanley_waypoint_follow_node')
+  while read -r lp; do apply_one "6-7" -5 "${lp}" "planner"; done < <(pids_matching 'local_planner_node')
+  while read -r lp; do apply_one "6-7" -8 "${lp}" "aeb"; done < <(pids_matching 'emergency_brake_node')
+  while read -r lp; do apply_one "6-7" 0 "${lp}" "obstacle"; done < <(pids_matching 'integrated_obstacle_node|static_obstacle_node')
   local fgm_label="fgm"
   [[ "${fgm_boost}" -eq 1 ]] && fgm_label="fgm-boost"
   while read -r lp; do
-    apply_one "3-5" "${fgm_nice}" "${lp}" "${fgm_label}"
+    apply_one "6-7" "${fgm_nice}" "${lp}" "${fgm_label}"
   done < <(pids_matching 'fgm_node')
-  while read -r lp; do apply_one "3-5" 10 "${lp}" "path-launch"; done < <(pgrep -af 'ros2 launch path_following' | awk '/path_follow_/ {print $1}')
-  while read -r lp; do apply_one "3-5" 19 "${lp}" "viz"; done < <(pids_matching 'stack_status_node|drive_monitor')
+  while read -r lp; do apply_one "6-7" 10 "${lp}" "path-launch"; done < <(pgrep -af 'ros2 launch path_following' | awk '/path_follow_/ {print $1}')
+  while read -r lp; do apply_one "6-7" 19 "${lp}" "viz"; done < <(pids_matching 'stack_status_node|drive_monitor')
 }
 
 run_once() {
