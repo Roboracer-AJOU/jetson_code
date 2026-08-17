@@ -81,7 +81,24 @@ CFG = {
     "rc_max_val": 3000,
     "rc_deadzone": 30,
     "rc_timeout_sec": 0.30,
-    "ch6_estop_us": 1700,         # ESP 다섯 번째 값이 CH6이면 >=1700 ESTOP latch
+    # ESP validUs() 와 같은 범위. 밖이면 그 채널은 손실로 본다.
+    "rc_valid_min_us": 800,
+    "rc_valid_max_us": 2200,
+    # ESP ESTOP_THRESHOLD_US 와 같은 값이어야 한다. 젯슨이 더 높으면 ESP 는 서보를
+    # 중앙에 고정하는데 젯슨은 duty 를 계속 내보내는 구간이 생긴다.
+    # CH340 DTR/RTS 자동 리셋 회로 때문에 포트를 여는 순간 ESP 가 재부팅된다
+    # (rst:0x1 POWERON_RESET). 리눅스 tty 가 open 시 DTR 을 올려서 pyserial 로는 못 막는다.
+    # 부팅 + PPM 재동기가 끝날 때까지 RC 를 손실로 두고 duty 를 끊는 유예 시간.
+    "esp_boot_settle_sec": 1.5,
+    # ESP 가 리셋 후 PPM 락에 실패했을 때 다시 리셋을 걸기까지 기다리는 시간과 횟수.
+    # 실측상 리셋 1회당 락 성공률이 약 2/3 이라 5회면 사실상 확실히 붙는다.
+    "esp_recovery_wait_sec": 2.0,
+    "esp_recovery_max_tries": 5,
+    # ESP ESTOP_THRESHOLD_US / ESTOP_RELEASE_US 와 같은 값이어야 한다.
+    # 1500 은 3단 스위치 중립값과 겹쳐서 가만히 있어도 ESTOP 이 걸렸다.
+    # 실측 정상값 CH6=1000, ESTOP 위치=2000.
+    "ch6_estop_us": 1700,         # CH6 >= 1700 ESTOP latch
+    "ch6_estop_release_us": 1400,  # CH6 <= 1400 이면 RC 로 건 latch 해제 (히스테리시스)
     "invert_rc_throttle": False,  # 송신기 CH2 전후진 duty 부호 (True면 반전)
     "auto_duty_ramp_sec": 1.0,    # AUTO: /drive duty → VESC (1초에 목표까지)
     "telemetry_topic": "/vehicle/telemetry",  # drive_monitor.py 구독
@@ -267,7 +284,12 @@ class VehicleControlNode(Node):
         self._rc_max_val = int(CFG["rc_max_val"])
         self._rc_deadzone = int(CFG["rc_deadzone"])
         self._rc_timeout = float(CFG["rc_timeout_sec"])
-        self._ch6_estop_us = int(CFG.get("ch6_estop_us", 1700))
+        self._rc_valid_min_us = int(CFG.get("rc_valid_min_us", 800))
+        self._rc_valid_max_us = int(CFG.get("rc_valid_max_us", 2200))
+        self._ch6_estop_us = int(CFG.get("ch6_estop_us", 1500))
+        self._ch6_estop_release_us = min(
+            int(CFG.get("ch6_estop_release_us", 1400)), self._ch6_estop_us
+        )
         self._invert_rc_throttle = bool(CFG.get("invert_rc_throttle", False))
         self._auto_duty_ramp_sec = max(0.0, float(CFG.get("auto_duty_ramp_sec", 1.0)))
         self._max_auto_duty = max(0.0, float(CFG.get("max_auto_duty", 0.30)))
@@ -324,6 +346,7 @@ class VehicleControlNode(Node):
 
         self._estop_lock = threading.Lock()
         self._estop_latched = False
+        self._estop_source: str | None = None
         self._keyboard_running = False
         self._keyboard_thread: threading.Thread | None = None
         self._stdin_termios_old = None
@@ -376,12 +399,28 @@ class VehicleControlNode(Node):
         self._rc_ch5 = 1000
         self._rc_ch6 = 0
         self._last_rc_time = 0.0
+        self._rc_signal_ok = True
         self.esp32_target_angle_deg = None
         self.esp32_servo_command_deg = None
         self.last_esp32_packet_time = None
         self.last_esp32_steering_time = None
         self._esp_rx_buffer = bytearray()
         self._control_mode = "INIT"
+
+        # CH340 자동 리셋 때문에 포트를 열면 ESP 가 반드시 한 번 재부팅된다.
+        # 부팅 + PPM 재동기가 끝날 때까지는 RC 를 손실로 취급해야 안전하다.
+        self._esp_boot_settle_sec = float(CFG.get("esp_boot_settle_sec", 1.5))
+        self._esp_boot_time = time.time()
+        self._esp_boot_log_time = 0.0
+        self._esp_boot_count = 0
+        self._esp_unparsed_count = 0
+        self._esp_unparsed_log_time = 0.0
+
+        # PPM 락 실패 시 ESP 를 다시 리셋해서 되살리는 우회책
+        self._esp_recovery_wait_sec = float(CFG.get("esp_recovery_wait_sec", 2.0))
+        self._esp_recovery_max_tries = int(CFG.get("esp_recovery_max_tries", 5))
+        self._esp_recovery_tries = 0
+        self._esp_rc_dead_since = 0.0
 
         esp_port = resolve_serial_port("esp", CFG["esp_port"])
         vesc_port = resolve_serial_port("vesc", CFG["vesc_port"])
@@ -472,10 +511,30 @@ class VehicleControlNode(Node):
         with self._estop_lock:
             return self._estop_latched
 
-    def _set_estop_latched(self, latched: bool) -> None:
+    def _set_estop_latched(self, latched: bool, source: str = "key") -> None:
+        """source: latch 를 건 주체. 'rc' 로 건 것은 'rc' 로만, 'key' 로 건 것은
+        키보드로만 풀린다. 조종기 글리치로 걸린 latch 가 키보드 없이는 안 풀려서
+        모든 명령이 먹통이 되던 문제 때문이다."""
         with self._estop_lock:
-            changed = self._estop_latched != latched
-            self._estop_latched = latched
+            if latched:
+                changed = not self._estop_latched
+                self._estop_latched = True
+                if changed:
+                    self._estop_source = source
+            else:
+                # 키보드는 마스터 리셋이라 무엇으로 걸렸든 푼다. RC 는 RC 로 건
+                # latch 만 풀 수 있어서, 사람이 스페이스로 건 정지를 조종기가
+                # 임의로 해제하지 못한다.
+                if (
+                    self._estop_latched
+                    and source == "rc"
+                    and self._estop_source != "rc"
+                ):
+                    return
+                changed = self._estop_latched
+                self._estop_latched = False
+                self._estop_source = None
+            held_by = self._estop_source
         if not changed:
             return
         self.current_duty = 0.0
@@ -484,8 +543,15 @@ class VehicleControlNode(Node):
         self._last_duty_int = None
         self._last_duty_packet = None
         if latched:
-            self.get_logger().warn("ESTOP latched — output forced to zero (press "
-                                   f"{self._estop_reset_key.upper()} to reset)")
+            how = (
+                "CH6 를 내리거나 "
+                if held_by == "rc"
+                else ""
+            )
+            self.get_logger().warn(
+                f"ESTOP latched ({held_by}) — output forced to zero "
+                f"({how}{self._estop_reset_key.upper()} 키로 해제)"
+            )
         else:
             self.get_logger().info("ESTOP cleared — /drive commands accepted again")
 
@@ -666,6 +732,127 @@ class VehicleControlNode(Node):
             servo_command_deg,
         )
 
+    def _valid_us(self, value: int) -> int:
+        """ESP validUs() 와 같은 판정. 범위 밖이면 0(손실)으로 표시한다."""
+        if self._rc_valid_min_us <= value <= self._rc_valid_max_us:
+            return value
+        return 0
+
+    # ESP32 ROM 부트로더가 리셋 직후 115200 으로 뱉는 문자열들.
+    # CH340 의 DTR/RTS 자동 리셋 회로 때문에 포트를 열 때마다 리셋이 걸린다.
+    _ESP_BOOT_MARKERS = (
+        "rst:0x",
+        "ets ",
+        "boot:0x",
+        "SPI_FAST_FLASH_BOOT",
+        "entry 0x",
+        "ESP32 RC + Jetson",
+    )
+
+    def _looks_like_esp_boot(self, line: str) -> bool:
+        return any(marker in line for marker in self._ESP_BOOT_MARKERS)
+
+    def _note_esp_reboot(self, line: str) -> None:
+        """ESP 재부팅 감지. 서보는 90도로 돌아갔고 PPM 은 재동기 전이다."""
+        now = time.time()
+        self._esp_boot_time = now
+        # 부팅 직후 값은 신뢰할 수 없다. RC 를 손실로 떨어뜨려 duty 를 끊는다.
+        self._rc_ch1 = 0
+        self._rc_ch2 = 0
+        self._rc_ch5 = 0
+        self._rc_ch6 = 0
+        self._last_rc_time = 0.0
+        self._mode_auto_latched = False
+        if now - self._esp_boot_log_time > 1.0:
+            self._esp_boot_log_time = now
+            self._esp_boot_count += 1
+            self.get_logger().warn(
+                f"ESP32 재부팅 감지 (#{self._esp_boot_count}): {line.strip()[:60]!r} "
+                "— 서보 중앙 복귀, PPM 재동기 대기. MANUAL 강제, duty 0"
+            )
+
+    def _note_unparsed_esp_line(self, line: str) -> None:
+        text = line.strip()
+        if not text:
+            return
+        if self._looks_like_esp_boot(text):
+            self._note_esp_reboot(text)
+            return
+        self._esp_unparsed_count += 1
+        now = time.time()
+        if now - self._esp_unparsed_log_time > 5.0:
+            self._esp_unparsed_log_time = now
+            self.get_logger().warn(
+                f"ESP 시리얼 해석 불가 (누적 {self._esp_unparsed_count}): {text[:60]!r}"
+            )
+
+    def _pulse_esp_reset(self) -> None:
+        """DTR/RTS 로 ESP32 를 하드 리셋한다.
+
+        CH340 자동 리셋 회로는 RTS 가 EN, DTR 이 GPIO0 에 물려 있다.
+        GPIO0 를 놓아둔 채 EN 만 잠깐 내렸다 올리면 일반 부팅으로 재시작한다.
+        """
+        self.esp.dtr = False
+        self.esp.rts = True
+        time.sleep(0.05)
+        self.esp.rts = False
+        self.esp.reset_input_buffer()
+        self._esp_rx_buffer.clear()
+
+    def _esp_ppm_recovery_check(self, now: float) -> None:
+        """PPM 락에 실패한 ESP 를 다시 리셋해서 되살린다.
+
+        ESP 는 리셋 후 약 1/3 확률로 PPM 캡처가 살아나지 못하고, 한 번 그렇게
+        되면 스스로 복구되지 않는다 (텔레메트리는 계속 RC,0,0,0,0). 젯슨이 USB 를
+        열 때마다 CH340 이 ESP 를 리셋시키므로 주행 시작 때마다 재현된다.
+
+        펌웨어 쪽 재무장 워치독이 올라가기 전까지의 우회책이다. 리셋을 다시
+        걸면 다음 시도에서 락이 걸릴 확률이 그만큼 생긴다.
+        """
+        if self._esp_recovery_tries >= self._esp_recovery_max_tries:
+            return
+        if self._esp_booting(now):
+            return
+        # 링크 자체가 죽었으면(텔레메트리 없음) 리셋해도 의미가 없다.
+        if self.last_esp32_packet_time is None:
+            return
+        if now - self.last_esp32_packet_time > 0.5:
+            return
+        # RC 가 살아 있으면 할 일이 없다.
+        if self._rc_fresh(now):
+            self._esp_recovery_tries = 0
+            self._esp_rc_dead_since = 0.0
+            return
+        # 움직이는 중에는 건드리지 않는다.
+        if abs(self._measured_speed_mps) > 0.05:
+            return
+
+        if self._esp_rc_dead_since <= 0.0:
+            self._esp_rc_dead_since = now
+            return
+        if now - self._esp_rc_dead_since < self._esp_recovery_wait_sec:
+            return
+
+        self._esp_recovery_tries += 1
+        self._esp_rc_dead_since = 0.0
+        self.get_logger().warn(
+            f"ESP PPM 락 실패 — ESP 재리셋 시도 "
+            f"{self._esp_recovery_tries}/{self._esp_recovery_max_tries}"
+        )
+        try:
+            self._pulse_esp_reset()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"ESP 재리셋 실패: {exc}")
+
+    def _esp_booting(self, now: float) -> bool:
+        """부팅 직후 PPM 재동기 구간. 이 동안은 무조건 안전 상태로 둔다."""
+        if self._esp_boot_time <= 0.0:
+            return False
+        if now - self._esp_boot_time <= self._esp_boot_settle_sec:
+            return True
+        self._esp_boot_time = 0.0
+        return False
+
     def _read_esp_rc(self) -> None:
         waiting = self.esp.in_waiting
         if waiting <= 0:
@@ -683,6 +870,7 @@ class VehicleControlNode(Node):
             del self._esp_rx_buffer[: nl + 1]
             parsed = self._parse_rc_line(line)
             if parsed is None:
+                self._note_unparsed_esp_line(line)
                 continue
             (
                 ch1,
@@ -693,12 +881,32 @@ class VehicleControlNode(Node):
                 servo_command_deg,
             ) = parsed
             packet_time = time.time()
+            # ESP 는 PPM 을 잃으면 RC,0,0,0,0 을 계속 보낸다. 범위 검증 없이 받으면
+            # 이 프레임이 '최신 정상 RC' 로 취급돼서, 조종기가 끊겨도 AUTO 가 유지되고
+            # VESC duty 가 계속 나간다. 값이 깨진 프레임도 같은 경로로 모드를 뒤집었다.
+            ch1 = self._valid_us(ch1)
+            ch2 = self._valid_us(ch2)
+            ch5 = self._valid_us(ch5)
+            ch6 = self._valid_us(ch6)
+
             self._rc_ch1 = ch1
             self._rc_ch2 = ch2
             self._rc_ch5 = ch5
             self._rc_ch6 = ch6
-            self._last_rc_time = packet_time
             self.last_esp32_packet_time = packet_time
+
+            # 링크(USB)는 살아 있어도 조종기 신호가 없으면 RC 는 stale 로 둔다.
+            rc_link_ok = ch5 > 0 or ch1 > 0 or ch2 > 0 or ch6 > 0
+            if rc_link_ok:
+                self._last_rc_time = packet_time
+                if not self._rc_signal_ok:
+                    self._rc_signal_ok = True
+                    self.get_logger().info("RC 신호 복구 — 조종기 프레임 정상")
+            elif self._rc_signal_ok:
+                self._rc_signal_ok = False
+                self.get_logger().warn(
+                    "RC 신호 손실 (ESP PPM failsafe) — MANUAL 강제, duty 0"
+                )
 
             if target_angle_deg is not None and servo_command_deg is not None:
                 self.esp32_target_angle_deg = target_angle_deg
@@ -713,14 +921,32 @@ class VehicleControlNode(Node):
                 servo_msg.data = float(servo_command_deg)
                 self.esp32_servo_command_pub.publish(servo_msg)
 
-            if ch6 >= self._ch6_estop_us:
-                self._set_estop_latched(True)
+            if ch6 > 0:
+                if ch6 >= self._ch6_estop_us:
+                    self._set_estop_latched(True, source="rc")
+                elif ch6 <= self._ch6_estop_release_us:
+                    self._set_estop_latched(False, source="rc")
+
+    def _rc_fresh(self, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        if self._esp_booting(now):
+            return False
+        if self._last_rc_time <= 0.0:
+            return False
+        if self._rc_timeout <= 0.0:
+            return True
+        return (now - self._last_rc_time) <= self._rc_timeout
 
     def _is_autonomous_mode(self) -> bool:
-        if self._last_rc_time <= 0.0:
+        # RC 가 끊기면 AUTO 를 유지하지 않는다. 예전에는 latch 를 그대로 돌려줘서
+        # 조종기가 죽어도 자율 duty 가 계속 나갔다.
+        if not self._rc_fresh():
+            self._mode_auto_latched = False
             return False
         ch5 = self._rc_ch5
         if ch5 <= 0:
+            # 프레임 한두 개가 깨진 경우. 위 stale 검사가 지속 손실을 잡으므로
+            # 여기서는 직전 모드를 유지해 순간 글리치로 모드가 튀지 않게 한다.
             return self._mode_auto_latched
         if ch5 <= self._ch5_manual_us:
             self._mode_auto_latched = False
@@ -1016,6 +1242,7 @@ class VehicleControlNode(Node):
         self._last_timer_time = now
 
         self._read_esp_rc()
+        self._esp_ppm_recovery_check(now)
         self._poll_vesc_telemetry(now)
         autonomous = self._is_autonomous_mode()
         self._control_mode = "AUTO" if autonomous else "MANUAL"
@@ -1072,12 +1299,8 @@ class VehicleControlNode(Node):
         else:
             self._reset_auto_steer()
             self._reset_speed_controller()
-            rc_fresh = (
-                self._last_rc_time > 0.0
-                and (time.time() - self._last_rc_time) <= self._rc_timeout
-            )
             target_duty = (
-                self._rc_ch2_to_duty(self._rc_ch2) if rc_fresh else 0.0
+                self._rc_ch2_to_duty(self._rc_ch2) if self._rc_fresh(now) else 0.0
             )
             self.current_duty = self._apply_manual_duty_rate_limit(target_duty, dt)
             self.current_steer = 0.0
