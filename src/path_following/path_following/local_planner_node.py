@@ -182,11 +182,11 @@ CFG = {
     # 각을 눕히는 방법은 길이뿐인데(L >= 1.875*|d0|/tan) 트랙 둘레가 41 m 라
     # 무한정 늘릴 수 없어서, 고속쪽 하한을 10° 로 막아 둔다.
     "rejoin_max_heading_deg": 18.0,
-    "rejoin_min_heading_deg": 10.0,
+    "rejoin_min_heading_deg": 7.0,
     # 합류 시 라인을 넘어가도 좋은 양 [m] 과 추종 지연 [s].
     # 오버슈트 ≈ v·sin(ψ)·τ 를 이 값 이하로 누르는 각을 쓴다.
     # 6 m/s 에서 10°, 4 m/s 에서 14.5°, 2.5 m/s 에서 18° 가 나온다.
-    "rejoin_merge_overshoot_m": 0.30,
+    "rejoin_merge_overshoot_m": 0.20,
     "rejoin_track_lag_s": 0.30,
     # 차가 실제로 낼 수 있는 최대 경로곡률 [1/m] = tan(전륜각)/축거.
     # 실측 전륜각 21.4°, 축거 0.33 m → 1.19. 이걸 넘는 복귀 경로는 아무리
@@ -276,7 +276,7 @@ CFG = {
     # 폭이었다. 레이스라인 한쪽 여유가 아니다. 그래서 벽에 박았다.)
     "avoid_offset_max_m": 0.70,
     "avoid_offset_a_lat_enter": 3.0,    # 진입 횡가속 예산. 낮출수록 멀리서 시작
-    "avoid_offset_a_lat_exit": 2.0,     # 복귀 예산. 진입보다 낮게 = 천천히 붙음
+    "avoid_offset_a_lat_exit": 1.8,     # 복귀 예산. 진입보다 낮게 = 천천히 붙음
     "avoid_offset_a_lat_hard": 4.5,     # 넘으면 조향 대신 감속으로 답한다
     "avoid_offset_enter_min_m": 1.0,
     "avoid_offset_enter_max_m": 9.0,

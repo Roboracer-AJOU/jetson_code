@@ -182,7 +182,7 @@ CFG = {
     # 문제 구간인 3~5 m/s 에서 실각 0.98 로 운동학적 정확값에 맞춘다.
     "ff_gain_schedule_enable": True,  # 이전 기본값 False (고정 ff_gain 1.3)
     "ff_gain_speed_bp": [1.0, 3.0, 5.0, 7.0, 10.0],
-    "ff_gain_bp": [2.3, 3.0, 3.5, 3.8, 4.0],
+    "ff_gain_bp": [2.3, 2.5, 3.0, 3.3, 3.5],
     "ff_sign": 1.0,              # 좌우 반대면 -1.0
     "ff_lookahead_m": 0.8,       # best_i 기준 앞쪽 평균 곡률 구간 [m]
     "ff_kappa_clip": 2.5,        # |κ| 상한 [1/m] (스파이크 방지)

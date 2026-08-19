@@ -23,7 +23,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -57,11 +56,19 @@ class _Aeb:
         self.reverse_max_sec = kw.get("reverse_max_sec", 2.0)
         self.reverse_min_clearance = kw.get("reverse_min_clearance", 0.60)
         self.reverse_abort_clearance = kw.get("reverse_abort_clearance", 0.25)
+        self.reverse_stuck_sec = kw.get("reverse_stuck_sec", 1.0)
+        self.reverse_stuck_obstacle = kw.get("reverse_stuck_obstacle", 0.79)
+        self.reverse_cooldown_sec = kw.get("reverse_cooldown_sec", 3.0)
+        self.stuck_speed = 0.05
+        self._reverse_ready_at = 0.0
+        self._idle_since = 0.0
         self.escape_enable = True
         self.escape_min_travel = 0.35
         self.escape_max_sec = 3.0
         self.escape_speed_end = 1.0
-        self.escape_hard_stop = 0.12
+        # 실제 설정값. 이 값이 곧 실차에서 문제가 된 지점이라 낮춰 잡으면
+        # 재현이 안 된다.
+        self.escape_hard_stop = round(vg.LASER_TO_FRONT_M + 0.05, 3)  # 0.24
         self._escape_until = 0.0
         self._escape_travel = 0.0
         self._escape_count = 0
@@ -89,6 +96,7 @@ class _Aeb:
     update = EmergencyBrakeNode._update_reverse
     open_window = EmergencyBrakeNode._open_escape_window
     update_window = EmergencyBrakeNode._update_escape_window
+    is_stuck = EmergencyBrakeNode._stuck_against_something
 
 
 def test_a_stalled_forward_escape_triggers_the_reverse():
@@ -215,97 +223,224 @@ def test_an_idle_machine_reports_not_reversing():
     assert a.update(0.0, TICK) is False
 
 
+# ── 그냥 서 있는 것도 실패다 (탈출 창과 무관) ───────────────────────────
+
+
+def _sit_still(a: _Aeb, closest: float, secs: float, speed: float = 0.0):
+    """정지 상태로 시간을 흘리고, 후진이 걸린 시각을 낸다 (없으면 None)."""
+    a._speed = speed
+    now = 0.0
+    for _ in range(int(secs / TICK)):
+        now += TICK
+        if a._reverse_until <= 0.0 and a.is_stuck(now, closest):
+            a.start(now)
+            if a._reverse_until > 0.0:
+                return now
+    return None
+
+
+def test_regression_the_hardstop_loop_no_longer_traps_the_car():
+    """실차에서 탈출 창 #105 까지 헛돌던 상황.
+
+    `closest`(0.24) 가 `escape_hard_stop`(0.24) 과 같은 값이라 창이 열린 다음
+    틱에 hard_stop 침범으로 닫힌다. 시간 초과 분기에 영영 도달하지 못하니
+    거기 걸어 둔 후진 판정도 영영 안 걸렸다. 차는 조향만 떨며 서 있었다.
+
+    그래서 창이 아니라 결과를 본다 — 서 있으면 못 나가는 것이다.
+    """
+    a = _Aeb()
+    # 로그의 0.24 는 반올림 표시고 실제 값은 임계 언저리에서 흔들린다.
+    # 임계 바로 아래로 한 번만 내려가도 창이 그 틱에 닫힌다.
+    at_threshold = a.escape_hard_stop - 0.005
+
+    a.open_window(0.0)
+    # 창이 hard_stop 으로 즉시 닫힌다 (stalled 아님 → 예전 경로로는 안 걸림)
+    assert a.update_window(TICK, TICK, closest=at_threshold) is False
+    assert "hard_stop" in a.log
+    assert a._reverse_until == 0.0, "예전 경로로는 안 걸리는 게 맞다"
+
+    assert _sit_still(a, closest=at_threshold, secs=3.0) is not None, "여전히 갇힌다"
+    assert "후진 탈출 시작" in a.log
+
+
+def test_it_waits_the_full_second_before_giving_up():
+    a = _Aeb(reverse_stuck_sec=1.0)
+    at = _sit_still(a, closest=0.30, secs=3.0)
+    assert at == pytest.approx(1.0, abs=2 * TICK)
+
+
+def test_stopping_with_nothing_ahead_is_just_parked():
+    """출발 전 정차나 신호 대기까지 후진하면 안 된다."""
+    a = _Aeb()
+    assert _sit_still(a, closest=3.0, secs=5.0) is None
+
+
+def test_crawling_forward_resets_the_clock():
+    """조금이라도 나아가고 있으면 갇힌 게 아니다."""
+    a = _Aeb(reverse_stuck_sec=1.0)
+    now = 0.0
+    for i in range(200):
+        now += TICK
+        # 0.5 초마다 한 틱씩 움직인다
+        a._speed = 0.5 if i % 25 == 0 else 0.0
+        if a.is_stuck(now, 0.30):
+            a.start(now)
+    assert a._reverse_until == 0.0, f"기어가는 중인데 후진: {a.log}"
+
+
+def test_it_does_not_back_up_over_and_over():
+    """물러난 직후 또 걸리면 뒤가 빌 때까지 뒷걸음질한다."""
+    a = _Aeb(reverse_cooldown_sec=3.0)
+    a.start(0.0)
+    _back_up(a)                      # 정상 종료 → 쿨다운 시작
+    assert a._reverse_ready_at > 0.0
+    a._speed = 0.0
+    a._idle_since = 0.0
+    # 쿨다운 안에서는 아무리 서 있어도 안 걸린다
+    now = a._reverse_ready_at - 0.5
+    assert a.is_stuck(now, 0.30) is False or (a.start(now) or a._reverse_until == 0.0)
+
+
+def test_a_blocked_rear_does_not_spam_the_log():
+    """앞뒤 다 막힌 상태는 매 틱 참이다. 20 Hz 로 찍으면 로그가 죽는다."""
+    a = _Aeb(rear=0.10)
+    now = 0.0
+    for _ in range(200):  # 4 초
+        now += TICK
+        a.start(now)
+    assert a.log.count("전진도 후진도 막혔다") <= 3
+
+
 # ── 후방 여유 측정 ──────────────────────────────────────────────────────
 
 
-class _Scan:
-    """라이다 원점 기준 360° 스캔."""
+STEP = EmergencyBrakeNode._REVERSE_PROBE_STEP_M
 
-    def __init__(self, ranges, angle_min=-np.pi, inc=None):
-        self.ranges = list(ranges)
-        self.angle_min = angle_min
-        self.angle_increment = (
-            inc if inc is not None else 2.0 * np.pi / len(self.ranges)
-        )
+
+class _Map:
+    """벽까지 거리를 직접 주는 가짜 맵.
+
+    실차 맵은 distance transform 격자지만, 여기서 보고 싶은 건 그 값을
+    어떻게 읽어 뒤로 얼마나 갈 수 있다고 판단하는가다.
+    """
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def clearance_at(self, x: float, y: float) -> float:
+        return self._fn(x, y)
 
 
 class _Rear:
-    def __init__(self, scan):
-        self._scan = scan
-        self._beam_angles = None
-        self.min_range = 0.05
-        self.max_range = 6.0
-        self.reverse_half_width = 0.25
+    """차가 map 원점에 +x 를 보고 서 있는 상태."""
 
-    _beam_angle_array = EmergencyBrakeNode._beam_angle_array
+    def __init__(self, gmap, tf=(1.0, 0.0, 0.0, 0.0), **kw):
+        self._map = gmap
+        self._tf = tf
+        self.reverse_map_margin = kw.get("margin", 0.10)
+        self.reverse_travel = kw.get("travel", 0.40)
+        self.reverse_min_clearance = kw.get("min_clearance", 0.60)
+
+    _REVERSE_PROBE_STEP_M = STEP
+
+    def _lookup_laser_to_map(self):
+        return self._tf
+
     clearance = EmergencyBrakeNode._rear_clearance
 
 
-def _uniform(n: int, r: float) -> _Scan:
-    return _Scan([r] * n)
+def _wall_at(x_wall: float):
+    """x = x_wall 에 놓인 벽 하나. 그 앞쪽은 벽까지 거리가 곧 여유다."""
+    return _Map(lambda x, y: abs(x - x_wall))
 
 
-def _wall_behind(dist: float, n: int = 720) -> _Scan:
-    """x = -dist 에 놓인 평면 벽. 뒤를 향하지 않는 빔은 멀리 둔다."""
-    ranges = []
-    for i in range(n):
-        angle = -np.pi + i * (2.0 * np.pi / n)
-        c = np.cos(angle)
-        ranges.append(dist / -c if c < -0.2 else 6.0)
-    return _Scan(ranges, inc=2.0 * np.pi / n)
+LIMIT = 1.0  # travel 0.40 + min_clearance 0.60
 
 
-def test_the_rear_clearance_is_measured_from_the_bumper():
+def test_it_reports_how_far_the_bumper_can_travel():
+    """뒤끝이 x=-0.41 이고 벽이 x=-1.41 이면 1.0 m 갈 수 있다.
+
+    다만 중심선 기준이라 차 반폭+여유(0.25) 만큼 일찍 막힌 것으로 본다.
+    보수적인 쪽이라 그대로 둔다.
+    """
+    need = vg.HALF_WIDTH_M + 0.10
+    got = _Rear(_wall_at(-(vg.LASER_TO_REAR_M + 1.0))).clearance()
+    want = 1.0 - need  # 0.75
+    # 0.05 간격으로 훑으므로 한 칸까지는 늦게 잡힐 수 있다
+    assert want <= got <= want + STEP + 1e-9
+
+
+def test_a_wall_right_behind_gives_nothing():
+    got = _Rear(_wall_at(-(vg.LASER_TO_REAR_M + 0.05))).clearance()
+    assert got == 0.0
+
+
+def test_it_stops_looking_once_it_has_seen_enough():
+    """더 멀리 재 봐야 쓰지도 않는다 — 상한에서 자른다."""
+    assert _Rear(_Map(lambda x, y: 50.0)).clearance() == pytest.approx(LIMIT)
+
+
+def test_the_offset_to_the_rear_bumper_is_applied():
     """라이다가 축보다 0.31 m 앞이라 뒤끝까지가 0.41 m 다.
 
-    스캔 거리를 그대로 쓰면 있지도 않은 여유 0.41 m 를 믿고 벽에 박는다.
+    이 오프셋을 빼먹으면 있지도 않은 0.41 m 를 믿고 벽으로 민다.
     """
-    got = _Rear(_wall_behind(1.0)).clearance()
-    assert got == pytest.approx(1.0 - vg.LASER_TO_REAR_M, abs=0.01)
     assert vg.LASER_TO_REAR_M == pytest.approx(0.41)
+    seen: list[float] = []
+    _Rear(_Map(lambda x, y: seen.append(x) or 50.0)).clearance()
+    assert seen[0] == pytest.approx(-vg.LASER_TO_REAR_M)
 
 
-def test_things_beside_the_car_do_not_count_as_behind_it():
-    """옆 벽까지 세면 좁은 복도에서 후진이 영영 안 열린다."""
-    n = 360
-    ranges = [6.0] * n
-    for i in range(n):
-        angle = -np.pi + i * (2.0 * np.pi / n)
-        # 정확히 옆(±90°) 0.3 m — 후방 코리도 밖이다
-        if abs(abs(angle) - np.pi / 2) < np.radians(3.0):
-            ranges[i] = 0.3
-    assert _Rear(_Scan(ranges)).clearance() > 1.0
+def test_it_follows_the_car_heading():
+    """차가 돌아 서 있으면 '뒤' 도 같이 돈다. 맵 축이 아니다."""
+    # +y 를 보고 서 있다 (yaw=90°) → 뒤는 -y 방향
+    tf = (0.0, 1.0, 0.0, 0.0)
+    seen: list[tuple] = []
+    _Rear(_Map(lambda x, y: seen.append((x, y)) or 50.0), tf=tf).clearance()
+    x0, y0 = seen[0]
+    assert x0 == pytest.approx(0.0)
+    assert y0 == pytest.approx(-vg.LASER_TO_REAR_M)
 
 
-def test_the_front_is_ignored():
-    """앞이 코앞이라서 후진하는 것이다. 앞을 세면 시작조차 못 한다."""
-    n = 360
-    ranges = [3.0] * n
-    for i in range(n):
-        angle = -np.pi + i * (2.0 * np.pi / n)
-        if abs(angle) < np.radians(20.0):
-            ranges[i] = 0.2
-    assert _Rear(_Scan(ranges)).clearance() == pytest.approx(
-        3.0 - vg.LASER_TO_REAR_M, abs=0.05
-    )
+def test_a_narrow_corridor_still_lets_it_back_up():
+    """양옆 벽이 있어도 차폭이 들어가면 물러날 수 있어야 한다."""
+    # 중심선에서 좌우 0.30 m 에 벽 (통로 폭 0.60) — 차폭 0.30 은 들어간다
+    assert _Rear(_Map(lambda x, y: 0.30)).clearance() == pytest.approx(LIMIT)
 
 
-def test_a_wall_right_behind_reads_zero_not_negative():
-    """음수 여유를 내면 비교가 뒤집혀 '넉넉하다' 로 읽힌다."""
-    assert _Rear(_uniform(360, 0.2)).clearance() == 0.0
+def test_a_corridor_too_narrow_is_refused():
+    # 좌우 0.20 — 반폭 0.15 + 여유 0.10 = 0.25 에 못 미친다
+    assert _Rear(_Map(lambda x, y: 0.20)).clearance() == 0.0
 
 
-def test_junk_beams_are_dropped():
-    n = 360
-    ranges = [float("inf")] * n
-    ranges[0] = float("nan")  # -180° = 정후방
-    ranges[1] = 0.01          # min_range 미만
-    assert _Rear(_Scan(ranges)).clearance() == float("inf")
+# ── 못 재면 물러나지 않는다 (전진 검사와 반대) ──────────────────────────
 
 
-def test_no_scan_means_no_measurement():
-    """못 재면 inf — 대신 시작 조건이 아니라 중단 조건에서 걸러야 한다."""
-    assert _Rear(None).clearance() == float("inf")
+def test_regression_no_map_means_do_not_reverse():
+    """예전엔 못 재면 inf(비었다)를 냈다. 그게 실차에서 이렇게 나왔다:
+
+        후진 탈출 시작 #23 — 뒤 여유 inf m
+        후진 탈출 종료 — 뒤가 막혔다 (0.00m)   ← 0.02 s 뒤
+
+    라이다가 뒤를 못 보니 후방 섹터에 빔이 없어 inf 가 나오고, FOV 가장자리
+    잡음이 하나 들어오면 0.00 이 나온다. 20 ms 만에 끝나니 차는 찔끔 움직이고
+    말았다.
+
+    뒤를 볼 수단이 맵뿐이라, 맵이 없으면 낙관하면 안 된다 — 눈 감고 후진하는
+    셈이다.
+    """
+    assert _Rear(None).clearance() == 0.0
+
+
+def test_no_tf_means_do_not_reverse():
+    r = _Rear(_Map(lambda x, y: 50.0))
+    r._tf = None
+    assert r.clearance() == 0.0
+
+
+def test_outside_the_map_is_blocked():
+    """맵 밖은 `clearance_at` 이 0 을 준다. 그대로 막힌 것으로 읽어야 한다."""
+    assert _Rear(_Map(lambda x, y: 0.0)).clearance() == 0.0
 
 
 # ── 집행: control_node ──────────────────────────────────────────────────

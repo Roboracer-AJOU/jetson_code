@@ -109,6 +109,25 @@ CFG = {
     # 조향은 집행하는 control_node 가 중립으로 잡는다 — 꺾인 채 후진하면
     # 뒤가 어디로 갈지 예측이 안 된다.
     "reverse_escape_enable": True,
+    # 탈출 창이 시간 초과까지 가 주면 위 판정으로 충분한데, 실차에서는 거기까지
+    # 가지도 못했다. `closest` 가 `escape_hard_stop_m` 과 같은 값에 걸터앉으면
+    # (둘 다 0.24) 창이 열린 다음 틱에 hard_stop 침범으로 닫힌다:
+    #
+    #   탈출 창 시작 #105 → 0.02 s 뒤 EMERGENCY BRAKE [STANDOFF] → 반복
+    #
+    # 실제로 #105 까지 돌았다. 제동이 풀린 시간이 한 틱뿐이라 차는 조향만
+    # 파르르 떨며 그 자리에 서 있고, 시간 초과 분기는 영영 안 온다.
+    #
+    # 그래서 창과 무관하게 본다: **서 있고 앞이 막혔으면** 물러난다. 창이 어떤
+    # 사유로 닫히든, AEB 가 켜져 있든 꺼져 있든 상관없다. 서 있다는 것 자체가
+    # 전진으로 못 나간다는 증거다.
+    "reverse_stuck_sec": 1.0,
+    # 이 안에 뭔가 있어야 "앞이 막혀서" 선 것으로 본다 (라이다 기준).
+    # 범퍼 기준 0.6 m — 그 밖이면 못 가는 이유가 장애물이 아니다.
+    "reverse_stuck_obstacle_m": round(vg.LASER_TO_FRONT_M + 0.60, 3),
+    # 물러난 직후엔 이만큼 다시 안 건다. 플래너가 나갈 기회를 줘야 하고,
+    # 안 그러면 뒤가 빌 때까지 계속 뒷걸음질한다.
+    "reverse_cooldown_sec": 3.0,
     # 이 거리만큼 물러나면 끝. 전진 탈출이 열리는 최소치 + 여유.
     "reverse_travel_m": 0.40,
     "reverse_max_sec": 2.0,
@@ -116,9 +135,9 @@ CFG = {
     "reverse_min_clearance_m": 0.60,
     # 후진 중 뒤 여유가 여기까지 줄면 즉시 중단. 벽에 대고 밀면 안 된다.
     "reverse_abort_clearance_m": 0.25,
-    # 후방 코리도 반폭. 전방보다 조금 넉넉하게 본다 — 뒤는 안 보고 가는 거라
-    # 조향이 조금만 남아 있어도 실제 궤적이 옆으로 샌다.
-    "reverse_half_width_m": round(vg.HALF_WIDTH_M + 0.10, 3),
+    # 맵에서 "차가 여기 들어가나" 를 볼 때 반폭에 더할 여유. 뒤는 안 보고
+    # 가는 거라 조향이 조금만 남아 있어도 실제 궤적이 옆으로 샌다.
+    "reverse_map_margin_m": 0.10,
     "reverse_topic": "/aeb/escape_reverse",
     # 노이즈 빔 하나로 급정거하지 않도록, 조건을 만족하는 빔이 이 개수 이상일 때만
     "min_hit_beams": 3,
@@ -178,6 +197,9 @@ CFG = {
 
 
 class EmergencyBrakeNode(Node):
+    # 후방 검사 간격. 맵 해상도(보통 0.05)보다 잘게 볼 이유가 없다.
+    _REVERSE_PROBE_STEP_M = 0.05
+
     def __init__(self) -> None:
         super().__init__("emergency_brake_node")
         for key, value in CFG.items():
@@ -222,10 +244,17 @@ class EmergencyBrakeNode(Node):
         self.reverse_abort_clearance = max(
             0.0, float(g("reverse_abort_clearance_m").value)
         )
-        self.reverse_half_width = max(0.05, float(g("reverse_half_width_m").value))
+        self.reverse_map_margin = max(0.0, float(g("reverse_map_margin_m").value))
+        self.reverse_stuck_sec = max(0.0, float(g("reverse_stuck_sec").value))
+        self.reverse_stuck_obstacle = max(
+            0.0, float(g("reverse_stuck_obstacle_m").value)
+        )
+        self.reverse_cooldown_sec = max(0.0, float(g("reverse_cooldown_sec").value))
         self._reverse_until = 0.0    # 0 = 후진 안 함
         self._reverse_travel = 0.0
         self._reverse_count = 0
+        self._reverse_ready_at = 0.0  # 이 시각 전에는 다시 안 건다
+        self._idle_since = 0.0        # 속도가 0 으로 떨어진 시각
 
         self._speed = 0.0
         self._steering = 0.0
@@ -261,7 +290,9 @@ class EmergencyBrakeNode(Node):
         self._tf_buffer = None
         self._tf_listener = None
         self._warned_no_map = False
-        if self.map_filter_enable:
+        # 후진도 맵과 TF 로 뒤를 판단한다 (라이다가 뒤를 못 본다). 그래서
+        # map_filter 를 꺼도 후진을 쓰려면 맵이 있어야 한다.
+        if self.map_filter_enable or self.reverse_enable:
             self._tf_buffer = tf2_ros.Buffer()
             self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
             self.create_subscription(
@@ -457,39 +488,48 @@ class EmergencyBrakeNode(Node):
         )
 
     def _rear_clearance(self) -> float:
-        """뒤 범퍼에서 뒤쪽 장애물까지의 여유 [m]. 못 재면 inf.
+        """뒤 범퍼가 벽에 닿기 전까지 물러날 수 있는 거리 [m]. 모르면 0.
 
-        곧게 물러난다고 보고 직선 코리도만 본다 (집행 쪽에서 조향을 중립으로
-        잡는다). 라이다가 축보다 0.31 m 앞에 있어서 뒤끝까지가 0.41 m 나
-        되므로, 스캔 거리에서 그만큼 빼야 실제 범퍼 여유다.
+        **라이다는 뒤를 못 본다.** 처음엔 스캔의 후방 섹터를 쟀는데, 뒤 빔이
+        아예 없으니 대부분 inf(비었다)가 나오고 FOV 가장자리 잡음이 하나
+        들어오면 0.00 이 나왔다. 그래서 실차에서 이렇게 됐다:
 
-        전방 검사와 달리 맵 필터(아는 벽 무시)를 안 쓴다. 후진은 벽이든
-        장애물이든 닿으면 안 되고, 여기서 벽을 지워 버리면 벽으로 밀고
-        들어간다.
+            후진 탈출 시작 #23 — 뒤 여유 inf m
+            후진 탈출 종료 — 뒤가 막혔다 (0.00m)   ← 0.02 s 뒤
+
+        20 ms 만에 끝나니 차는 찔끔 움직이고 만다.
+
+        그래서 맵과 TF 로 본다. 지금 위치에서 뒤로 훑으며 차폭이 들어가는
+        곳까지의 거리를 잰다. `clearance_at` 은 그 점에서 가장 가까운 벽까지
+        거리라, 차 반폭+여유보다 크면 그 지점은 차가 지나갈 수 있다.
+
+        **못 재면 0 이다 (전진 검사와 반대).** 앞은 안 보이면 라이다가 어떻게든
+        보지만 뒤는 볼 수단이 이것뿐이라, 낙관하면 눈 감고 후진하는 셈이 된다.
+        맵이나 TF 가 없으면 아예 물러나지 않는다.
+
+        한계가 하나 있다. 맵에 없는 물건(사람, 새로 놓인 상자)은 뒤에 있어도
+        모른다. 그래서 후진 거리를 0.4 m 로 짧게, 속도도 기는 수준으로 묶어
+        둔다.
         """
-        scan = self._scan
-        if scan is None:
-            return float("inf")
-        ranges = np.asarray(scan.ranges, dtype=float)
-        angles = self._beam_angle_array(scan)
-        if len(ranges) != len(angles):
-            return float("inf")
+        gmap = self._map
+        if gmap is None:
+            return 0.0
+        tf = self._lookup_laser_to_map()
+        if tf is None:
+            return 0.0
 
-        ok = (
-            np.isfinite(ranges)
-            & (ranges >= self.min_range)
-            & (ranges <= self.max_range)
-        )
-        if not np.any(ok):
-            return float("inf")
-        r = ranges[ok]
-        th = angles[ok]
-        x = r * np.cos(th)
-        y = r * np.sin(th)
-        behind = (x < 0.0) & (np.abs(y) <= self.reverse_half_width)
-        if not np.any(behind):
-            return float("inf")
-        return max(0.0, float(np.abs(x[behind]).min()) - vg.LASER_TO_REAR_M)
+        cos_t, sin_t, tx, ty = tf
+        need = vg.HALF_WIDTH_M + self.reverse_map_margin
+        # 필요한 만큼만 본다 — 더 멀리 재 봐야 쓰지도 않는다.
+        limit = self.reverse_travel + self.reverse_min_clearance
+        steps = int(limit / self._REVERSE_PROBE_STEP_M) + 1
+        for k in range(steps + 1):
+            d = min(k * self._REVERSE_PROBE_STEP_M, limit)
+            # 라이다 프레임에서 뒤끝보다 d 만큼 더 뒤 (차는 중심선 위에 있다)
+            lx = -(vg.LASER_TO_REAR_M + d)
+            if gmap.clearance_at(lx * cos_t + tx, lx * sin_t + ty) < need:
+                return d
+        return limit
 
     def _update_reverse(self, now: float, dt: float) -> bool:
         """후진 요청 상태 갱신. True 면 이번 틱에 물러난다.
@@ -520,6 +560,8 @@ class EmergencyBrakeNode(Node):
 
         self._reverse_until = 0.0
         self._reverse_travel = 0.0
+        self._reverse_ready_at = now + self.reverse_cooldown_sec
+        self._idle_since = 0.0
         self.get_logger().warn(f"후진 탈출 종료 — {reason}")
         if backed_off:
             # 물러난 만큼 앞이 열렸다. 그 자리에서 standoff 가 다시 물기
@@ -527,17 +569,41 @@ class EmergencyBrakeNode(Node):
             self._open_escape_window(now)
         return False
 
+    def _stuck_against_something(self, now: float, closest: float) -> bool:
+        """서 있은 지 오래됐고 앞이 막혔는가.
+
+        탈출 창의 종료 사유를 안 본다. 창이 hard_stop 으로 한 틱 만에 닫히는
+        경우가 실제로 있었고 (`closest` 가 임계와 같은 값에 걸터앉을 때),
+        그러면 시간 초과 판정에 영원히 도달하지 못한다. 여기서는 결과만
+        본다 — 서 있으면 못 나가는 것이다.
+        """
+        if self._speed > self.stuck_speed:
+            self._idle_since = 0.0
+            return False
+        if self._idle_since <= 0.0:
+            self._idle_since = now
+            return False
+        if now - self._idle_since < self.reverse_stuck_sec:
+            return False
+        return closest < self.reverse_stuck_obstacle
+
     def _maybe_start_reverse(self, now: float) -> None:
-        """전진 탈출이 실패했다 — 뒤가 비었으면 물러난다."""
+        """전진으로 못 나간다 — 뒤가 비었으면 물러난다."""
         if not (self.reverse_enable and self._reverse_until <= 0.0):
+            return
+        if now < self._reverse_ready_at:
             return
         rear = self._rear_clearance()
         if rear < self.reverse_min_clearance:
+            # 앞뒤 다 막혔다. 이 상태는 매 틱 참이므로 쿨다운을 걸어야
+            # 로그가 20 Hz 로 쏟아지지 않는다.
+            self._reverse_ready_at = now + self.reverse_cooldown_sec
             self.get_logger().warn(
                 f"전진도 후진도 막혔다 — 뒤 여유 {rear:.2f}m "
                 f"< {self.reverse_min_clearance:.2f}m. 그대로 선다"
             )
             return
+        self._idle_since = 0.0
         self._reverse_until = now + self.reverse_max_sec
         self._reverse_travel = 0.0
         self._reverse_count += 1
@@ -678,6 +744,11 @@ class EmergencyBrakeNode(Node):
             dt = 0.0
         self._last_tick = now
         escaping = self._update_escape_window(now, dt, closest)
+        # 창이 어떻게 닫히든, 서 있는데 앞이 막혔으면 물러난다. 창의 시간
+        # 초과만 보던 때는 hard_stop 으로 한 틱 만에 닫히는 경우를 통째로
+        # 놓쳤다 (실차에서 탈출 창 #105 까지 헛돌았다).
+        if self._reverse_until <= 0.0 and self._stuck_against_something(now, closest):
+            self._maybe_start_reverse(now)
         reversing = self._update_reverse(now, dt)
         # 후진이 끝나면서 전진 창을 새로 열었을 수 있다. 위 줄이 이미 지나간
         # 뒤라, 이걸 안 보면 그 한 틱에 standoff 가 물어 창이 헛돈다.
