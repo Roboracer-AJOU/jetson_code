@@ -6,8 +6,8 @@ from launch.actions import ExecuteProcess, LogInfo, TimerAction
 
 # 8코어 배치 (nvpmodel MAXN 필요):
 #   CPU 0-4 = 로컬 처리 (cartographer, odom, map, rviz) — 스케줄러가 알아서 분배
-#   CPU 5   = 로컬 센서 드라이버 전용 (LiDAR, IMU). 경합을 없애 스캔 주기를 지킨다
-#   CPU 6-7 = path_following 전용 (path_cpu_policy.py)
+#   CPU 5   = 로컬 센서 드라이버 (LiDAR, IMU). path_following 과 공유
+#   CPU 5-7 = path_following (path_cpu_policy.py). 5번은 센서와 공유, 6-7은 전용
 # Node(prefix=...) expects a single string (shlex-split later). A list joins
 # without spaces and becomes 'taskset-c0-4'.
 LOCAL_CPU_PREFIX = "taskset -c 0-4"
@@ -20,7 +20,7 @@ def local_cpu_prefix():
 
 
 def sensor_cpu_prefix():
-    """LiDAR/IMU 드라이버 전용. 다른 로컬 노드와 코어를 공유하지 않는다."""
+    """LiDAR/IMU 드라이버. 로컬 처리(0-4)와는 분리, path_following 과는 공유."""
     return SENSOR_CPU_PREFIX
 
 
@@ -29,7 +29,7 @@ def cpu_policy_actions(*, apply_delay_sec: float = 3.0, start_daemon: bool = Tru
         TimerAction(
             period=apply_delay_sec,
             actions=[
-                LogInfo(msg="=== CPU policy: apply (local 0-4, sensor 5, path 6-7) ==="),
+                LogInfo(msg="=== CPU policy: apply (local 0-4, sensor 5, path 5-7) ==="),
                 ExecuteProcess(
                     cmd=["bash", _POLICY, "--once"],
                     output="screen",

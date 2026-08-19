@@ -44,6 +44,11 @@ CFG = {
     "dynamic_obstacle_topic": "/dynamic_obstacles",
     "fgm_enable_topic": "/planner/fgm_enable",
     "ego_speed_topic": "/vehicle/speed_mps",
+    # [탈출 조준 기준] local_planner 가 AEB 정지 후 보내는 [기준각, 허용 콘]
+    # (rad, 차체 기준). 안 오거나 빈 배열이면 여기 모든 "정면 선호" 는
+    # 평소대로 0° 를 뜻한다.
+    "prefer_angle_topic": "/planner/fgm_prefer_angle",
+    "prefer_stale_sec": 0.5,
     # True면 local_planner 의 /planner/fgm_enable 이 True 일 때만 갭 계산
     "require_planner_enable": True,
     "target_topic": "/fgm_target",
@@ -101,6 +106,22 @@ CFG = {
     # 크게 꺾는 데 매기는 벌점 [m/rad]. 키우면 정면 고집(회피 소극적),
     # 줄이면 여유 공간을 찾아 과감히 튼다.
     "corridor_straight_bias_m_per_rad": 1.0,
+    # ---- "여유가 이만큼이면 충분하다" 는 기준 [m] ----
+    # 점수는 min(여유, want) − bias·|각도| 다. want 는 안전 문턱이 아니라
+    # **보상이 포화되는 지점** 이다. 여기를 넘으면 더 뚫려 있어도 점수가 안
+    # 올라가므로, 그때부터는 벌점이 이겨서 정면에 가까운 각도가 선택된다.
+    #
+    # 예전엔 여기에 목표점 거리(target_dist, 최대 5 m)를 그대로 넣었다.
+    # 그러면 굽은 통로에서 정면은 몇 미터 앞 벽에 막히고 옆으로 틀수록 멀리
+    # 뚫리니, 여유 1 m 더 벌자고 45° 트는 게 이득이 된다 (45°의 벌점은 겨우
+    # 0.79 m). 실측 조준각이 26~54° 까지 나왔고, r=0.20 콘 하나에 라인에서
+    # 1.2~1.5 m 씩 벗어났다 (필요량 0.45 m 의 2.5~3.3 배).
+    #
+    # 안전은 여기가 아니라 버블(장애물에서 r+0.20+차폭반폭 확보)과 AEB 가
+    # 맡는다. 그래서 이 값은 "이 방향으로 잠깐 가도 되나" 수준이면 된다.
+    "corridor_want_time_s": 0.5,
+    "corridor_want_min_m": 1.5,
+    "corridor_want_max_m": 3.0,
     # 목표점 거리 = clamp(ego_speed * lead_time, min, max) [m, 레이저 프레임]
     "target_lead_time_s": 0.70,
     "target_min_m": 1.0,
@@ -161,6 +182,12 @@ class FGMNode(Node):
             Float64,
             str(self.get_parameter("ego_speed_topic").value),
             self.speed_callback,
+            10,
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            str(self.get_parameter("prefer_angle_topic").value),
+            self.prefer_callback,
             10,
         )
         self._fgm_enabled = not self.require_planner_enable
@@ -230,6 +257,16 @@ class FGMNode(Node):
         self.corridor_straight_bias = max(
             0.0, float(self.get_parameter("corridor_straight_bias_m_per_rad").value)
         )
+        self.corridor_want_time_s = max(
+            0.0, float(self.get_parameter("corridor_want_time_s").value)
+        )
+        self.corridor_want_min_m = max(
+            0.2, float(self.get_parameter("corridor_want_min_m").value)
+        )
+        self.corridor_want_max_m = max(
+            self.corridor_want_min_m,
+            float(self.get_parameter("corridor_want_max_m").value),
+        )
         self.target_min_m = max(0.2, float(self.get_parameter("target_min_m").value))
         self.target_max_m = max(
             self.target_min_m, float(self.get_parameter("target_max_m").value)
@@ -263,6 +300,13 @@ class FGMNode(Node):
         self._ego_speed = 0.0
         self._last_scan_ns: int | None = None
         self._last_corridor_warn_ns = 0
+        self._prefer_angle = 0.0
+        self._prefer_cone = 0.0
+        self._prefer_ns = 0
+        self._prefer_stale_ns = int(
+            max(0.05, float(self.get_parameter("prefer_stale_sec").value)) * 1e9
+        )
+        self._prefer_logged = False
         self._cpu_boost_active = False
         # 초기 enable 상태에 맞춰 CPU 우선순위 플래그 동기화
         self._set_cpu_boost(self._fgm_enabled)
@@ -305,6 +349,43 @@ class FGMNode(Node):
 
     def speed_callback(self, msg: Float64) -> None:
         self._ego_speed = abs(float(msg.data))
+
+    def prefer_callback(self, msg: Float32MultiArray) -> None:
+        """[기준각, 허용 콘] (rad). 빈 배열이면 선호 없음."""
+        d = list(msg.data)
+        if len(d) < 2 or not all(math.isfinite(float(v)) for v in d[:2]):
+            self._prefer_ns = 0
+            return
+        self._prefer_angle = float(d[0])
+        self._prefer_cone = max(0.0, float(d[1]))
+        self._prefer_ns = self.get_clock().now().nanoseconds
+
+    def _prefer_now(self) -> tuple[float, float] | None:
+        """지금 유효한 (기준각, 콘). 없으면 None.
+
+        기준각은 FOV 안으로 당긴다. 차가 콘을 벗어나게 돌아 버리면 기준이
+        스캔 밖으로 나가는데, 그대로 두면 갭 선택이 늘 FOV 가장자리로 쏠린다.
+        """
+        if self._prefer_ns <= 0:
+            return None
+        if self.get_clock().now().nanoseconds - self._prefer_ns > self._prefer_stale_ns:
+            return None
+        a = self._prefer_angle
+        if not self._use_full_scan_fov:
+            a = max(-self.fov_angle, min(self.fov_angle, a))
+        return a, self._prefer_cone
+
+    def _log_prefer(self, active: bool, angle: float, cone: float) -> None:
+        if active == self._prefer_logged:
+            return
+        self._prefer_logged = active
+        if active:
+            self.get_logger().warn(
+                f"탈출 조준 제한 — 기준 {math.degrees(angle):+.0f}° "
+                f"±{math.degrees(cone):.0f}°"
+            )
+        else:
+            self.get_logger().info("탈출 조준 제한 해제 — 정면 기준 복귀")
 
     def _bubble_now(self) -> float:
         """[A6] 현재 속도에서의 장애물 버블 반경 [m]."""
@@ -369,7 +450,26 @@ class FGMNode(Node):
         m.action = Marker.DELETE
         self.gap_marker_pub.publish(m)
 
-    def _select_gap(self, gaps: list, max_len: int) -> np.ndarray | None:
+    def _select_gap(
+        self,
+        gaps: list,
+        max_len: int,
+        aim_idx: int | None = None,
+        lock: bool = False,
+    ) -> np.ndarray | None:
+        """따라갈 갭 하나. `aim_idx` 는 기준 방향에 해당하는 work 인덱스.
+
+        폭이 `min_gap_bins` 를 넘긴 갭은 이미 버블을 통과했으므로 "차가
+        지나갈 수 있다" 는 뜻이다. 그중에서는 **기준에 제일 가까운** 갭을
+        고른다. 예전엔 제일 넓은 갭을 골랐는데, 트랙에서 각도상 제일 넓은
+        방향은 보통 레이스라인이 아니라 트랙 건너편이다. 콘 하나 앞에서
+        반대편을 잡으면 그 갭의 가장자리부터가 이미 멀어서, 뒤이은 각도
+        선정이 아무리 정면을 선호해도 되돌릴 수 없다.
+
+        `lock` 이면 직전 갭에 붙는 히스테리시스를 건너뛴다. AEB 탈출처럼
+        기준 방향이 따로 주어진 상황에서는 한 번 옆 갭을 물면 계속 그쪽으로
+        끌려가는데, 그게 정확히 막으려는 동작이다.
+        """
         if not gaps:
             return None
         wide = [g for g in gaps if len(g) >= self.min_gap_bins]
@@ -380,17 +480,51 @@ class FGMNode(Node):
         def center_idx(g: np.ndarray) -> int:
             return int(g[len(g) // 2])
 
-        if self._last_gap_center_idx is not None:
+        def dist_to(g: np.ndarray, idx: int) -> int:
+            """갭에서 idx 까지의 거리. 갭이 idx 를 품고 있으면 0."""
+            lo, hi = int(g[0]), int(g[-1])
+            if lo <= idx <= hi:
+                return 0
+            return lo - idx if idx < lo else idx - hi
+
+        if self._last_gap_center_idx is not None and not lock:
             candidates = [g for g in wide if len(g) >= thresh_len]
             if not candidates:
                 candidates = wide
-            best = min(
+            return min(
                 candidates,
                 key=lambda g: abs(center_idx(g) - self._last_gap_center_idx),
             )
-            return best
 
+        if aim_idx is not None:
+            # 동률이면 넓은 쪽 (가장자리를 스칠 위험이 적다)
+            return min(wide, key=lambda g: (dist_to(g, aim_idx), -len(g)))
         return max(wide, key=lambda g: len(g))
+
+    @staticmethod
+    def _clamp_to_cone(
+        lo: float, hi: float, center: float, cone: float
+    ) -> tuple[float, float]:
+        """갭 각도 범위 [lo, hi] 를 기준 ±콘 안으로 자른다.
+
+        겹치면 겹치는 만큼만 남긴다. 문제는 안 겹칠 때다. 장애물 바로 앞에
+        멈추면 버블 반각이 `asin((r+버블+차반폭)/거리)` 라 거리가 그 반경보다
+        가까운 순간 90° — 정면이 통째로 막히고 갭은 FOV 끝에만 남는다. 그래서
+        "안 겹침" 은 예외가 아니라 AEB 정지의 기본 상황이다.
+
+        이때는 **콘 쪽 끝** 을 쓴다. 갭 끝을 쓰면 콘이 무력해져 옆으로 돌던
+        예전 동작 그대로다. 검증된 갭 밖을 겨냥하는 셈이지만 탈출 한정으로
+        받아들인다 — 속도가 0.8 m/s 이하고, AEB 가 그대로 살아 있고,
+        `_pick_target_angle` 이 그 방향의 실제 코리도 여유를 다시 재서 막혀
+        있으면 목표점을 코앞으로 당긴다. 즉 최악이 "조금 가다 다시 정지" 지,
+        벽으로 도는 게 아니다.
+        """
+        clo, chi = center - cone, center + cone
+        if hi < clo:
+            return clo, clo
+        if lo > chi:
+            return chi, chi
+        return max(lo, clo), min(hi, chi)
 
     def _smooth_target(self, tx: float, ty: float, dt: float) -> tuple[float, float]:
         """EMA 1단 + 이동 속도 제한.
@@ -451,6 +585,18 @@ class FGMNode(Node):
             return self.preprocess_dist
         return max(0.0, float(along[blocking].min()) - self.corridor_stop_margin)
 
+    def _corridor_want_m(self) -> float:
+        """보상이 포화되는 여유거리 [m]. 여기를 넘으면 정면 선호가 이긴다.
+
+        속도에 비례시키되 상한을 낮게 둔다. 빨리 달릴수록 같은 시간에 더
+        멀리 가니 조금 더 봐야 하지만, 상한이 없으면 "제일 멀리 보이는 쪽"
+        을 겨냥하는 예전 동작으로 되돌아간다.
+        """
+        return min(
+            self.corridor_want_max_m,
+            max(self.corridor_want_min_m, self._ego_speed * self.corridor_want_time_s),
+        )
+
     def _pick_target_angle(
         self,
         geom_ranges: np.ndarray,
@@ -459,13 +605,21 @@ class FGMNode(Node):
         hi: float,
         preferred: float,
         want: float,
+        bias_ref: float = 0.0,
     ) -> tuple[float, float]:
         """(목표 각도, 그 방향 코리도 여유거리).
 
-        preferred(갭 안에서 정면에 제일 가까운 각도)로 want 만큼 못 가면 갭
-        안의 다른 각도를 뒤진다. 점수 = min(여유, want) − bias·|각도| 라서,
-        여유가 충분해지는 순간부터는 정면에 가까운 쪽이 이긴다. 즉 필요한
-        만큼만 틀고 불필요하게 크게 꺾지 않는다.
+        preferred(갭 안에서 기준에 제일 가까운 각도)로 want 만큼 못 가면 갭
+        안의 다른 각도를 뒤진다. 점수 = min(여유, want) − bias·|각도−기준|
+        이라서, 여유가 충분해지는 순간부터는 기준에 가까운 쪽이 이긴다. 즉
+        필요한 만큼만 틀고 불필요하게 크게 꺾지 않는다.
+
+        `bias_ref` 가 기준이다. 평소엔 0(정면), AEB 탈출 중에는 멈춘 순간의
+        헤딩 방향이 들어온다.
+
+        **`want` 는 반드시 `_corridor_want_m()` 이어야 한다.** 목표점 거리를
+        넣으면 보상이 5 m 까지 안 꺾여서 위 문장이 성립하지 않는다 —
+        벌점(45° 에 0.79 m)이 보상 증가분을 못 이겨 항상 크게 튼다.
 
         후보를 [lo, hi] 로 가두므로 이미 검증된 갭 밖으로는 절대 안 나간다.
         """
@@ -474,11 +628,15 @@ class FGMNode(Node):
         if best_clear >= want:
             return best_angle, best_clear
 
-        best_score = min(best_clear, want) - self.corridor_straight_bias * abs(preferred)
+        best_score = min(best_clear, want) - self.corridor_straight_bias * abs(
+            preferred - bias_ref
+        )
         for cand in np.linspace(lo, hi, self.corridor_angle_samples):
             angle = float(cand)
             clear = self._corridor_clear_distance(geom_ranges, wrapped, angle)
-            score = min(clear, want) - self.corridor_straight_bias * abs(angle)
+            score = min(clear, want) - self.corridor_straight_bias * abs(
+                angle - bias_ref
+            )
             if score > best_score:
                 best_angle, best_clear, best_score = angle, clear, score
         return best_angle, best_clear
@@ -567,9 +725,17 @@ class FGMNode(Node):
         if not gaps:
             return
 
+        # 조준의 기준 방향. 평소엔 정면(0°), AEB 탈출 중에는 멈춘 순간의
+        # 헤딩이 들어온다. 갭 선택부터 이걸 따라야 한다 — 각도만 나중에
+        # 당겨 봐야, 이미 반대편 갭을 물었으면 되돌릴 수 없다.
+        prefer = self._prefer_now()
+        aim_ref = prefer[0] if prefer is not None else 0.0
+        self._log_prefer(prefer is not None, aim_ref, prefer[1] if prefer else 0.0)
+
         self.min_gap_bins = max(2, int(self.min_gap_width_rad / abs(angle_inc)))
         max_len = max(len(g) for g in gaps)
-        chosen = self._select_gap(gaps, max_len)
+        aim_idx = int(np.argmin(np.abs(_wrap_pi_np(work_angles - aim_ref))))
+        chosen = self._select_gap(gaps, max_len, aim_idx, lock=prefer is not None)
         if chosen is None or len(chosen) == 0:
             return
 
@@ -620,7 +786,9 @@ class FGMNode(Node):
             hi -= inset
         else:
             lo = hi = 0.5 * (lo + hi)
-        eff_angle = min(hi, max(lo, 0.0))
+        if prefer is not None:
+            lo, hi = self._clamp_to_cone(lo, hi, aim_ref, prefer[1])
+        eff_angle = min(hi, max(lo, aim_ref))
 
         # 목표점을 속도에 비례해 앞으로: 고속에서 0.5 m 앞은 조향이 즉시 되감긴다
         target_dist = min(
@@ -636,8 +804,16 @@ class FGMNode(Node):
         # 단일 빔이 아니라 차폭 코리도로 다시 검증. 각도 기준 갭 선택은
         # "각도는 열려 있는데 차폭은 안 들어가는" 통로를 걸러내지 못한다.
         if self.corridor_check_enable:
+            # 각도 선정의 want 와 목표점 거리는 별개다. 목표점은 "얼마나 앞에
+            # 찍을까"(조향 응답성), want 는 "여유가 이만큼이면 됐다"(방향 선택).
             eff_angle, clear = self._pick_target_angle(
-                geom_ranges, wrapped, lo, hi, eff_angle, target_dist
+                geom_ranges,
+                wrapped,
+                lo,
+                hi,
+                eff_angle,
+                self._corridor_want_m(),
+                bias_ref=aim_ref,
             )
             if clear < target_dist:
                 target_dist = max(0.2, clear)

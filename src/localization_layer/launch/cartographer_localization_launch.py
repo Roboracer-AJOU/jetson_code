@@ -99,7 +99,7 @@ def generate_launch_description():
         # 20260816: config/centerline.csv, raceline.csv 가 이 맵 좌표계로 뽑혀
         # 있다. 211739 로 두면 프레임 원점이 달라서 레이스라인 785 점 중 719 점이
         # 벽 안으로 떨어진다 — 출발과 동시에 벽으로 간다.
-        'cartographer_map_20260817_003202.pbstream',
+        'cartographer_map_20260820_014643.pbstream',
     )
 
     return LaunchDescription([

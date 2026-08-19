@@ -105,16 +105,10 @@ class EbimuDriver(Node):
         baud = self.get_parameter("baud").value
         self.accel_in_g = bool(self.get_parameter("accel_in_g").value)
         self.nominal_period_s = float(self.get_parameter("imu_sample_period_s").value)
-        # 마지막으로 발행한 stamp. 배치 역산이 이 값보다 과거로 내려가지 않게
-        # 붙잡는 데 쓴다. Cartographer 의 imu_tracker 는 IMU stamp 가 한 번만
-        # 뒤로 가도 CHECK 실패로 즉시 abort 한다.
+        # 마지막으로 발행한 stamp. Cartographer imu_tracker 는 stamp 가 한 번만
+        # 뒤로 가도 CHECK 로 abort 한다.
         self._last_stamp_ns: int | None = None
-        # PLL 상태: stamp 를 벽시계에 매번 앵커링하지 않고 자체 시계로 생성한다.
-        self._next_stamp_ns: int | None = None
-        self._period_ns: int = max(1, int(
-            float(self.get_parameter("imu_sample_period_s").value) * 1e9))
-        self._sync_t0_ns: int = 0
-        self._sync_count: int = 0
+        self._period_ns: int = max(1_000_000, int(self.nominal_period_s * 1e9))
         self.publish_ros_axes = bool(self.get_parameter("publish_ros_axes").value)
         port = self.resolve_port(requested_port)
         self.seen_full_imu_frame = False
@@ -244,69 +238,42 @@ class EbimuDriver(Node):
         self._process_frame_batch(complete_lines)
 
     def _process_frame_batch(self, frames: list[str]) -> None:
-        """한 틱에 몰려 들어온 프레임들에 위상동기(PLL) timestamp를 매겨 전부 publish.
+        """젯슨이 받은 시각(ROS now)으로 바로 찍는다. 자체 IMU 시계는 쓰지 않는다.
 
-        예전 방식은 배치마다 벽시계 now 에 다시 앵커링하고 거기서 역산했다.
-        그래서 시리얼 버퍼링/스케줄러 지터가 그대로 stamp 에 실렸고, 역행 방지에
-        걸리면 프레임 간격이 주기(10ms)가 아니라 step(1ms)으로 찍혀서
-        간격 표준편차가 평균보다 커졌다(cartographer 로그: 1.05e-2 s +/- 1.85e-2 s).
-        회전 중에는 이 시각 오차가 곧바로 각도 오차가 된다(70dps에서 18ms = 1.3deg).
+        라이다/오돔도 젯슨 수신 시각이다. IMU만 PLL 자체 시계를 쓰면 위상차가
+        수십~수백 ms 로 커지고, Cartographer collator 가 IMU를 기다리거나
+        스캔을 drop 한다. 위치추정에는 방금 받은 샘플을 같은 시간축으로 넣는 게
+        맞다.
 
-        지금은 stamp 를 자체 시계로 만든다:
-          stamp(k) = anchor + k * period
-        - period 는 실측에서 학습한다(파라미터 0.01s = 100Hz 였지만 실측 95.2Hz).
-        - 벽시계와의 위상차는 매 배치 아주 약하게(1/8) 슬루해서 따라간다.
-          점프가 아니라 슬루라서 간격이 흔들리지 않는다.
-        - 큰 정체(0.5s 이상) 뒤에는 하드 리싱크한다.
+        한 틱에 여러 프레임이 몰리면 최신 프레임 = now, 그보다 오래된 것은
+        공칭 주기만큼 과거로 찍되, 이미 발행한 시각보다 과거면 버린다.
+        (늦은 버퍼를 가짜 과거 시각으로 밀어 넣으면 라이다와 또 어긋난다.)
         """
         if not frames:
             return
 
         now_ns = self.get_clock().now().nanoseconds
-        n = len(frames)
+        period = self._period_ns
 
-        if self._next_stamp_ns is None:      # 최초 1회
-            self._period_ns = max(1, int(self.nominal_period_s * 1e9))
-            self._next_stamp_ns = now_ns - (n - 1) * self._period_ns
-            self._sync_t0_ns = self._next_stamp_ns
-            self._sync_count = 0
+        if self._last_stamp_ns is not None:
+            lead = self._last_stamp_ns - now_ns
+            if lead > 50_000_000 or -lead > 200_000_000:
+                self.get_logger().warn(
+                    f'IMU stamp 재동기화 (벽시계 대비 {lead * 1e-6:.0f} ms)')
+                self._last_stamp_ns = None
 
-        # 마지막 프레임이 있어야 할 자리와 실제 now 의 차이 = 위상 오차
-        predicted_last = self._next_stamp_ns + (n - 1) * self._period_ns
-        err_ns = now_ns - predicted_last
-
-        if abs(err_ns) > 500_000_000:        # 0.5s 이상 어긋나면 스트림이 끊겼던 것
-            self.get_logger().warn(
-                f'IMU stamp 재동기화 (위상차 {err_ns * 1e-6:.0f} ms)')
-            self._next_stamp_ns = now_ns - (n - 1) * self._period_ns
-            self._sync_t0_ns = self._next_stamp_ns
-            self._sync_count = 0
-            err_ns = 0
-
-        for frame in frames:
-            stamp_ns = self._next_stamp_ns
-            # 안전망: 어떤 경로로도 stamp 가 뒤로 가면 cartographer 의
-            # imu_tracker.cc 가 CHECK 로 즉시 abort 한다.
+        # 최신 프레임부터: stamp = now, now-period, now-2period, ...
+        to_pub: list[tuple[int, str]] = []
+        for k, frame in enumerate(reversed(frames)):
+            stamp_ns = now_ns - k * period
             if self._last_stamp_ns is not None and stamp_ns <= self._last_stamp_ns:
-                stamp_ns = self._last_stamp_ns + 1
+                break
+            to_pub.append((stamp_ns, frame))
+        to_pub.reverse()
+
+        for stamp_ns, frame in to_pub:
             self._last_stamp_ns = stamp_ns
-            self._next_stamp_ns = stamp_ns + self._period_ns
-            self._sync_count += 1
             self.process_frame(frame, stamp=Time(nanoseconds=stamp_ns))
-
-        # 위상 슬루: 주기의 1/4 이내로 제한하고 그중 1/8 만 반영.
-        # 점프가 아니라 서서히 당겨야 간격 지터가 안 생긴다.
-        cap = self._period_ns // 4
-        self._next_stamp_ns += max(-cap, min(cap, err_ns)) // 8
-
-        # 주기 학습: 충분히 쌓인 뒤 장기 평균으로 갱신(파라미터 값보다 실측 우선).
-        if self._sync_count >= 200:
-            measured = (now_ns - self._sync_t0_ns) // self._sync_count
-            if 1_000_000 <= measured <= 100_000_000:      # 10Hz~1000Hz 사이만
-                self._period_ns = (self._period_ns * 7 + measured) // 8
-            if self._sync_count >= 2000:                  # 창을 굴려 최신성 유지
-                self._sync_t0_ns = self._last_stamp_ns
-                self._sync_count = 0
 
     def process_frame(self, frame: str, stamp=None):
         cleaned_line = frame.strip()

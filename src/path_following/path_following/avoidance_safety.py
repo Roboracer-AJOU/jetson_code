@@ -88,6 +88,21 @@ class InflatedMap:
     def blocked(self, x: float, y: float) -> bool:
         return self.clearance_at(x, y) < self.inflation_m
 
+    def blocked_many(self, xs, ys):
+        """`blocked` 의 벡터판. 맵 밖은 막힌 것으로 본다.
+
+        오프셋 예산을 깔 때 레이스라인 전 점 × 후보 거리를 훑어야 해서,
+        점마다 파이썬 호출을 하면 맵이 올 때마다 눈에 띄게 걸린다.
+        """
+        xs = np.asarray(xs, dtype=np.float64)
+        ys = np.asarray(ys, dtype=np.float64)
+        j = ((xs - self.ox) / self.res).astype(np.int64)
+        i = ((ys - self.oy) / self.res).astype(np.int64)
+        inside = (i >= 0) & (j >= 0) & (i < self.h) & (j < self.w)
+        clear = np.zeros(xs.shape, dtype=np.float32)
+        clear[inside] = self.clearance[i[inside], j[inside]]
+        return ~inside | (clear < self.inflation_m)
+
 
 def first_blocked_index(
     points,
@@ -152,6 +167,9 @@ class AvoidSpeedParams:
         ego_half_width_m: float = vg.HALF_WIDTH_M,  # 이전 0.17
         ego_front_m: float = vg.FRONT_M,            # 이전 0.30
         lateral_margin_m: float = 0.10,
+        # "지나갈 수 있다" 로 판정할 때만 추가로 요구하는 횡여유. 정지거리
+        # 한계를 통째로 면제하는 판단이라 최소 여유보다 조금 더 받는다.
+        pass_clear_extra_m: float = 0.15,
         v_min: float = 0.6,
         v_max: float = 8.0,
     ):
@@ -162,6 +180,7 @@ class AvoidSpeedParams:
         self.ego_half_width_m = max(0.01, ego_half_width_m)
         self.ego_front_m = max(0.0, ego_front_m)
         self.lateral_margin_m = max(0.0, lateral_margin_m)
+        self.pass_clear_extra_m = max(0.0, pass_clear_extra_m)
         self.v_min = max(0.0, v_min)
         self.v_max = max(self.v_min, v_max)
 
@@ -184,26 +203,69 @@ def maneuver_speed_limit(
     return math.sqrt(p.a_lat / kappa)
 
 
+def passing_clearance_m(y_base: float, target_lat_m: float) -> float:
+    """회피 기동을 끝까지 수행했을 때 이 장애물과 벌어질 최소 횡거리 [m].
+
+    자차의 횡위치는 지금(0) 에서 FGM 목표의 횡오프셋(`target_lat_m`) 까지
+    지나간다. 장애물의 y 가 그 구간 **안** 에 있으면 언젠가 정면으로 지나므로
+    여유는 0 이다. 밖에 있으면 두 끝점 중 가까운 쪽까지가 최소 여유다.
+
+    부호가 핵심이다. 왼쪽으로 틀고 있는데 장애물이 오른쪽이면 멀어지지만,
+    장애물도 왼쪽이면 오히려 다가간다. |y| 만 봐서는 이 둘을 구분 못 한다.
+    """
+    lo, hi = min(0.0, target_lat_m), max(0.0, target_lat_m)
+    if lo <= y_base <= hi:
+        return 0.0
+    return min(abs(y_base), abs(y_base - target_lat_m))
+
+
 def _obstacle_speed_limit(
     x_base: float,
     y_base: float,
     radius: float,
     v_obs_along: float,
     p: AvoidSpeedParams,
+    target_lat_m: float = 0.0,
+    passing: bool = False,
+    path_lat_at=None,
 ) -> float | None:
     """장애물 하나가 거는 속도 한계 [m/s]. 진로 밖이면 None.
 
     "회피가 실패해도 부딪히기 전에 멈출 수 있는" 속도. 정지 장애물이면
     v = sqrt(2*a*d) 그대로고, 움직이는 장애물이면 그만큼 덜 줄여도 되므로
     상대속도 기준이 되어 v_obs 가 더해진다. 앞차와 같은 속도면 안 줄여도 된다.
+
+    `passing=True` 는 지금 실제로 회피 조향 중이라는 뜻이다. 그때는 정면
+    충돌이 아니라 **옆으로 지나가는** 상황이므로 판정 기준이 달라진다.
     """
     lateral_need = radius + p.ego_half_width_m + p.lateral_margin_m
     # 옆에 나란히(추월·스치기)만 제외한다. 전방이면 |y| 가 커 보여도
     # 레이싱라인이 굽어서 그런 것이라, "이미 피했다" 로 보면 코너 앞 콘을
-    # CSV 속도로 들이받는다. 추월 전략이 생기기 전에는 전방은 무조건 감속.
+    # CSV 속도로 들이받는다. 접근 구간에서 전방은 무조건 감속.
     beside = x_base < max(p.ego_front_m + p.standoff_m, 0.8)
     if beside and abs(y_base) >= lateral_need:
         return None
+
+    # 회피 조향 중이고, 그 기동을 끝내면 확실히 옆으로 비켜 지나간다면
+    # 정지거리 한계를 걸지 않는다. 걸면 "피해서 지나갈 건데도 정면 충돌
+    # 기준으로 제동" 하는 꼴이라, 옆을 스치는 내내 v_min 으로 기어간다.
+    # (실측: 회피 중 배율이 0.17 에 붙어 0.49 m/s 까지 떨어졌다가, 장애물이
+    #  시야에서 빠지는 순간 다시 튀어 나갔다.)
+    # 조향 자체의 횡가속도 한계(maneuver)는 그대로 살아 있으므로 속도가
+    # 무제한이 되지는 않는다.
+    #
+    # `path_lat_at` 이 있으면 "이 장애물 옆을 지날 때 우리 경로가 어디 있는지"
+    # 를 직접 물어본다. 미리 계획한 기동은 그 답을 정확히 알고 있다.
+    # 없을 때만 FGM 식 근사(지금→목표 사이를 훑는다)로 떨어진다. 계획 기동에
+    # 그 근사를 쓰면 장애물이 그 구간 안에 있다는 이유로 여유를 0 으로 보고,
+    # 실제로는 진작 비켜서 지나가는데도 정면충돌 기준으로 제동하게 된다.
+    if passing:
+        if path_lat_at is not None:
+            clearance = abs(y_base - float(path_lat_at(x_base)))
+        else:
+            clearance = passing_clearance_m(y_base, target_lat_m)
+        if clearance >= lateral_need + p.pass_clear_extra_m:
+            return None
 
     gap = x_base - radius - p.ego_front_m - p.standoff_m
     if gap <= 0.0:
@@ -220,6 +282,8 @@ def avoid_speed_limit(
     p: AvoidSpeedParams,
     laser_to_base_x_m: float = 0.0,
     include_maneuver: bool = True,
+    passing: bool | None = None,
+    path_lat_at=None,
 ) -> tuple[float, str]:
     """목표 속도 [m/s] 와 그걸 정한 이유.
 
@@ -235,7 +299,17 @@ def avoid_speed_limit(
     include_maneuver=False 는 아직 회피를 시작하지 않은 접근 구간(GLOBAL)용.
     조향을 안 하고 있으니 횡가속도 한계는 의미가 없고, 거리 기반 선감속만
     건다. 이게 있어야 회피 모드로 넘어가는 순간 속도가 계단으로 안 떨어진다.
+
+    `passing` 은 "옆으로 지나가는 중이라 정지거리 한계를 면제해도 되는가" 다.
+    기본은 include_maneuver 를 따라간다 — FGM 을 쫓을 때는 조향 중인 것과
+    지나가는 중인 것이 같은 말이기 때문이다. 하지만 **미리 계획한 횡오프셋
+    기동**에서는 둘이 갈린다. 그때 조향 한계는 계획이 이미 봤으므로
+    include_maneuver=False 여야 하지만, 옆으로 비켜 지나가는 것은 사실이라
+    면제는 받아야 한다. 묶어 두면 회피 내내 정면충돌 기준으로 제동이 걸려
+    기어가게 된다.
     """
+    if passing is None:
+        passing = include_maneuver
     limits: list[tuple[float, str]] = []
     if include_maneuver:
         limits.append(
@@ -246,7 +320,16 @@ def avoid_speed_limit(
         x = float(static_obstacles[k + 1]) + laser_to_base_x_m
         y = float(static_obstacles[k + 2])
         r = float(static_obstacles[k + 3])
-        v = _obstacle_speed_limit(x, y, r, 0.0, p)
+        v = _obstacle_speed_limit(
+            x,
+            y,
+            r,
+            0.0,
+            p,
+            target_lat_m=target_lat_m,
+            passing=passing,
+            path_lat_at=path_lat_at,
+        )
         if v is not None:
             limits.append((v, "static"))
 
@@ -262,7 +345,16 @@ def avoid_speed_limit(
         # closing = +면 접근. 상대속도라 앞차의 절대속도는 ego - closing.
         closing = -(x * vx + y * vy) / rng
         v_obs_along = max(0.0, float(ego_speed_mps) - closing)
-        v = _obstacle_speed_limit(x + laser_to_base_x_m, y, r, v_obs_along, p)
+        v = _obstacle_speed_limit(
+            x + laser_to_base_x_m,
+            y,
+            r,
+            v_obs_along,
+            p,
+            target_lat_m=target_lat_m,
+            passing=passing,
+            path_lat_at=path_lat_at,
+        )
         if v is not None:
             limits.append((v, "dynamic"))
 

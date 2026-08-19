@@ -104,7 +104,7 @@ CFG = {
     #   - atan(L·κ) 가 만드는 FF 가 비로소 "필요량의 몇 배" 로 읽힌다
     #   - _limit_lateral_accel / _accel_hold_cap 의 횡가속 상한이 실제로 걸린다
     #     (지금은 실각도 상한을 2.33배 부풀린 명령과 비교해서 사실상 무효다)
-    # False 로 되돌리면 이전과 완전히 동일하다.
+    # True 면 실측 전륜각(±21.4°) 기준으로 Stanley 출력을 보정한다.
     "steer_scale_calibrated": True,
     "steering_smooth_alpha": 0.45,
     "wheelbase": vg.WHEELBASE_M,
@@ -135,7 +135,7 @@ CFG = {
     # heading_gain 은 "경로 헤딩 오차 → 조향" 배율. FGM 각도가 이미 필요한
     # 회피량을 담고 있어서 1.0 을 넘기면 목표점을 지나쳐 과회피가 된다.
     # 목표점 추종(pure pursuit) 등가 게인은 2L/Ld ≈ 0.7 수준.
-    "local_path_stanley_k": 1.0,
+    "local_path_stanley_k": 0.5,
     "local_path_heading_gain": 0.8,
     "local_path_cte_speed_cap_mps": 1.2,  # 고속에서 cte_term 약화 방지
     "local_path_lookahead_m": 0.70,      # heading 기준을 앞쪽 경로로
@@ -147,6 +147,16 @@ CFG = {
     # 5.0 은 IMU 실측 기준: 2.5~2.8 m/s 코너링에서 v·ω 피크가 4.84~5.59 였고
     # 그 지점에서 이미 밀리고 있었다. 그 위를 명령해도 조향이 곡률로 바뀌지 않는다.
     "max_lateral_accel_mps2": 5.0,
+    # 피드백 보정(heading+CTE+가속보정)만 따로 묶는 접지력 예산 (≤0 이면 끔).
+    # 위 상한과 마찬가지로 **LOCAL_PATH(회피/복귀) 전용**이다.
+    # 이게 없으면 장애물을 지나 경로에서 벌어진 상태로 복귀할 때 헤딩을
+    # 되돌리는 조향이 접지력을 넘어 그대로 벽으로 밀린다
+    # (7m/s 에서 10° 만 꺾어도 26 m/s² 요구).
+    # 4.0 은 max_lateral_accel 보다 낮게 둬서, 복귀 기동이 코너링보다
+    # 언제나 완만하도록 한 값이다.
+    # CSV 추종에는 걸지 않는다 — 곡선은 FF 가 처리하고, 피드백은 남은 오차를
+    # 정확히 지워야 한다. 2° 상한을 씌우면 라인을 못 따라간다.
+    "feedback_lateral_accel_mps2": 4.0,
     # 곡률 피드포워드: δ = δ_ff(κ) + Stanley. 직선용 stanley_k 는 유지.
     "enable_steer_ff": True,
     "ff_gain": 1.3,              # δ_ff = ff_gain * ff_sign * atan(L·κ)
@@ -155,15 +165,15 @@ CFG = {
     # 두 배열은 같은 길이여야 하고 속도는 오름차순이어야 한다. 구간 사이는
     # 선형보간, 양 끝 밖은 끝값으로 고정(외삽 안 함 — 저속에서 게인이 음수로
     # 뒤집혀 코너에서 반대로 꺾는 것을 막는다).
-    #   1 -> 1.00   2 -> 1.65   3 -> 2.30   4 -> 2.30   5 -> 2.30
-    #   6 -> 2.65   7 -> 3.00   그 이상은 3.00 고정
-    # 3~5 m/s 는 2.30 평탄 구간이다 (양 끝을 같은 값으로 지정했다).
     # 끄면(False) 기존처럼 ff_gain 고정값을 쓴다.
     #
     # 여기 숫자는 서보각 단위다. 스케일 보정(steer_scale_calibrated)이 켜지면
     # 0.428 이 곱해져 "실제 전륜각 기준 운동학 배율" 이 된다. 그 눈으로 보면:
     #   서보 2.33 = 실각 1.00 = atan(L·κ) 를 정확히 그만큼 꺾는다(운동학적 정확)
-    #   현재 고정값 1.30 = 실각 0.56 — 필요량의 56% 만 넣고 있었다
+    #   아래 표는 1m/s 0.98 → 3 1.07 → 5 1.20 → 7 1.41 → 10 1.50 배가 된다.
+    # 한때 5·7·10 을 3.3/3.5/3.8 로 올려둔 적이 있는데, 그건 control_node 분모가
+    # 0.8726 이라 조향이 43% 로 깎이던 걸 FF 로 메우려던 것이었다. 분모를
+    # 0.3735 로 되돌린 지금 그대로 두면 코너에서 18% 과조향이 된다.
     # 20260816 랩에서 t=186~188s, κ=-0.13(반경 7.5m), 2.7→3.0 m/s 구간의
     # cte 가 0.11 → 0.59 m 로 벌어졌다. 그때 FF 는 실각 1.3° 였고 운동학적
     # 필요량은 2.46° 였다. 모자란 1.16° 는 횡가속 0.55 m/s² 에 해당해서,
@@ -172,7 +182,7 @@ CFG = {
     # 문제 구간인 3~5 m/s 에서 실각 0.98 로 운동학적 정확값에 맞춘다.
     "ff_gain_schedule_enable": True,  # 이전 기본값 False (고정 ff_gain 1.3)
     "ff_gain_speed_bp": [1.0, 3.0, 5.0, 7.0, 10.0],
-    "ff_gain_bp": [2.3, 2.5, 2.8, 3.3, 3.5],
+    "ff_gain_bp": [2.3, 3.0, 3.5, 3.8, 4.0],
     "ff_sign": 1.0,              # 좌우 반대면 -1.0
     "ff_lookahead_m": 0.8,       # best_i 기준 앞쪽 평균 곡률 구간 [m]
     "ff_kappa_clip": 2.5,        # |κ| 상한 [1/m] (스파이크 방지)
@@ -434,6 +444,9 @@ class StanleyWaypointFollowNode(Node):
         self.max_lateral_accel_mps2 = float(
             self.get_parameter("max_lateral_accel_mps2").value
         )
+        self.feedback_lateral_accel_mps2 = float(
+            self.get_parameter("feedback_lateral_accel_mps2").value
+        )
         self.enable_steer_ff = param_bool(self.get_parameter("enable_steer_ff").value)
         self.ff_gain = float(self.get_parameter("ff_gain").value) * g
         self._init_ff_gain_schedule()
@@ -481,6 +494,9 @@ class StanleyWaypointFollowNode(Node):
         self._path_poses: List[Tuple[float, float]] = []
 
         self._planner_override_active = False
+        # 기본값은 False = FGM 폴백처럼 곡률이 의미 없는 경로로 가정. 계획
+        # 기동이 실제로 들어올 때만 켜진다.
+        self._local_path_planned = False
         self._planner_gate_recv_ns = 0
 
         self._measured_speed_mps = 0.0
@@ -504,6 +520,8 @@ class StanleyWaypointFollowNode(Node):
         self._telemetry_recv_ns = 0
 
         self._last_steering_cmd = 0.0
+        self._wrong_way_frames = 0
+        self._wrong_way_warned = False
         self._last_heading_err = 0.0
         self._last_cte_term = 0.0
         self._last_ff_term = 0.0
@@ -520,6 +538,9 @@ class StanleyWaypointFollowNode(Node):
 
         self.create_subscription(Path, self.local_path_topic, self._cb_local_path, 10)
         self.create_subscription(Bool, self.gate_topic, self._cb_planner_gate, 10)
+        self.create_subscription(
+            Bool, "/planner/local_path_planned", self._cb_local_path_planned, 10
+        )
         self.create_subscription(
             Float64,
             self.measured_speed_topic,
@@ -604,6 +625,10 @@ class StanleyWaypointFollowNode(Node):
     def _cb_planner_gate(self, msg: Bool) -> None:
         self._planner_override_active = bool(msg.data)
         self._planner_gate_recv_ns = self.get_clock().now().nanoseconds
+
+    def _cb_local_path_planned(self, msg: Bool) -> None:
+        """/local_path 가 계획된 기하 경로인가 (FF 를 켤지 여부)."""
+        self._local_path_planned = bool(msg.data)
 
     def _cb_vehicle_telemetry(self, msg: Float64MultiArray) -> None:
         """control_node /vehicle/telemetry 스냅샷.
@@ -897,6 +922,7 @@ class StanleyWaypointFollowNode(Node):
             )
 
         heading_error = wrap_pi(path_yaw - yaw)
+        self._warn_if_wrong_way(heading_error, speed)
 
         dx = px - best_qx
         dy = py - best_qy
@@ -939,7 +965,22 @@ class StanleyWaypointFollowNode(Node):
 
         kappa_used = 0.0
         ff_term = 0.0
-        if self.enable_steer_ff and mode != "LOCAL_PATH":
+        # LOCAL_PATH 에서도 경로가 **계획된 기하**면 FF 를 쓴다.
+        #
+        # FF 를 껐던 이유는 FGM 폴백 경로 때문이다. 그건 조준점까지 그은
+        # 직선이라 곡률이 목표점 흔들림에서 나오는 잡음이고, 그걸 FF 로
+        # 증폭하면 조향이 떤다.
+        #
+        # 횡오프셋 기동은 반대다. 그 곡률(6 m/s 에서 0.08 1/m ≈ 1.6°)은 우리가
+        # 타기로 **계획한** 값이고, FF 로 안 내보내면 오차가 쌓인 뒤 피드백이
+        # 뒤늦게 만들어야 한다. 그런데 그 피드백에는 횡가속 상한이 걸려 있어
+        # (6 m/s 에서 2.1°, 7 m/s 에서 1.5°) 기하를 내는 데만 예산을 다 쓰고
+        # 정작 오차를 지울 여지가 안 남는다. 계획대로 못 따라가는 것이다.
+        #
+        # 이렇게 나누면 역할이 제자리를 찾는다: FF 가 계획된 곡률을 내고,
+        # 피드백 상한은 순수하게 **오차 보정** 크기를 묶는다.
+        ff_ok = mode != "LOCAL_PATH" or self._local_path_planned
+        if self.enable_steer_ff and ff_ok:
             kappa_used = self._lookahead_curvature(path, best_i)
             # 자전거 모델: δ_ff = atan(L·κ). +κ(좌로 휨) → +조향(좌).
             ff_term = (
@@ -954,9 +995,35 @@ class StanleyWaypointFollowNode(Node):
         accel_extra = self._accel_hold_term(
             accel_u, cte, speed, ff_term
         )
-        self._last_accel_extra = accel_extra
 
-        steering = ff_term + heading_term + cte_term + accel_extra
+        # 피드백 보정을 접지력 예산으로 묶는다 — 단 LOCAL_PATH(회피/복귀)에서만.
+        #
+        # 이 상한은 v² 에 반비례해서 6 m/s 면 2.1°, 7 m/s 면 1.5° 까지 조인다.
+        # 회피/복귀에서는 그게 목적이다: 장애물 옆을 지나느라 경로에서 벌어진
+        # 상태로 헤딩을 되돌릴 때 조향을 크게 넣으면 벽으로 간다. 조향 대신
+        # 미리 피하거나 속도를 줄이는 쪽이 맞다.
+        #
+        # 반대로 깨끗한 트랙(CSV_TRACKING)에 걸면 안 된다. 곡선은 FF 가 이미
+        # 처리하고 있고, 피드백은 남은 CTE/헤딩 오차를 정확히 지우는 역할이다.
+        # 거기에 2° 상한을 씌우면 경로를 못 따라간다. 한때 CSV 에도 걸려
+        # 있었는데, 요청받은 건 회피/복귀 한정이었다.
+        #
+        # 세 항을 함께 비례 축소해야 진단 토픽의 합이 실제 명령과 맞는다.
+        fb_term = heading_term + cte_term + accel_extra
+        fb_limit = (
+            self._steering_for_lateral_accel(self.feedback_lateral_accel_mps2, speed)
+            if mode == "LOCAL_PATH" and self.feedback_lateral_accel_mps2 > 0.0
+            else None
+        )
+        if fb_limit is not None and abs(fb_term) > fb_limit:
+            shrink = fb_limit / abs(fb_term)
+            heading_term *= shrink
+            cte_term *= shrink
+            accel_extra *= shrink
+            fb_term = math.copysign(fb_limit, fb_term)
+
+        self._last_accel_extra = accel_extra
+        steering = ff_term + fb_term
 
         # Stanley 조향값은 원형 각도가 아니라 bounded control input 이므로
         # wrap_pi()로 다시 감싸면 반응이 과하게 휘어질 수 있다.
@@ -1085,6 +1152,34 @@ class StanleyWaypointFollowNode(Node):
             f"steer={steer_deg:+.1f}° mode={mode}"
         )
 
+    # 경로를 역방향으로 타면 헤딩오차가 180° 근처에 눌러앉고 Stanley 는 즉시
+    # 풀락을 때린다. 원인은 대개 CSV 재생성 시 폐루프 감김방향이 뒤집힌 것이라
+    # 게인을 아무리 만져도 낫지 않는다. 증상 대신 원인을 바로 지목한다.
+    # 차를 들어 옮기거나 돌려놓는 동안에도 오차는 180° 가 되므로 주행 중일
+    # 때만 센다. 안 그러면 셋업할 때마다 에러가 떠서 무시하게 된다.
+    _WRONG_WAY_RAD = math.radians(120.0)
+    _WRONG_WAY_FRAMES = 25
+    _WRONG_WAY_MIN_MPS = 1.0
+
+    def _warn_if_wrong_way(self, heading_error: float, speed: float) -> None:
+        if abs(speed) < self._WRONG_WAY_MIN_MPS:
+            return
+        if abs(heading_error) < self._WRONG_WAY_RAD:
+            self._wrong_way_frames = 0
+            self._wrong_way_warned = False
+            return
+        self._wrong_way_frames += 1
+        if self._wrong_way_frames < self._WRONG_WAY_FRAMES or self._wrong_way_warned:
+            return
+        self._wrong_way_warned = True
+        self.get_logger().error(
+            f"경로를 역방향으로 타고 있다: 헤딩오차 "
+            f"{math.degrees(heading_error):+.0f}° 가 "
+            f"{self._WRONG_WAY_FRAMES} 프레임 지속. "
+            f"raceline/centerline CSV 의 감김방향이 뒤집혔거나 차가 반대로 "
+            f"출발했다. 게인 문제가 아니다."
+        )
+
     def _path_yaw_at_lookahead(
         self,
         path: List[Tuple[float, float]],
@@ -1209,17 +1304,23 @@ class StanleyWaypointFollowNode(Node):
         self._last_steering_cmd = out
         return out
 
-    def _limit_lateral_accel(self, steering: float, speed: float) -> float:
-        """a_lat = v²·tan(δ)/L 이 한계를 넘지 않도록 조향 상한 (LOCAL_PATH 전용).
+    def _steering_for_lateral_accel(self, a_max: float, speed: float) -> float | None:
+        """a_lat = v²·tan(δ)/L = a_max 가 되는 조향각. 제한이 무의미하면 None.
 
-        저속에서는 상한이 max_steering 보다 커서 걸리지 않고, 고속에서만 조인다.
+        저속에서는 상한이 max_steering 보다 커서 어차피 걸리지 않는다.
         """
-        a_max = self.max_lateral_accel_mps2
         v = abs(speed)
         if a_max <= 0.0 or v < 0.5:
+            return None
+        return math.atan(self.wheelbase * a_max / (v * v))
+
+    def _limit_lateral_accel(self, steering: float, speed: float) -> float:
+        """LOCAL_PATH 전용 총조향 상한 (이 모드에선 FF 가 꺼져 있어 전부 피드백)."""
+        delta_max = self._steering_for_lateral_accel(
+            self.max_lateral_accel_mps2, speed
+        )
+        if delta_max is None:
             return steering
-        kappa_max = a_max / (v * v)
-        delta_max = math.atan(self.wheelbase * kappa_max)
         return max(-delta_max, min(delta_max, steering))
 
     def _compute_path_curvature(

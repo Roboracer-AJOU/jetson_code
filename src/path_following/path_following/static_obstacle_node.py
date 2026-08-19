@@ -20,6 +20,7 @@ from std_msgs.msg import Float32MultiArray
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
+from path_following.detection_confirm import HitHistory
 from path_following.scan_cluster import ClusterParams, cluster_scan_xy
 from path_following.track_sliding import param_bool
 
@@ -52,7 +53,7 @@ CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
     # integrated_obstacle_node·로컬라이제이션 pbstream·CSV 와 같은 맵이어야 한다.
     # 이전 값은 이틀 전 맵이라 세 곳과 전부 어긋나 있었다.
-    "map_name": "cartographer_map_20260817_003202.yaml",  # 이전 20260816_234629
+    "map_name": "cartographer_map_20260820_014643_rosmap.yaml",  # 이전 20260816_234629
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",  # 실차 (시뮬: ego_racecar/laser)
@@ -60,8 +61,22 @@ CFG = {
     "scan_topic": "/scan",
     "obstacles_topic": "/static_obstacles",
     "markers_topic": "/visualization_marker_array",
-    # 실차 TF/맵 어긋남 + 잔차 노이즈 (너무 키우면 실장애를 벽으로 흡수)
-    "wall_match_radius_m": 0.42,
+    # 맵 벽을 이만큼 부풀려서 그 안의 스캔점을 전부 지운다. 키운 만큼 벽 옆
+    # 실장애물도 통째로 흡수하므로(0.42 면 벽에서 42cm 안쪽이 안 보였다)
+    # 실제 오차 예산이 허용하는 최소값으로 둔다. 7 m/s 기준:
+    #   측위 잔차 (map→odom 점프 실측)        0.10
+    #   스캔 왜곡 (25ms 스윕을 강체변환)      0.09  ← 디스큐 없이는 못 없앰
+    #   맵 격자 반칸 + 라이다 거리 노이즈     0.045
+    #   ------------------------------------------
+    #   합계                                  0.235  → 격자 올림 0.25
+    # 팽창은 ceil(r/resolution) 셀이라 0.25 는 정확히 5셀(=0.25m)이다.
+    # scan stamp 로 TF 를 조회하도록 고치기 전에는 여기에 시각 불일치
+    # 14cm 가 더 붙어서 0.42 가 필요했다 (_lookup_laser_to_map 참고).
+    # 새로 드러나는 0.25~0.42 띠는 아래 near_wall 가드가 점수·span 으로
+    # 거른다 (얇은 벽 잔차는 탈락, 실물 박스는 통과).
+    # 더 낮추려면 점별 디스큐나 측위 개선이 먼저다 —
+    # scripts/measure_wall_residual.py 로 실측해서 근거를 만들 것.
+    "wall_match_radius_m": 0.25,
     "tf_timeout_sec": 0.10,
     "cluster_gap_threshold_m": 0.28,
     "min_cluster_points": 10,
@@ -79,8 +94,10 @@ CFG = {
     "radius_percentile": 90.0,
     "radius_min_m": 0.05,
     # 벽 잔차 오검출 억제. integrated_obstacle_node 와 같은 기준으로 맞춘다.
+    # wall_match_radius_m 를 줄인 만큼 이 띠를 넓혀서, 새로 드러난 구간을
+    # 증거량(점수·span)으로 판단하게 한다.
     "wall_residual_guard": True,
-    "wall_clearance_m": 0.12,
+    "wall_clearance_m": 0.20,
     "near_wall_min_points": 14,
     "near_wall_min_span_m": 0.20,
     "max_obstacle_size_m": 0.85,
@@ -91,6 +108,14 @@ CFG = {
     "persist_match_m": 0.55,
     "confirm_time_s": 0.04,  # 발행 전 최소 관측 시간 (반응↑)
     "keep_time_s": 0.10,     # 미검출 시 유지 시간
+    # M-of-N 확정. confirm_time_s 만으로는 못 거른다 — 누적 관측시간은
+    # 미검출에서 줄지 않아서, 몇 프레임에 한 번 깜빡이는 노이즈도 트랙이
+    # keep_time_s 안에 살아있는 한 계속 쌓여 결국 확정되기 때문이다.
+    # 40Hz 기준 6프레임(150ms) 중 4회. 매 프레임 잡히는 실제 장애물은
+    # 4프레임(100ms, 7m/s 에서 70cm)에 통과한다. 탐지 사거리 11m 대비 6%다.
+    # confirm_min_hits=1 로 두면 예전 동작으로 정확히 되돌아간다.
+    "confirm_window_frames": 6,
+    "confirm_min_hits": 4,
     "log_detections": False,
     "log_throttle_sec": 2.0,
     # Foxglove/RViz MarkerArray
@@ -235,6 +260,16 @@ class StaticObstacleNode(Node):
         )
         self.confirm_time_s = max(0.0, float(self.get_parameter("confirm_time_s").value))
         self.keep_time_s = max(0.0, float(self.get_parameter("keep_time_s").value))
+        self.confirm_window_frames = max(
+            1, int(self.get_parameter("confirm_window_frames").value)
+        )
+        self.confirm_min_hits = max(
+            1,
+            min(
+                int(self.get_parameter("confirm_min_hits").value),
+                self.confirm_window_frames,
+            ),
+        )
         self.tf_timeout = float(self.get_parameter("tf_timeout_sec").value)
         self.log_throttle_ns = int(
             max(0.1, float(self.get_parameter("log_throttle_sec").value)) * 1e9
@@ -243,6 +278,9 @@ class StaticObstacleNode(Node):
         self._publish_markers = param_bool(self.get_parameter("publish_markers").value)
         self._last_detect_log_ns = 0
         self._last_tf_warn_ns = 0
+        self._tf_fallback_count = 0
+        self._tf_lookup_total = 0
+        self._last_tf_fallback_warn_ns = 0
 
         gp = self.get_parameter
         self._cluster_params = ClusterParams(
@@ -266,7 +304,9 @@ class StaticObstacleNode(Node):
         self._near_wall_min_span_m = max(0.0, float(gp("near_wall_min_span_m").value))
 
         # [(x, y, r, age_s, missed_s), ...]
-        self._persist: list[list[float]] = []
+        self._persist: list[list] = []
+        self._noise_rejected = 0
+        self._last_noise_log_ns = 0
         self._last_scan_ns: int | None = None
         self._dt: float = 0.025
 
@@ -314,16 +354,59 @@ class StaticObstacleNode(Node):
         obs_msg.data = []
         self.obstacle_pub.publish(obs_msg)
 
-    def _lookup_laser_to_map(self):
+    def _lookup_laser_to_map(self, stamp=None):
+        """스캔이 찍힌 시각의 TF. 실패하면 최신 TF 로 근사한다.
+
+        최신 TF(`rclpy.time.Time()`) 를 쓰면 스캔 시각과 어긋난 만큼 점구름
+        전체가 밀린다. 7 m/s 에서 20 ms 면 14 cm, 코너(요레이트 1 rad/s)에서는
+        8 m 앞 점이 16 cm 옆으로 간다. 이 오차를 덮으려고 wall_match_radius_m
+        를 크게 잡으면 벽 옆 실장애물까지 같이 지워진다.
+        """
+        timeout = rclpy.duration.Duration(seconds=self.tf_timeout)
+        self._tf_lookup_total += 1
+        if stamp is not None:
+            try:
+                # 대기하지 않는다. 스캔 주기가 25ms 인데 여기서 tf_timeout
+                # (0.1s) 을 기다리면 실패할 때마다 스캔 4개를 통째로 놓친다.
+                # 못 찾으면 곧바로 최신 TF 로 넘어가는 편이 낫다 — 그게
+                # 예전 동작이라 잃는 것도 없다.
+                return self.tf_buffer.lookup_transform(
+                    self._map_frame,
+                    self._laser_frame,
+                    stamp,
+                    timeout=rclpy.duration.Duration(seconds=0.0),
+                )
+            except TransformException:
+                # 팽창 반경을 줄여 둔 근거가 이 조회의 성공률이므로 세어 둔다.
+                self._tf_fallback_count += 1
         try:
             return self.tf_buffer.lookup_transform(
                 self._map_frame,
                 self._laser_frame,
                 rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=self.tf_timeout),
+                timeout=timeout,
             )
         except TransformException:
             return None
+
+    def _warn_tf_fallback_rate(self, now_ns: int) -> None:
+        """스캔 시각 TF 성공률. 낮으면 팽창 반경을 줄여 둔 근거가 약해진다.
+
+        실패해도 최신 TF 로 굴러가므로 치명적이진 않다 — 예전 동작이다.
+        다만 그만큼 고속에서 점구름이 밀리므로 비율만 알린다.
+        """
+        if now_ns - self._last_tf_fallback_warn_ns < 30_000_000_000:
+            return
+        self._last_tf_fallback_warn_ns = now_ns
+        total, miss = self._tf_lookup_total, self._tf_fallback_count
+        self._tf_lookup_total = self._tf_fallback_count = 0
+        if total <= 0 or miss * 5 <= total:  # 20% 이하면 조용히 넘어간다
+            return
+        self.get_logger().warn(
+            f"스캔 시각 TF 조회 {miss}/{total} 실패 ({100.0*miss/total:.0f}%) — "
+            "최신 TF 로 대체 중. 고속에서 벽 잔차가 그만큼 커지므로 "
+            "wall_match_radius_m 를 낮춰 둔 상태면 감안할 것"
+        )
 
     @staticmethod
     def _transform_xy(
@@ -339,6 +422,29 @@ class StaticObstacleNode(Node):
         mx = c * lx - s * ly + tx
         my = s * lx + c * ly + ty
         return mx, my
+
+    def _new_history(self) -> HitHistory:
+        return HitHistory(self.confirm_window_frames, self.confirm_min_hits)
+
+    def _prune_persist(self) -> None:
+        """수명이 다한 트랙 제거. 끝까지 확정 못 받고 죽은 건 노이즈로 센다."""
+        kept = []
+        for p in self._persist:
+            if p[4] <= self.keep_time_s:
+                kept.append(p)
+            elif not p[5].confirmed:
+                self._noise_rejected += 1
+        self._persist = kept
+        if self._noise_rejected == 0:
+            return
+        now_ns = self.get_clock().now().nanoseconds
+        if now_ns - self._last_noise_log_ns >= self.log_throttle_ns:
+            self._last_noise_log_ns = now_ns
+            self.get_logger().info(
+                f"노이즈 기각 누적 {self._noise_rejected}건 "
+                f"(최근 {self.confirm_window_frames}프레임 중 "
+                f"{self.confirm_min_hits}회 미달)"
+            )
 
     def _cluster_xy(self, px: np.ndarray, py: np.ndarray, angle_inc: float):
         """[A1] integrated_obstacle_node 와 같은 공용 클러스터러를 쓴다."""
@@ -366,7 +472,8 @@ class StaticObstacleNode(Node):
             self._publish_empty_obstacles()
             return
 
-        tf = self._lookup_laser_to_map()
+        tf = self._lookup_laser_to_map(msg.header.stamp)
+        self._warn_tf_fallback_rate(self.get_clock().now().nanoseconds)
         if tf is None:
             now_ns = self.get_clock().now().nanoseconds
             if now_ns - self._last_tf_warn_ns > 2_000_000_000:
@@ -428,7 +535,8 @@ class StaticObstacleNode(Node):
             # 검출 없음 — missed만 증가시키도록 빈 raw로 persistence 갱신
             for p in self._persist:
                 p[4] += self._dt
-            self._persist = [p for p in self._persist if p[4] <= self.keep_time_s]
+                p[5].update(False)
+            self._prune_persist()
             if not self._persist:
                 self._publish_empty_obstacles()
                 return
@@ -444,7 +552,7 @@ class StaticObstacleNode(Node):
             final_obstacle_count = 0
             nearest_logic = None
             for oid, p in enumerate(self._persist):
-                if p[3] < self.confirm_time_s:
+                if p[3] < self.confirm_time_s or not p[5].confirmed:
                     continue
                 logic_x, logic_y, radius = p[0], p[1], p[2]
                 obstacle_data_list.extend([float(oid), logic_x, logic_y, radius])
@@ -506,6 +614,7 @@ class StaticObstacleNode(Node):
         # 연속 히트 persistence — 단발 노이즈 깜빡임 억제
         for p in self._persist:
             p[4] += self._dt  # 미검출 누적 시간
+        prior_count = len(self._persist)
         used: set[int] = set()
         for dx, dy, dr in raw_dets:
             best_i = -1
@@ -522,14 +631,22 @@ class StaticObstacleNode(Node):
                 p[0], p[1], p[2] = dx, dy, dr
                 p[3] += self._dt
                 p[4] = 0.0
+                p[5].update(True)
                 used.add(best_i)
             else:
-                self._persist.append([dx, dy, dr, self._dt, 0.0])
+                self._persist.append(
+                    [dx, dy, dr, self._dt, 0.0, self._new_history()]
+                )
+        # 이번 프레임에 매칭 안 된 기존 트랙은 '미검출'로 창을 한 칸 민다.
+        # 이게 있어야 깜빡이는 노이즈의 창이 실제로 비워진다.
+        for i in range(prior_count):
+            if i not in used:
+                self._persist[i][5].update(False)
 
-        self._persist = [p for p in self._persist if p[4] <= self.keep_time_s]
+        self._prune_persist()
 
         for oid, p in enumerate(self._persist):
-            if p[3] < self.confirm_time_s:
+            if p[3] < self.confirm_time_s or not p[5].confirmed:
                 continue
             logic_x, logic_y, radius = p[0], p[1], p[2]
             obstacle_data_list.extend([float(oid), logic_x, logic_y, radius])

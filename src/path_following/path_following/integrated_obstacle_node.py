@@ -24,6 +24,7 @@ from std_msgs.msg import Float32MultiArray
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
+from path_following.detection_confirm import HitHistory
 from path_following.scan_cluster import ClusterParams, cluster_scan_xy
 from path_following.static_obstacle_node import StaticMap, resolve_map_yaml
 from path_following.track_kf import ConstantVelocityKF
@@ -35,7 +36,7 @@ CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
     # CSV(centerline/raceline)·로컬라이제이션 pbstream·static_obstacle_node 와
     # 반드시 같은 맵이어야 한다. 어긋나면 벽을 장애물로 보거나 그 반대가 된다.
-    "map_name": "cartographer_map_20260817_003202.yaml",  # 이전 20260816_211739
+    "map_name": "cartographer_map_20260820_014643_rosmap.yaml",  # 이전 20260816_211739
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",
@@ -44,8 +45,10 @@ CFG = {
     "static_obstacles_topic": "/static_obstacles",
     "dynamic_obstacles_topic": "/dynamic_obstacles",
     "markers_topic": "/visualization_marker_array",
-    # 맵 잔차 노이즈: 벽 매칭 여유 (너무 크게 하면 실장애 흡수)
-    "wall_match_radius_m": 0.42,
+    # 맵 벽 팽창 반경. 오차 예산 근거는 static_obstacle_node.py 주석 참고.
+    # 7 m/s 에서 측위 0.10 + 스캔왜곡 0.09 + 격자·노이즈 0.045 = 0.235
+    # → 격자 올림 0.25 (= 정확히 5셀). 두 노드가 같은 값을 유지할 것.
+    "wall_match_radius_m": 0.25,
     "tf_timeout_sec": 0.10,
     "cluster_gap_threshold_m": 0.28,
     "min_cluster_points": 10,
@@ -60,6 +63,15 @@ CFG = {
     # 확정/유지는 스캔 Hz와 무관하게 "초" 기준 (고속에서 지연이 곧 거리)
     "confirm_time_s": 0.04,          # 발행 전 최소 관측 시간 (반응↑)
     "dynamic_confirm_time_s": 0.08,  # dynamic 분류 최소 관측 시간
+    # M-of-N 확정. age_s 는 미검출 프레임에서 줄지 않는데 트랙은
+    # track_keep_time_s(4~5프레임) 동안 살아남는다. 그래서 몇 프레임에 한 번
+    # 깜빡이는 라이다 노이즈도 트랙이 죽지 않은 채 age_s 만 쌓아 결국
+    # confirm_time_s 를 넘겼다. 창을 흘려보내는 M-of-N 은 그게 안 된다.
+    # 40Hz 기준 6프레임(150ms) 중 4회. 실제 장애물은 100ms(7m/s 에서 70cm)에
+    # 통과하고, 탐지 사거리 11m 대비 6% 만 쓴다.
+    # confirm_min_hits=1 로 두면 예전 동작으로 정확히 되돌아간다.
+    "confirm_window_frames": 6,
+    "confirm_min_hits": 4,
     "track_keep_time_s": 0.12,       # 미검출 시 트랙 유지 시간 (ema 모드)
     # kf 모드 전용 유지 시간. 40 Hz 에서 0.12 s 는 5 프레임뿐이라 그보다 조금만
     # 가려도 트랙이 삭제되고 새 ID 로 태어난다. age_s 가 리셋되니
@@ -104,8 +116,10 @@ CFG = {
     # 자유공간의 7.8% 뿐이다. 나머지 92% (= 주행선이 지나는 트랙 한가운데)
     # 에서는 이 가드가 아무 일도 하지 않는다. 그래서 실장애를 놓칠 위험
     # 없이 벽 잔차만 골라 억제한다. 끄려면 False.
+    # wall_match_radius_m 를 줄인 만큼 이 띠를 넓혀서, 새로 드러난 구간을
+    # 증거량(점수·span)으로 판단하게 한다.
     "wall_residual_guard": True,
-    "wall_clearance_m": 0.12,
+    "wall_clearance_m": 0.20,
     "near_wall_min_points": 14,
     "near_wall_min_span_m": 0.20,
     "log_detections": False,
@@ -168,6 +182,8 @@ class Track:
     # laser 쪽이 상대운동이라 closing_mps 가 여기서 바로 나온다.
     kf_map: ConstantVelocityKF | None = None
     kf_laser: ConstantVelocityKF | None = None
+    # M-of-N 확정 창. _spawn_track 에서 채운다.
+    hits: HitHistory | None = None
 
 class IntegratedObstacleNode(Node):
     def __init__(self):
@@ -202,6 +218,16 @@ class IntegratedObstacleNode(Node):
         self.dynamic_confirm_time_s = max(
             0.0, float(self.get_parameter("dynamic_confirm_time_s").value)
         )
+        self.confirm_window_frames = max(
+            1, int(self.get_parameter("confirm_window_frames").value)
+        )
+        self.confirm_min_hits = max(
+            1,
+            min(
+                int(self.get_parameter("confirm_min_hits").value),
+                self.confirm_window_frames,
+            ),
+        )
         self.track_keep_time_s = max(
             0.0, float(self.get_parameter("track_keep_time_s").value)
         )
@@ -224,6 +250,9 @@ class IntegratedObstacleNode(Node):
         self._publish_markers = param_bool(self.get_parameter("publish_markers").value)
         self._last_detect_log_ns = 0
         self._last_tf_warn_ns = 0
+        self._tf_fallback_count = 0
+        self._tf_lookup_total = 0
+        self._last_tf_fallback_warn_ns = 0
 
         gp = self.get_parameter
         self._cluster_params = ClusterParams(
@@ -283,6 +312,8 @@ class IntegratedObstacleNode(Node):
 
         self._tracks: list[Track] = []
         self._next_id = 0
+        self._noise_rejected = 0
+        self._last_noise_log_ns = 0
         self._last_scan_time_ns: int | None = None
 
         self.get_logger().info(
@@ -295,16 +326,59 @@ class IntegratedObstacleNode(Node):
             f"dyn_confirm≥{self.dynamic_confirm_time_s:.2f}s"
         )
 
-    def _lookup_laser_to_map(self):
+    def _lookup_laser_to_map(self, stamp=None):
+        """스캔이 찍힌 시각의 TF. 실패하면 최신 TF 로 근사한다.
+
+        최신 TF(`rclpy.time.Time()`) 를 쓰면 스캔 시각과 어긋난 만큼 점구름
+        전체가 밀린다. 7 m/s 에서 20 ms 면 14 cm, 코너(요레이트 1 rad/s)에서는
+        8 m 앞 점이 16 cm 옆으로 간다. 이 오차를 덮으려고 wall_match_radius_m
+        를 크게 잡으면 벽 옆 실장애물까지 같이 지워진다.
+        """
+        timeout = rclpy.duration.Duration(seconds=self.tf_timeout)
+        self._tf_lookup_total += 1
+        if stamp is not None:
+            try:
+                # 대기하지 않는다. 스캔 주기가 25ms 인데 여기서 tf_timeout
+                # (0.1s) 을 기다리면 실패할 때마다 스캔 4개를 통째로 놓친다.
+                # 못 찾으면 곧바로 최신 TF 로 넘어가는 편이 낫다 — 그게
+                # 예전 동작이라 잃는 것도 없다.
+                return self.tf_buffer.lookup_transform(
+                    self._map_frame,
+                    self._laser_frame,
+                    stamp,
+                    timeout=rclpy.duration.Duration(seconds=0.0),
+                )
+            except TransformException:
+                # 팽창 반경을 줄여 둔 근거가 이 조회의 성공률이므로 세어 둔다.
+                self._tf_fallback_count += 1
         try:
             return self.tf_buffer.lookup_transform(
                 self._map_frame,
                 self._laser_frame,
                 rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=self.tf_timeout),
+                timeout=timeout,
             )
         except TransformException:
             return None
+
+    def _warn_tf_fallback_rate(self, now_ns: int) -> None:
+        """스캔 시각 TF 성공률. 낮으면 팽창 반경을 줄여 둔 근거가 약해진다.
+
+        실패해도 최신 TF 로 굴러가므로 치명적이진 않다 — 예전 동작이다.
+        다만 그만큼 고속에서 점구름이 밀리므로 비율만 알린다.
+        """
+        if now_ns - self._last_tf_fallback_warn_ns < 30_000_000_000:
+            return
+        self._last_tf_fallback_warn_ns = now_ns
+        total, miss = self._tf_lookup_total, self._tf_fallback_count
+        self._tf_lookup_total = self._tf_fallback_count = 0
+        if total <= 0 or miss * 5 <= total:  # 20% 이하면 조용히 넘어간다
+            return
+        self.get_logger().warn(
+            f"스캔 시각 TF 조회 {miss}/{total} 실패 ({100.0*miss/total:.0f}%) — "
+            "최신 TF 로 대체 중. 고속에서 벽 잔차가 그만큼 커지므로 "
+            "wall_match_radius_m 를 낮춰 둔 상태면 감안할 것"
+        )
 
     @staticmethod
     def _transform_xy(
@@ -451,15 +525,29 @@ class IntegratedObstacleNode(Node):
         track.age_s += dt
         track.missed_s = 0.0
         track.matched = True
+        if track.hits is not None:
+            track.hits.update(True)
 
     def _update_tracks(self, detections: list[Detection], dt: float) -> None:
         if self._tracker_mode == "kf":
             self._update_tracks_kf(detections, dt)
         else:
             self._update_tracks_ema(detections, dt)
-        self._tracks = [
-            t for t in self._tracks if t.missed_s <= self.track_keep_time_s
-        ]
+        # 이번 프레임에 매칭 안 된 트랙은 창을 한 칸 민다. 이게 있어야
+        # 깜빡이는 노이즈의 창이 실제로 비워지고 M-of-N 이 의미를 가진다.
+        # (이번에 생성된 트랙은 matched=True 라 여기 안 걸린다)
+        for t in self._tracks:
+            if not t.matched and t.hits is not None:
+                t.hits.update(False)
+        kept = []
+        for t in self._tracks:
+            if t.missed_s <= self.track_keep_time_s:
+                kept.append(t)
+            elif t.hits is not None and not t.hits.confirmed:
+                # 끝까지 확정 못 받고 죽은 트랙 = 노이즈로 판정한 것.
+                # 로깅은 발행 경로에서 한다 — 여기는 추적만.
+                self._noise_rejected += 1
+        self._tracks = kept
 
     def _spawn_track(self, det: Detection, dt: float) -> None:
         lx, ly, mx, my = self._track_coords(det)
@@ -476,6 +564,7 @@ class IntegratedObstacleNode(Node):
             center_map_y=my,
             center_laser_x=lx,
             center_laser_y=ly,
+            hits=HitHistory(self.confirm_window_frames, self.confirm_min_hits),
         )
         if self._tracker_mode == "kf":
             track.kf_map = ConstantVelocityKF(
@@ -632,7 +721,8 @@ class IntegratedObstacleNode(Node):
         if dt <= 0.0:
             return
 
-        tf = self._lookup_laser_to_map()
+        tf = self._lookup_laser_to_map(msg.header.stamp)
+        self._warn_tf_fallback_rate(now_ns)
         if tf is None:
             if now_ns - self._last_tf_warn_ns > 2_000_000_000:
                 self.get_logger().warn(
@@ -662,6 +752,8 @@ class IntegratedObstacleNode(Node):
                 continue
             # 단발/짧은 트랙은 노이즈로 보고 미발행 (너무 길면 실장애 반응 늦음)
             if track.age_s < self.confirm_time_s:
+                continue
+            if track.hits is not None and not track.hits.confirmed:
                 continue
             if self._is_dynamic(
                 track, self.speed_threshold_mps, self.dynamic_confirm_time_s
@@ -716,6 +808,16 @@ class IntegratedObstacleNode(Node):
         self.dynamic_pub.publish(Float32MultiArray(data=dynamic_data))
         if self.marker_pub is not None and marker_array is not None:
             self.marker_pub.publish(marker_array)
+
+        if self._noise_rejected and (
+            now_ns - self._last_noise_log_ns >= self.log_throttle_ns
+        ):
+            self._last_noise_log_ns = now_ns
+            self.get_logger().info(
+                f"노이즈 기각 누적 {self._noise_rejected}건 "
+                f"(최근 {self.confirm_window_frames}프레임 중 "
+                f"{self.confirm_min_hits}회 미달로 미발행)"
+            )
 
         if self._log_detections and (static_count + dynamic_count) > 0:
             if now_ns - self._last_detect_log_ns >= self.log_throttle_ns:

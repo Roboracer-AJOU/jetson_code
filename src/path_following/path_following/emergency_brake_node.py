@@ -98,6 +98,28 @@ CFG = {
     # 0.12 는 범퍼가 장애물을 7 cm 지나간 지점이었다 (0.12 - 0.19 < 0).
     # 범퍼 여유 5 cm 를 남긴다.
     "escape_hard_stop_m": round(vg.LASER_TO_FRONT_M + 0.05, 3),  # 이전 0.12
+    # ---- 후진 탈출 ----
+    # 장애물 코앞에 서면 전진으로는 못 나간다. 버블 반각이
+    # asin((장애물반경+버블+차반폭)/거리) 라 거리가 그 반경(약 0.55) 안이면 90° —
+    # 최대 조향을 줘도 갈 데가 없다. 0.4 m 만 물러나도 반각이 90°→50° 로
+    # 떨어져 전진 탈출이 그때부터 가능해진다.
+    #
+    # 그래서 전진 탈출 창이 **아무 진전 없이 시간 초과** 로 닫히면 (= 최대
+    # 조향으로도 못 나갔다는 뜻) 곧게 뒤로 물러난 뒤 다시 전진 탈출을 시킨다.
+    # 조향은 집행하는 control_node 가 중립으로 잡는다 — 꺾인 채 후진하면
+    # 뒤가 어디로 갈지 예측이 안 된다.
+    "reverse_escape_enable": True,
+    # 이 거리만큼 물러나면 끝. 전진 탈출이 열리는 최소치 + 여유.
+    "reverse_travel_m": 0.40,
+    "reverse_max_sec": 2.0,
+    # 뒤가 이만큼 안 비어 있으면 시작하지 않는다 (범퍼 기준).
+    "reverse_min_clearance_m": 0.60,
+    # 후진 중 뒤 여유가 여기까지 줄면 즉시 중단. 벽에 대고 밀면 안 된다.
+    "reverse_abort_clearance_m": 0.25,
+    # 후방 코리도 반폭. 전방보다 조금 넉넉하게 본다 — 뒤는 안 보고 가는 거라
+    # 조향이 조금만 남아 있어도 실제 궤적이 옆으로 샌다.
+    "reverse_half_width_m": round(vg.HALF_WIDTH_M + 0.10, 3),
+    "reverse_topic": "/aeb/escape_reverse",
     # 노이즈 빔 하나로 급정거하지 않도록, 조건을 만족하는 빔이 이 개수 이상일 때만
     "min_hit_beams": 3,
     # ---- 주행 코리도 (오작동의 대부분이 여기서 갈린다) ----
@@ -193,6 +215,18 @@ class EmergencyBrakeNode(Node):
         self._escape_count = 0
         self._last_tick = 0.0
 
+        self.reverse_enable = bool(g("reverse_escape_enable").value)
+        self.reverse_travel = max(0.05, float(g("reverse_travel_m").value))
+        self.reverse_max_sec = max(0.1, float(g("reverse_max_sec").value))
+        self.reverse_min_clearance = max(0.0, float(g("reverse_min_clearance_m").value))
+        self.reverse_abort_clearance = max(
+            0.0, float(g("reverse_abort_clearance_m").value)
+        )
+        self.reverse_half_width = max(0.05, float(g("reverse_half_width_m").value))
+        self._reverse_until = 0.0    # 0 = 후진 안 함
+        self._reverse_travel = 0.0
+        self._reverse_count = 0
+
         self._speed = 0.0
         self._steering = 0.0
         self._drive_recv_ns = 0
@@ -245,6 +279,9 @@ class EmergencyBrakeNode(Node):
             Bool, str(g("brake_topic").value), 10
         )
         self.ttc_pub = self.create_publisher(Float64, str(g("ttc_topic").value), 10)
+        self.reverse_pub = self.create_publisher(
+            Bool, str(g("reverse_topic").value), 10
+        )
 
         self.create_subscription(
             LaserScan, str(g("scan_topic").value), self._scan_cb, 10
@@ -419,6 +456,96 @@ class EmergencyBrakeNode(Node):
             closest,
         )
 
+    def _rear_clearance(self) -> float:
+        """뒤 범퍼에서 뒤쪽 장애물까지의 여유 [m]. 못 재면 inf.
+
+        곧게 물러난다고 보고 직선 코리도만 본다 (집행 쪽에서 조향을 중립으로
+        잡는다). 라이다가 축보다 0.31 m 앞에 있어서 뒤끝까지가 0.41 m 나
+        되므로, 스캔 거리에서 그만큼 빼야 실제 범퍼 여유다.
+
+        전방 검사와 달리 맵 필터(아는 벽 무시)를 안 쓴다. 후진은 벽이든
+        장애물이든 닿으면 안 되고, 여기서 벽을 지워 버리면 벽으로 밀고
+        들어간다.
+        """
+        scan = self._scan
+        if scan is None:
+            return float("inf")
+        ranges = np.asarray(scan.ranges, dtype=float)
+        angles = self._beam_angle_array(scan)
+        if len(ranges) != len(angles):
+            return float("inf")
+
+        ok = (
+            np.isfinite(ranges)
+            & (ranges >= self.min_range)
+            & (ranges <= self.max_range)
+        )
+        if not np.any(ok):
+            return float("inf")
+        r = ranges[ok]
+        th = angles[ok]
+        x = r * np.cos(th)
+        y = r * np.sin(th)
+        behind = (x < 0.0) & (np.abs(y) <= self.reverse_half_width)
+        if not np.any(behind):
+            return float("inf")
+        return max(0.0, float(np.abs(x[behind]).min()) - vg.LASER_TO_REAR_M)
+
+    def _update_reverse(self, now: float, dt: float) -> bool:
+        """후진 요청 상태 갱신. True 면 이번 틱에 물러난다.
+
+        시작 조건은 `_update_escape_window` 가 잡는다 (전진 탈출이 아무 진전
+        없이 시간 초과). 여기서는 끝내는 조건만 본다 — 충분히 물러났거나,
+        시간이 다 됐거나, 뒤가 좁아졌거나.
+        """
+        if self._reverse_until <= 0.0:
+            return False
+
+        self._reverse_travel += abs(self._speed) * dt
+        rear = self._rear_clearance()
+
+        reason = ""
+        backed_off = False
+        if rear < self.reverse_abort_clearance:
+            reason = f"뒤가 막혔다 ({rear:.2f}m)"
+        elif self._reverse_travel >= self.reverse_travel:
+            reason = f"{self._reverse_travel:.2f}m 물러남 — 전진 재시도"
+            backed_off = True
+        elif now >= self._reverse_until:
+            reason = f"시간 초과 ({self._reverse_travel:.2f}m 물러남)"
+            backed_off = self._reverse_travel > 0.0
+
+        if not reason:
+            return True
+
+        self._reverse_until = 0.0
+        self._reverse_travel = 0.0
+        self.get_logger().warn(f"후진 탈출 종료 — {reason}")
+        if backed_off:
+            # 물러난 만큼 앞이 열렸다. 그 자리에서 standoff 가 다시 물기
+            # 전에 전진 탈출을 한 번 더 시켜 준다.
+            self._open_escape_window(now)
+        return False
+
+    def _maybe_start_reverse(self, now: float) -> None:
+        """전진 탈출이 실패했다 — 뒤가 비었으면 물러난다."""
+        if not (self.reverse_enable and self._reverse_until <= 0.0):
+            return
+        rear = self._rear_clearance()
+        if rear < self.reverse_min_clearance:
+            self.get_logger().warn(
+                f"전진도 후진도 막혔다 — 뒤 여유 {rear:.2f}m "
+                f"< {self.reverse_min_clearance:.2f}m. 그대로 선다"
+            )
+            return
+        self._reverse_until = now + self.reverse_max_sec
+        self._reverse_travel = 0.0
+        self._reverse_count += 1
+        self.get_logger().warn(
+            f"후진 탈출 시작 #{self._reverse_count} — 최대 조향으로도 못 나갔다. "
+            f"뒤 여유 {rear:.2f}m, {self.reverse_travel:.2f}m 물러난다"
+        )
+
     # ------------------------------------------------------------
     def _map_cb(self, msg: OccupancyGrid) -> None:
         try:
@@ -512,6 +639,7 @@ class EmergencyBrakeNode(Node):
         self._escape_travel += self._speed * dt
 
         reason = ""
+        stalled = False
         if closest < self.escape_hard_stop:
             reason = f"hard_stop 침범 ({closest:.2f}m)"
         elif self._escape_travel >= self.escape_min_travel > 0.0:
@@ -519,7 +647,12 @@ class EmergencyBrakeNode(Node):
         elif self._speed >= self.escape_speed_end > 0.0:
             reason = f"정상 주행 복귀 ({self._speed:.2f}m/s)"
         elif now >= self._escape_until:
-            reason = "시간 초과 — 못 빠져나감"
+            # 시간을 다 쓰고도 거의 제자리면 최대 조향으로도 못 나간 것이다.
+            # 조금이라도 나아갔으면 느릴 뿐이니 후진까지 갈 일은 아니다.
+            stalled = self._escape_travel < 0.5 * self.escape_min_travel
+            reason = (
+                f"시간 초과 — 못 빠져나감 ({self._escape_travel:.2f}m)"
+            )
 
         if not reason:
             return True
@@ -527,6 +660,8 @@ class EmergencyBrakeNode(Node):
         self._escape_until = 0.0
         self._escape_travel = 0.0
         self.get_logger().info(f"AEB 탈출 창 종료 — {reason}")
+        if stalled:
+            self._maybe_start_reverse(now)
         return False
 
     def _timer_cb(self) -> None:
@@ -543,6 +678,24 @@ class EmergencyBrakeNode(Node):
             dt = 0.0
         self._last_tick = now
         escaping = self._update_escape_window(now, dt, closest)
+        reversing = self._update_reverse(now, dt)
+        # 후진이 끝나면서 전진 창을 새로 열었을 수 있다. 위 줄이 이미 지나간
+        # 뒤라, 이걸 안 보면 그 한 틱에 standoff 가 물어 창이 헛돈다.
+        if not reversing and self._escape_until > 0.0:
+            escaping = True
+
+        if reversing:
+            # 물러나는 동안은 앞을 보고 제동하지 않는다. 앞이 가까운 건
+            # 이미 아는 사실이고, 그래서 뒤로 가는 중이다. 여기서 제동을
+            # 걸면 후진이 그대로 막힌다. 뒤쪽 안전은 `_update_reverse` 가
+            # 여유를 계속 재서 지킨다.
+            if self._active:
+                self._active = False
+                self._stopped_since = 0.0
+            self.brake_pub.publish(Bool(data=False))
+            self.ttc_pub.publish(Float64(data=(ttc if math.isfinite(ttc) else -1.0)))
+            self.reverse_pub.publish(Bool(data=True))
+            return
 
         if not self._active:
             # 탈출 창 안에서는 재발동을 막는다. 단 hard_stop 안쪽은 예외 —
@@ -596,6 +749,7 @@ class EmergencyBrakeNode(Node):
 
         self.brake_pub.publish(Bool(data=self._active))
         self.ttc_pub.publish(Float64(data=(ttc if math.isfinite(ttc) else -1.0)))
+        self.reverse_pub.publish(Bool(data=False))
 
 
 def main(args=None):

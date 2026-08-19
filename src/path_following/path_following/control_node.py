@@ -43,15 +43,22 @@ CFG = {
     "max_speed_mps": 10.0,
     # /drive 의 steering_angle [rad] 을 S∈[-1,1] 로 정규화할 때 쓰는 풀스케일.
     #
-    # 0.8726646(=50°)은 ESP normToAngle 의 서보 혼 이동각(40°/140°)이지 전륜
-    # 조향각이 아니었다. 자전거 모델을 쓰는 Stanley 쪽과 단위가 안 맞아서,
-    # 곡률 FF 와 횡가속 상한이 전부 실제 필요량의 43% 로 나가고 있었다.
+    # Stanley 는 steer_scale_calibrated=True 에서 게인을 ×0.428 재환산해
+    # **실전륜각 [rad]** 을 내보낸다 (풀스케일 0.3735 = 21.4°). 그러니 여기
+    # 분모도 0.3735 여야 S=±1 이 실제 풀락에 대응한다.
     #
-    # 20260816 요레이트 실측: S=1.0 의 실제 전륜각 ≈ 21.4° (실효/명령 0.429).
-    # Stanley 의 max_steering_angle_real_rad 와 **반드시 같은 값**이어야 한다.
-    # 한쪽만 바꾸면 정규화가 어긋나 서보 가동범위를 못 쓰거나 넘겨버린다.
-    # 되돌릴 때는 Stanley steer_scale_calibrated=False 와 함께 0.8726646 으로.
-    "max_steering_angle_rad": 0.3735,  # 이전 0.8726646 (서보 혼 ±50°)
+    # 0.8726646 은 ESP normToAngle 의 서보 혼 이동각(40°/140°)이지 전륜각이
+    # 아니다. 그걸 분모로 쓰면 실제 21.4° 를 요구해도 S=0.428 밖에 안 나가
+    # 조향이 42.8% 로 깎인다. 저속에서는 피드백이 메워서 티가 안 나고,
+    # 고속에서 요구 조향각이 커지면 풀락에 걸려 라인을 벗어난다.
+    #
+    # 한 번 0.8726 으로 되돌린 적이 있는데, 그때 "2.34배 세져서 벽에 박았다"
+    # 고 본 건 오진이었다. 그 주행은 raceline CSV 감김방향이 뒤집혀 헤딩오차가
+    # 180° 였던 구간이다.
+    #
+    # 이 값은 Stanley 의 max_steering_angle_real_rad 와 **반드시 같아야** 한다.
+    # 한쪽만 바꾸면 정규화가 어긋난다.
+    "max_steering_angle_rad": 0.3735,  # ±21.4° 실측 전륜각
     "max_duty": 0.3,           # MANUAL mode CH2 duty limit
     "speed_scale": 1.0,         # 추가 감쇠 (1.0=끔)
     "min_move_duty": 0.06,      # 정지마찰 극복용 최소 duty (speed>threshold 일 때)
@@ -59,7 +66,7 @@ CFG = {
     "manual_duty_fall_rate_per_sec": 0.10,
     "min_move_speed_mps": 0.08,
     "status_log_hz": 2.0,         # 터미널 속도/제어 STATUS (0=끔)
-    "max_steer": 1.,          # ESP 조향 명령 범위. 1.0이면 서보 ±50°까지 사용
+    "max_steer": 1.0,          # ESP 조향 명령 범위. 1.0이면 서보 ±50°까지 사용
     # 0 = 끔. 조향 변화율은 Stanley 쪽 steering_rate_limit_radps 에서만 건다
     # (여기서 한 번 더 자르면 회피용으로 올려둔 응답속도가 무효화된다).
     "steer_rate_limit_per_sec": 0.0,
@@ -123,6 +130,21 @@ CFG = {
     # 신호가 오다가 끊기면 제동 (노드가 죽은 것 → fail-safe).
     # 한 번도 못 받았으면 노드 미사용으로 보고 무시한다.
     "emergency_brake_stale_sec": 0.5,
+    # ---- 후진 탈출 (emergency_brake_node 가 요청) ----
+    # 장애물 코앞에 서면 최대 조향으로도 못 나간다. 그때만 곧게 물러난다.
+    # 제동 역토크와 같은 하드웨어 경로라 새로 검증할 것은 없고, 다른 점은
+    # "멈출 때까지" 가 아니라 "정해진 만큼 뒤로" 라는 것뿐이다.
+    #
+    # 제동과 달리 이건 차를 **움직이는** 명령이라 신호가 없을 때의 기본값이
+    # 반대다. 제동은 끊기면 걸고(fail-safe), 후진은 끊기면 푼다.
+    "escape_reverse_topic": "/aeb/escape_reverse",
+    "escape_reverse_duty": 0.12,        # 제동(0.15)보다 약하게 — 기어가는 수준
+    "escape_reverse_stale_sec": 0.3,
+    # 요청이 붙박이로 True 가 돼도 이 시간이면 끊는다. 요청이 한 번 False 로
+    # 떨어져야 다시 걸린다 — 노드가 이상해져도 계속 뒤로 가지는 않는다.
+    "escape_reverse_max_sec": 2.5,
+    # 이보다 빨리 물러나면 duty 를 끊고 타력으로 둔다.
+    "escape_reverse_max_speed_mps": 0.6,
     "auto_duty_output_sign": 1.0,
     "speed_ff_duty_per_mps": 0.076,
     "speed_kp": 0.15,
@@ -252,6 +274,7 @@ class VehicleControlNode(Node):
         self._max_steering_angle_rad = max(
             float(CFG["max_steering_angle_rad"]), 1e-3
         )
+        self._warn_if_steer_scale_mismatch()
         self._max_duty = float(CFG["max_duty"])
         self._speed_scale = self.clamp(float(CFG["speed_scale"]), 0.0, 1.0)
         self._min_move_duty = max(0.0, float(CFG["min_move_duty"]))
@@ -319,6 +342,21 @@ class VehicleControlNode(Node):
         self._emergency_brake_cmd = False
         self._emergency_brake_recv_time = 0.0
         self._emergency_brake_engaged = False
+        self._escape_reverse_duty = abs(float(CFG.get("escape_reverse_duty", 0.12)))
+        self._escape_reverse_stale = max(
+            0.0, float(CFG.get("escape_reverse_stale_sec", 0.3))
+        )
+        self._escape_reverse_max_sec = max(
+            0.0, float(CFG.get("escape_reverse_max_sec", 2.5))
+        )
+        self._escape_reverse_max_speed = max(
+            0.0, float(CFG.get("escape_reverse_max_speed_mps", 0.6))
+        )
+        self._escape_reverse_cmd = False
+        self._escape_reverse_recv_time = 0.0
+        self._escape_reverse_since = 0.0
+        self._escape_reverse_spent = False
+        self._escape_reverse_engaged = False
         self._auto_duty_output_sign = -1.0 if float(
             CFG.get("auto_duty_output_sign", -1.0)
         ) < 0.0 else 1.0
@@ -441,6 +479,12 @@ class VehicleControlNode(Node):
             Bool,
             str(CFG.get("emergency_brake_topic", "/emergency_brake")),
             self._emergency_brake_callback,
+            10,
+        )
+        self.create_subscription(
+            Bool,
+            str(CFG.get("escape_reverse_topic", "/aeb/escape_reverse")),
+            self._escape_reverse_callback,
             10,
         )
         self.create_timer(float(CFG["timer_period_sec"]), self.timer_callback)
@@ -647,6 +691,47 @@ class VehicleControlNode(Node):
         self._emergency_brake_cmd = bool(msg.data)
         self._emergency_brake_recv_time = time.time()
 
+    def _escape_reverse_callback(self, msg: Bool) -> None:
+        want = bool(msg.data)
+        if not want:
+            # 요청이 내려가야 시간 예산이 되살아난다. 이게 붙박이 True 에
+            # 대한 방어다.
+            self._escape_reverse_since = 0.0
+            self._escape_reverse_spent = False
+        self._escape_reverse_cmd = want
+        self._escape_reverse_recv_time = time.time()
+
+    def _escape_reverse_requested(self, now: float) -> bool:
+        """후진 탈출 요청 여부.
+
+        제동과 정반대의 실패 규칙을 쓴다. 제동은 신호가 끊기면 거는 게
+        안전하지만, 후진은 차를 움직이는 명령이라 끊기면 푸는 게 안전하다.
+        """
+        if not self._escape_reverse_cmd:
+            return False
+        if self._escape_reverse_recv_time <= 0.0:
+            return False
+        if now - self._escape_reverse_recv_time > self._escape_reverse_stale:
+            return False
+        if self._escape_reverse_spent:
+            return False
+        if self._escape_reverse_since <= 0.0:
+            self._escape_reverse_since = now
+        elif now - self._escape_reverse_since > self._escape_reverse_max_sec:
+            self._escape_reverse_spent = True
+            self.get_logger().warn(
+                f"후진 탈출 시간 상한 {self._escape_reverse_max_sec:.1f}s 초과 — "
+                f"끊는다. 요청이 한 번 내려가야 다시 건다"
+            )
+            return False
+        return True
+
+    def _escape_reverse_output_duty(self) -> float:
+        """후진 duty. 너무 빨라지면 끊고 타력으로 둔다."""
+        if abs(self._measured_speed_mps) >= self._escape_reverse_max_speed > 0.0:
+            return 0.0
+        return -self._escape_reverse_duty * self._auto_duty_output_sign
+
     def _emergency_brake_requested(self, now: float) -> bool:
         """AEB 제동 요청 여부.
 
@@ -660,8 +745,19 @@ class VehicleControlNode(Node):
         return self._emergency_brake_cmd
 
     def _emergency_brake_output_duty(self) -> float:
-        """역토크 duty. 거의 멈췄으면 0 (계속 걸면 후진한다)."""
-        if abs(self._measured_speed_mps) <= self._emergency_brake_release_speed:
+        """역토크 duty. 앞으로 가고 있을 때만 건다.
+
+        `_measured_speed_mps` 는 ERPM 에서 온 **부호 있는** 값이다. 예전에는
+        `abs()` 로 해제를 판정했는데, 그러면 이미 뒤로 구르는 중일 때
+        |속도| 가 다시 임계를 넘어 역토크가 되살아난다 — 뒤로 갈수록 더
+        세게 미는 폭주다. 감속 중에 해제 구간(±0.15)을 한 틱에 건너뛰면
+        (20 Hz 에서 충분히 일어난다) 그대로 후진으로 넘어갔다.
+
+        부호를 그대로 보면 전진 중일 때만 걸리고, 멈췄거나 이미 뒤로
+        구르면 0 이다. 의도한 후진은 `_escape_reverse_output_duty` 가 따로
+        낸다.
+        """
+        if self._measured_speed_mps <= self._emergency_brake_release_speed:
             return 0.0
         return -self._emergency_brake_duty * self._auto_duty_output_sign
 
@@ -852,6 +948,52 @@ class VehicleControlNode(Node):
             return True
         self._esp_boot_time = 0.0
         return False
+
+    # 조향 체인의 실제 배율. Stanley 게인 재환산과 아래 분모가 상쇄된 뒤
+    # 남는 값으로, "운동학적으로 정확한 조향의 몇 배를 내보내는가" 를 뜻한다.
+    # 1.0 = 요구한 전륜각이 그대로 나간다.
+    _STEER_DELIVERY_TUNED = 1.0
+
+    def _warn_if_steer_scale_mismatch(self) -> None:
+        """조향 체인의 **실효 배율**이 1.0 에서 벗어나면 경고한다.
+
+        (보정ON + 0.3735) 와 (보정OFF + 0.8727) 은 물리 출력이 같고 둘 다
+        1.0 이다. 반대로 (보정ON + 0.8727) 은 0.428 로, 요구 조향의 43% 만
+        나간다. 값이 두 파일에 나뉘어 있어서 한쪽만 옮기면 이렇게 어긋난다.
+
+        그래서 비교해야 할 것은 분모 자체가 아니라 상쇄 후 남는 실효 배율이다.
+        """
+        try:
+            from path_following.stanley_waypoint_follow_node import (  # noqa: PLC0415
+                CFG as STANLEY_CFG,
+            )
+        except Exception:  # 패키지 구성이 달라도 제어는 계속돼야 한다
+            return
+
+        servo_full = float(STANLEY_CFG.get("max_steering_angle", 0.0))
+        if servo_full <= 1e-6:
+            return
+        rebase = 1.0
+        if STANLEY_CFG.get("steer_scale_calibrated", False):
+            real = float(STANLEY_CFG.get("max_steering_angle_real_rad", 0.0))
+            if real <= 1e-6:
+                return
+            rebase = real / servo_full
+        # 분모까지 반영한 실효 배율을 "운동학 정확 = 1.0" 기준으로 환산한다.
+        delivery = (rebase / self._max_steering_angle_rad) * servo_full
+
+        self.get_logger().info(
+            f"조향 실효 배율 {delivery:.3f} "
+            f"(게인재환산 {rebase:.3f} / 분모 {self._max_steering_angle_rad:.4f})"
+        )
+        if abs(delivery - self._STEER_DELIVERY_TUNED) <= 0.02:
+            return
+        self.get_logger().error(
+            f"조향 실효 배율이 튜닝값에서 벗어났다: "
+            f"{delivery:.3f} vs {self._STEER_DELIVERY_TUNED:.3f} "
+            f"(조향이 {delivery / self._STEER_DELIVERY_TUNED:.2f}배). "
+            f"Stanley 게인과 control_node 분모를 같이 옮겼는지 확인할 것."
+        )
 
     def _read_esp_rc(self) -> None:
         waiting = self.esp.in_waiting
@@ -1261,6 +1403,19 @@ class VehicleControlNode(Node):
             else:
                 self.get_logger().info("AEB 해제 — 정상 주행 복귀")
 
+        reversing = (
+            autonomous
+            and not self._is_estop_latched()
+            and not aeb
+            and self._escape_reverse_requested(now)
+        )
+        if reversing != self._escape_reverse_engaged:
+            self._escape_reverse_engaged = reversing
+            if reversing:
+                self.get_logger().warn("후진 탈출 — 조향 중립으로 곧게 물러난다")
+            else:
+                self.get_logger().info("후진 탈출 종료")
+
         if self._is_estop_latched():
             self.current_duty = 0.0
             self.current_steer = 0.0
@@ -1271,6 +1426,15 @@ class VehicleControlNode(Node):
             self._manual_drive_speed_active = False
             self.current_duty = self._emergency_brake_output_duty()
             self.current_steer = self._apply_steer_rate_limit(self._auto_steer, dt)
+            self._reset_speed_controller()
+            self.send_steering(self.current_steer)
+        elif reversing:
+            # 제동과 반대로 조향을 중립으로 되돌린다. 꺾인 채 물러나면 뒤가
+            # 어디로 갈지 예측이 안 되는데, 뒤 여유는 곧게 간다는 가정으로
+            # 쟀다. 한 번에 꺾지 않고 평소 레이트 제한을 그대로 태운다.
+            self._manual_drive_speed_active = False
+            self.current_duty = self._escape_reverse_output_duty()
+            self.current_steer = self._apply_steer_rate_limit(0.0, dt)
             self._reset_speed_controller()
             self.send_steering(self.current_steer)
         elif autonomous:

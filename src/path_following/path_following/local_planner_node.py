@@ -68,6 +68,16 @@ from .avoidance_safety import (
     first_blocked_index,
     trim_back,
 )
+from .offset_maneuver import (
+    ManeuverConfig,
+    ObstacleSD,
+    OffsetManeuver,
+    plan_maneuver,
+)
+
+# 실측 전륜 조향 한계 [rad]. Stanley 의 max_steering_angle_real_rad 와 같은 값이며,
+# 계획 단계에서 "탈 수 있는 경로인가" 를 판정하는 데만 쓴다.
+_MAX_STEER_RAD = 0.3735
 
 # ============================================================
 # USER TUNING — local_planner (실차: 장애·LOCAL_PATH·FGM 타이밍은 여기만)
@@ -95,6 +105,14 @@ CFG = {
     # laser frame |y| 검출 게이트. 차폭보다 넉넉해야 한다 — 여기서 버리면
     # 뒤에서 되살릴 방법이 없다. 실측 반폭 0.15 에 0.27 여유.
     "obstacle_lateral_abs_max_m": 0.42,
+    # 위 값은 차 진행축 기준 직선 튜브라 곡선·헤딩오차에 약하다. 반경 10m
+    # 코너면 레이스라인 정중앙 장애물도 3m 앞에서 |y|=0.45 라 잘려 나가고,
+    # 직선에서도 헤딩 5° 면 5m 앞에서 0.44 다. 회피를 시작해야 할 거리에서
+    # 장애물이 사라지는 게 이것 때문이다.
+    # 레이스라인 코리도는 맵 좌표로 재므로 곡선에서도 정확하다. 그게 도는
+    # 동안에는 여기를 넓게 열고 판단을 코리도에 맡긴다. 위 값은 코리도를
+    # 못 쓸 때(TF 실패/비활성)의 보수적 폴백으로만 남는다.
+    "obstacle_lateral_abs_max_corridor_m": 1.50,
     "obstacle_tf_timeout_sec": 0.15,
     # sensor_static_tf.cpp 의 base_link->laser translation.x 와 같아야 한다.
     # 이전 0.275 는 TF(0.31)와 어긋나 있어서, 라이다 거리를 base_link 로 옮길 때
@@ -137,23 +155,65 @@ CFG = {
     "exit_csv_clear_radius_m": 0.45,
     "avoid_forward_step_m": 0.15,
     "avoid_forward_num_points": 30,
-    # 회피 후 레이스라인 복귀를 Frenet quintic 으로. 이전 기본값 False.
+    # 회피 후 레이스라인 복귀를 Frenet quintic 으로.
+    #
+    # 레이스라인이 벽에 붙어 있는 구간에서는 이게 없으면 안 된다. 회피로
+    # 벗어난 뒤 Stanley 피드백만으로 붙으면 접근각이 서서 벽에 꽂힌다.
+    # quintic 은 끝점에서 d'=d''=0 이라 라인에 접선으로 눕혀 붙는다.
     "rejoin_enable": True,
     "rejoin_min_length_m": 0.50,
     # 재합류 길이는 속도 연동: clip(rejoin_time_sec * v_ego, min, max).
     # 예전엔 항상 min(0.50m) 이라 3m/s 에서 0.17초 만에 붙으라는 소리였다.
     "rejoin_time_sec": 0.8,
-    "rejoin_max_length_m": 2.50,  # 이전 기본값 0.70
+    # 시간 연동만으로는 부족하다. quintic d(s) 의 최대 곡률은 5.77*|d0|/L^2 라
+    # 요구 횡가속도가 v^2*5.77*|d0|/L^2 로 튄다. 7m/s 에서 1.5m 벗어난 채
+    # L=2.5m 로 붙으라면 67.9m/s^2 (타이어 한계의 7배) 를 요구하는 셈이고,
+    # 따라갈 수 없는 경로가 나와 조향만 포화된 채 벽으로 밀린다.
+    # 그래서 이탈량과 속도로부터 L 을 역산한다: L = sqrt(5.77*|d0|*v^2/a_lat).
+    # max 는 그 역산값을 자를 만큼 작으면 안 된다 (7m/s, 1.5m 이면 9.2m 필요).
+    "rejoin_a_lat_mps2": 4.0,
+    # 회피 해제 후 속도 회복 기울기 상한 [m/s^2]. 0 이면 무제한(예전 동작).
+    "avoid_a_accel_mps2": 4.0,
+    # 재합류 경로가 레이스라인과 이룰 수 있는 최대 각 [deg]. 속도에 따라
+    # 아래(min)~위(max) 사이에서 움직인다 — `_rejoin_heading_limit_rad` 참고.
+    #
+    # 이 각이 곧 "라인에 얼마나 비스듬히 꽂히는가" 다. 각이 서면 벽에 붙은
+    # 라인 구간에서 경로 자체가 벽을 향하고, 추종이 조금만 늦어도 넘어간다.
+    # 각을 눕히는 방법은 길이뿐인데(L >= 1.875*|d0|/tan) 트랙 둘레가 41 m 라
+    # 무한정 늘릴 수 없어서, 고속쪽 하한을 10° 로 막아 둔다.
+    "rejoin_max_heading_deg": 18.0,
+    "rejoin_min_heading_deg": 10.0,
+    # 합류 시 라인을 넘어가도 좋은 양 [m] 과 추종 지연 [s].
+    # 오버슈트 ≈ v·sin(ψ)·τ 를 이 값 이하로 누르는 각을 쓴다.
+    # 6 m/s 에서 10°, 4 m/s 에서 14.5°, 2.5 m/s 에서 18° 가 나온다.
+    "rejoin_merge_overshoot_m": 0.30,
+    "rejoin_track_lag_s": 0.30,
+    # 차가 실제로 낼 수 있는 최대 경로곡률 [1/m] = tan(전륜각)/축거.
+    # 실측 전륜각 21.4°, 축거 0.33 m → 1.19. 이걸 넘는 복귀 경로는 아무리
+    # 천천히 가도 못 따라간다 — 감속이 아니라 포기해야 하는 경우다.
+    "rejoin_max_path_curvature": 1.19,
+    # 위 헤딩 제약이 요구하는 길이 (이탈 1.2 m + 15° → 8.4 m). 여기서 잘리면
+    # 그만큼 각이 서므로 여유를 두되, 랩의 1/4 을 넘기지 않는 선.
+    "rejoin_max_length_m": 10.0,  # 이전 2.50 → 12.0 → 헤딩 제약에 맞춰 재산정
+    # 하한이다. 실제 개수는 길이/간격으로 정해진다 (충돌 검사 해상도 유지).
     "rejoin_sample_count": 30,
     "rejoin_tail_count": 40,
     "rejoin_finish_lateral_m": 0.20,
     "rejoin_finish_require_heading": False,
     "rejoin_finish_heading_deg": 15.0,
-    "avoid_skip_rejoin_if_cte_ok": False,
-    # CTE 가 줄기를 기다리며 AVOID 를 붙드는 시간 상한. 차가 서 있으면 CTE 는
-    # 절대 줄지 않아서, 상한이 없으면 장애물이 하나도 없는데 AVOID 에 갇힌다.
-    "rejoin_wait_max_sec": 1.5,
+    # REJOIN 탈출 안전장치. 완료 판정은 |CTE| 가 줄어야 성립하는데, 차가
+    # 서 있으면 CTE 는 절대 줄지 않아 영원히 못 나온다 (실측: 정지 후
+    # 수 분간 REJOIN + override=true 유지, Stanley 는 묵은 캐시 경로 추종).
+    "rejoin_stall_speed_mps": 0.25,
+    "rejoin_stall_sec": 1.0,
+    "rejoin_max_active_sec": 5.0,
     "rejoin_speed_scale": 0.7,  # 이전 기본값 0.5 (avoid_speed_enable=False 일 때만 쓰임)
+    # 이탈량 연동 감속. rejoin_max_length_m 안에 붙을 수 있는 속도로 상한을
+    # 건다: v = L_max * sqrt(a_lat / (5.77*|d|)). 크게 벗어난 채 고속을 유지하면
+    # 복귀 시점에 조향이 포화되므로, 붙기 전에 미리 깎아 둔다.
+    # free_m 이하에서는 상한이 무한대 — 정상 주행의 작은 CTE 로는 안 걸린다.
+    "deviation_speed_enable": True,
+    "deviation_speed_free_m": 0.35,
     # ---- 회피 경로 충돌검사 ----
     # 회피 경로는 FGM 목표점 너머로 avoid_forward_num_points 만큼 직선 연장된다.
     # 그 구간은 아무도 검사한 적이 없어서 코너에서는 그대로 벽을 향한다.
@@ -184,14 +244,60 @@ CFG = {
     "avoid_safety_factor": 0.7,   # 센서 지연·추종 오차 몫. 낮출수록 느리고 안전
     "avoid_standoff_m": 0.35,     # 장애물 앞 최소 이격
     "avoid_lateral_margin_m": 0.10,
+    # 회피 조향 중, "이대로 가면 확실히 옆으로 비켜 지나간다" 로 판정해
+    # 정지거리 한계를 면제할 때 추가로 요구하는 횡여유. 면제 판단이라
+    # 최소 여유보다 조금 더 받는다. 0 이면 최소 여유만으로 면제.
+    "avoid_pass_clear_extra_m": 0.15,
     "avoid_speed_min_mps": 0.6,   # 이 아래로는 안 줄인다 (기어가지 않게)
     "avoid_speed_ref_mps": 2.0,   # CSV 에 속도 열이 없을 때 쓸 기준속도
     # ---- AVOID 경로 생성 방식 ----
-    # "straight" = FGM 목표점까지 직선 + 전방 직선 연장 (기존, 검증된 쪽)
-    # "frenet"   = 레이스라인을 기준선으로 d(s) quintic → 진입/유지/복귀
-    # frenet 쪽이 고속에서 조향이 덜 급하고 복귀가 매끄럽지만, 기준선에서
-    # 멀리 떨어진 상태에서는 straight 가 더 직관적이다. 실차 검증 후 전환.
-    "avoid_path_mode": "straight",
+    # "offset"   = 장애물 기하에서 필요 횡오프셋을 뽑아 **미리** 계획한 기동.
+    #              진입 길이가 속도에 비례해 늘어나서 고속일수록 멀리서부터
+    #              완만하게 시작한다 (offset_maneuver.py).
+    # "straight" = FGM 목표점까지 직선 + 전방 직선 연장 (반응형, 폴백)
+    # "frenet"   = FGM 목표점의 d 로 고정 길이 quintic (구버전)
+    #
+    # straight/frenet 은 둘 다 FGM 조준각을 그대로 경로로 삼는다. 조준각은
+    # 지금 보이는 갭에서 나오는 값이라 속도와 무관하고, 그래서 6 m/s 에서
+    # 90 m/s² 짜리 경로가 태연히 나왔다. offset 은 반대로 예산을 먼저 정하고
+    # 길이를 역산한다. FGM 은 계획이 안 서는 상황(트랙 밖으로 나가야만
+    # 지나갈 수 있는 등)의 폴백으로만 남는다.
+    "avoid_path_mode": "offset",
+    # ---- 횡오프셋 기동 (avoid_path_mode="offset") ----
+    # 장애물 표면 ↔ 차체 옆면 여유. 속도제한이 "이 정도 벌어지면 정지거리
+    # 한계를 면제한다" 고 보는 값(lateral_margin + pass_clear_extra)이 하한이라,
+    # 그보다 작게 넣으면 자동으로 올라간다. 둘이 어긋나면 계획대로 비켜
+    # 가는데도 제동이 안 풀려 회피 내내 기어간다.
+    "avoid_offset_margin_m": 0.25,
+    # |d| 의 **상한**. 실제로 얼마나 나갈지는 점유맵에서 잰 좌/우 예산이 정한다
+    # (`_build_wall_budget`). 여기 값만 믿으면 안 된다 — 실측 레이스라인→벽
+    # 여유는 중앙값 0.70 m / 최소 0.30 m 라 0.70 은 구간의 76% 에서 못 낸다.
+    # (예전 주석이 근거로 든 "최소 0.70 / 중앙값 1.50" 은 센터라인의 전체
+    # 폭이었다. 레이스라인 한쪽 여유가 아니다. 그래서 벽에 박았다.)
+    "avoid_offset_max_m": 0.70,
+    "avoid_offset_a_lat_enter": 3.0,    # 진입 횡가속 예산. 낮출수록 멀리서 시작
+    "avoid_offset_a_lat_exit": 2.0,     # 복귀 예산. 진입보다 낮게 = 천천히 붙음
+    "avoid_offset_a_lat_hard": 4.5,     # 넘으면 조향 대신 감속으로 답한다
+    "avoid_offset_enter_min_m": 1.0,
+    "avoid_offset_enter_max_m": 9.0,
+    "avoid_offset_exit_min_m": 1.5,
+    "avoid_offset_exit_max_m": 12.0,
+    "avoid_offset_hold_rear_extra_m": 0.30,  # 장애물 뒤로 더 유지할 거리
+    "avoid_offset_merge_gap_m": 3.0,    # 이 안의 연속 장애물은 한 기동으로
+    # 계획에 허용할 조향 비율. 1.0 을 쓰면 기동만으로 풀락이라 Stanley 가
+    # 오차를 지울 여지가 없다. 남는 만큼이 피드백 몫이다.
+    "avoid_offset_steer_frac": 0.60,
+    # 계획을 다시 그리는 조건. 매 주기 다시 그리면 진입 곡선의 제일 급한
+    # 앞부분만 반복해서 타게 되어(경로가 계속 자차로 리앵커됨) 조향이 안
+    # 풀린다. 실제로 이전 구현이 그랬다.
+    "avoid_offset_replan_lateral_m": 0.20,  # 계획 대비 이만큼 벗어나면 다시
+    "avoid_offset_replan_obstacle_m": 0.35,  # 필요 오프셋이 이만큼 변하면 다시
+    # 기동이 트랙에 안 들어가면 속도를 낮춰 다시 뽑는다. 길이가 v 에 비례해서
+    # 절반 속도면 절반 길이다. 이 아래로는 안 내려가고 FGM 폴백으로 넘긴다 —
+    # 그보다 느리면 기동으로 풀 상황이 아니라 제동으로 풀 상황이다.
+    "avoid_offset_plan_v_floor_mps": 2.0,
+    "avoid_offset_plan_v_step_mps": 0.5,
+    "avoid_offset_step_m": 0.10,
     "avoid_frenet_step_m": 0.10,
     "avoid_frenet_hold_m": 0.60,       # apex 통과용 오프셋 유지 구간
     "avoid_frenet_enter_len_m": 1.2,   # 목표 오프셋까지 붙는 데 쓸 s 길이
@@ -249,6 +355,20 @@ CFG = {
     # 탈출 중에는 짧은 경로도 받는다. 여기서 path_check_min_length_m(0.6) 를
     # 그대로 요구하면 정면이 막힌 상황에서 경로가 늘 기각돼 탈출이 안 된다.
     "aeb_escape_min_path_m": 0.25,
+    # ---- 탈출 방향 고정 ----
+    # FGM 은 "지금 제일 열린 각도" 만 본다. 장애물 정면에 멈추면 정면 섹터가
+    # 통째로 막혀 있으므로 옆이 이기고, 조준각이 FOV 끝(±80°)까지 간다.
+    # 탈출 속도 0.8 m/s 로 2 초면 1.6 m 인데, 최대 조향(0.3735 rad, 축거
+    # 0.33) 의 회전반경이 0.85 m 라 그 사이 헤딩이 100° 넘게 돈다. 옆으로
+    # 돌다가 역주행 방향이 되거나 벽에 붙는 게 이래서 생긴다.
+    #
+    # 그래서 멈춘 순간의 헤딩을 기억해 두고, 그 방향을 기준으로 조준각을
+    # 제한한다. 차가 돌아간 만큼 선호각이 반대로 움직이므로 스스로 되돌아온다.
+    "aeb_escape_heading_lock_enable": True,
+    # 기억한 헤딩에서 이 각도 밖으로는 조준하지 않는다. 넓히면 좁은 틈도
+    # 쓰지만 그만큼 많이 돌고, 좁히면 안 돌지만 빠져나갈 길이 줄어든다.
+    "aeb_escape_heading_cone_deg": 55.0,
+    "fgm_prefer_angle_topic": "/planner/fgm_prefer_angle",
     "avoid_merge_tail_max": 180,
     "publish_hz": 40.0,
     "path_window_size": 140,
@@ -298,6 +418,25 @@ def _quat_to_yaw(q) -> float:
     siny = 2.0 * (q.w * q.z + q.x * q.y)
     cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny, cosy)
+
+def _forbid_order(forbid_side: int) -> Tuple[int, ...]:
+    """한 계획 속도에서 시도할 방향 순서.
+
+    호출부가 이미 한쪽을 막았으면 그것만 존중한다. 안 막았으면 계획기가 고른
+    쪽을 먼저 보고, 그게 벽이면 반대쪽도 **같은 속도에서** 시도한다 — 방향만
+    바꾸면 될 일에 속도까지 깎을 이유가 없다.
+    """
+    if forbid_side != 0:
+        return (forbid_side,)
+    return (0, +1, -1)
+
+def _min_opt(a: float | None, b: float | None) -> float | None:
+    """둘 다 상한일 수 있고 둘 다 없을 수도 있는 값의 최솟값."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return min(a, b)
 
 def _point_laser_to_map(
     px: float,
@@ -354,6 +493,10 @@ class LocalPlannerNode(Node):
         self._obstacle_lateral_abs_max_m = max(
             0.05, float(self.get_parameter("obstacle_lateral_abs_max_m").value)
         )
+        self._obstacle_lateral_abs_max_corridor_m = max(
+            self._obstacle_lateral_abs_max_m,
+            float(self.get_parameter("obstacle_lateral_abs_max_corridor_m").value),
+        )
         self._obstacle_tf_timeout = float(
             self.get_parameter("obstacle_tf_timeout_sec").value
         )
@@ -403,9 +546,35 @@ class LocalPlannerNode(Node):
         self.rejoin_time_sec = max(
             0.1, float(self.get_parameter("rejoin_time_sec").value)
         )
+        self.rejoin_a_lat_mps2 = max(
+            0.1, float(self.get_parameter("rejoin_a_lat_mps2").value)
+        )
+        self.avoid_a_accel_mps2 = max(
+            0.0, float(self.get_parameter("avoid_a_accel_mps2").value)
+        )
+        self.deviation_speed_enable = param_bool(
+            self.get_parameter("deviation_speed_enable").value
+        )
+        self.deviation_speed_free_m = max(
+            0.05, float(self.get_parameter("deviation_speed_free_m").value)
+        )
         self.rejoin_max_length_m = max(
             self.rejoin_min_length_m,
             float(self.get_parameter("rejoin_max_length_m").value),
+        )
+        # 속도 연동 합류각의 위/아래 한계. sin 으로 접어 둔다 (0° 는 무한 길이).
+        hi_deg = min(60.0, max(3.0, float(self.get_parameter("rejoin_max_heading_deg").value)))
+        lo_deg = min(hi_deg, max(3.0, float(self.get_parameter("rejoin_min_heading_deg").value)))
+        self._rejoin_heading_sin_hi = math.sin(math.radians(hi_deg))
+        self._rejoin_heading_sin_lo = math.sin(math.radians(lo_deg))
+        self.rejoin_merge_overshoot_m = max(
+            0.02, float(self.get_parameter("rejoin_merge_overshoot_m").value)
+        )
+        self.rejoin_track_lag_s = max(
+            0.05, float(self.get_parameter("rejoin_track_lag_s").value)
+        )
+        self.rejoin_max_path_curvature = max(
+            0.1, float(self.get_parameter("rejoin_max_path_curvature").value)
         )
         self.rejoin_sample_count = max(
             2, int(self.get_parameter("rejoin_sample_count").value)
@@ -422,12 +591,28 @@ class LocalPlannerNode(Node):
         self.rejoin_finish_heading_rad = math.radians(
             max(1.0, float(self.get_parameter("rejoin_finish_heading_deg").value))
         )
-        self.avoid_skip_rejoin_if_cte_ok = param_bool(
-            self.get_parameter("avoid_skip_rejoin_if_cte_ok").value
+        self.rejoin_stall_speed_mps = max(
+            0.0, float(self.get_parameter("rejoin_stall_speed_mps").value)
         )
-        self.rejoin_wait_max_ns = int(
-            max(0.0, float(self.get_parameter("rejoin_wait_max_sec").value)) * 1e9
+        self.rejoin_stall_ns = int(
+            max(0.1, float(self.get_parameter("rejoin_stall_sec").value)) * 1e9
         )
+        self.rejoin_max_active_ns = int(
+            max(0.5, float(self.get_parameter("rejoin_max_active_sec").value)) * 1e9
+        )
+        self._rejoin_start_ns = 0
+        self._rejoin_moving_ns = 0
+        self._rejoin_travel_m = 0.0
+        self._rejoin_last_xy: tuple[float, float] | None = None
+        self._rejoin_progress_cycle = -1
+        # 지금 따라가는 재합류 경로의 실제 길이. 속도 상한을 이 길이로
+        # 역산해야 "이 경로를 접지력 안에서 추종 가능한 속도" 가 나온다.
+        self._rejoin_length_m = 0.0
+        # 지금 경로의 실제 최대 곡률 (기준선 곡률 포함). 속도 상한을 여기서
+        # 역산한다. 0 이면 아직 안 잰 것.
+        self._rejoin_kappa_max = 0.0
+        # 경로 길이에 맞춘 포기 시한. 경로를 그릴 때 다시 계산한다.
+        self._rejoin_budget_ns = self.rejoin_max_active_ns
         self.rejoin_speed_scale = max(
             0.05, float(self.get_parameter("rejoin_speed_scale").value)
         )
@@ -457,9 +642,13 @@ class LocalPlannerNode(Node):
             ego_half_width_m=vg.HALF_WIDTH_M,  # 이전 0.5*0.42 = 0.21
             ego_front_m=float(g("ego_front_safety_m").value),
             lateral_margin_m=float(g("avoid_lateral_margin_m").value),
+            pass_clear_extra_m=float(g("avoid_pass_clear_extra_m").value),
             v_min=float(g("avoid_speed_min_mps").value),
         )
         self._inflated_map: InflatedMap | None = None
+        # 레이스라인 점별 좌/우 오프셋 예산. 맵이 와야 깔린다 (`_build_wall_budget`).
+        self._budget_left: np.ndarray | None = None
+        self._budget_right: np.ndarray | None = None
         self._map_warned = False
         self._last_avoid_speed = float("nan")
         self._last_avoid_reason = ""
@@ -483,11 +672,11 @@ class LocalPlannerNode(Node):
 
         # AVOID 경로 모드
         self.avoid_path_mode = str(g("avoid_path_mode").value).strip().lower()
-        if self.avoid_path_mode not in ("straight", "frenet"):
+        if self.avoid_path_mode not in ("offset", "straight", "frenet"):
             self.get_logger().warn(
-                f"avoid_path_mode='{self.avoid_path_mode}' 는 모르는 값 — straight 로 둔다"
+                f"avoid_path_mode='{self.avoid_path_mode}' 는 모르는 값 — offset 로 둔다"
             )
-            self.avoid_path_mode = "straight"
+            self.avoid_path_mode = "offset"
         self.avoid_frenet_step_m = max(0.02, float(g("avoid_frenet_step_m").value))
         self.avoid_frenet_hold_m = max(0.0, float(g("avoid_frenet_hold_m").value))
         self.avoid_frenet_enter_len_m = max(
@@ -500,6 +689,31 @@ class LocalPlannerNode(Node):
             0.05, float(g("avoid_frenet_max_offset_m").value)
         )
         self._last_frenet_avoid_warn_ns = 0
+
+        # ---- 횡오프셋 기동 ----
+        self.avoid_offset_step_m = max(0.02, float(g("avoid_offset_step_m").value))
+        self.avoid_offset_plan_v_floor_mps = max(
+            0.5, float(g("avoid_offset_plan_v_floor_mps").value)
+        )
+        self.avoid_offset_plan_v_step_mps = max(
+            0.1, float(g("avoid_offset_plan_v_step_mps").value)
+        )
+        self.avoid_offset_replan_lateral_m = max(
+            0.02, float(g("avoid_offset_replan_lateral_m").value)
+        )
+        self.avoid_offset_replan_obstacle_m = max(
+            0.02, float(g("avoid_offset_replan_obstacle_m").value)
+        )
+        # ManeuverConfig 자체는 트랙 길이를 알아야 해서 CSV 를 읽은 뒤
+        # `_build_maneuver_config()` 에서 만든다.
+        # 계획은 한 번 세우면 붙들고 간다. 매 주기 다시 그리면 진입 곡선의
+        # 제일 급한 앞부분만 반복해서 타게 되어 조향이 영영 안 풀린다.
+        self._maneuver: OffsetManeuver | None = None
+        self._maneuver_s0: float | None = None
+        self._maneuver_last_s: float | None = None
+        self._maneuver_ds_cache: float | None = None
+        self._maneuver_speed_cap: float | None = None
+        self._last_maneuver_log_ns = 0
 
         # TRAILING
         self.trailing_enable = param_bool(g("trailing_enable").value)
@@ -549,6 +763,14 @@ class LocalPlannerNode(Node):
         )
         self._aeb_escape_until_ns = 0
         self._aeb_escape_logged = False
+        self.aeb_escape_heading_lock = param_bool(
+            g("aeb_escape_heading_lock_enable").value
+        )
+        self.aeb_escape_heading_cone_rad = math.radians(
+            max(0.0, float(g("aeb_escape_heading_cone_deg").value))
+        )
+        # 멈춘 순간의 맵 프레임 헤딩. 탈출이 끝나면 지운다.
+        self._aeb_escape_yaw: float | None = None
         _tl_hz = max(0.0, float(g("trailing_log_hz").value))
         self._trailing_log_period_ns = int(1e9 / _tl_hz) if _tl_hz > 0.0 else 0
         self._last_trailing_log_ns = 0
@@ -638,6 +860,7 @@ class LocalPlannerNode(Node):
             self.points, self.path_window_size, self.path_anchor_half_width
         )
         self._build_loop_geometry()
+        self._build_maneuver_config()
         self.get_logger().info(
             f"CSV track loaded: [{os.path.basename(csv_path)}] {csv_path} "
             f"({len(self.points)} pts), "
@@ -703,6 +926,23 @@ class LocalPlannerNode(Node):
         self.pub_planner_speed_condition = self.create_publisher(UInt8, out_co, 10)
         mode_topic = self.get_parameter("planner_mode_topic").value
         self.pub_planner_mode = self.create_publisher(String, mode_topic, 10)
+        # 어느 정책이 속도를 깎았는지 (stop/maneuver/trailing/deviation/...).
+        # 배율만 봐서는 "왜 기어갔는지" 를 사후에 알 수 없다.
+        self.pub_speed_reason = self.create_publisher(
+            String, "/planner/speed_reason", 10
+        )
+        # 지금 내보내는 /local_path 가 **계획된 기하 경로**인가.
+        #
+        # Stanley 는 LOCAL_PATH 모드에서 FF 를 끈다. FGM 폴백 경로는 조준점까지
+        # 그은 직선이라 그 곡률이 기하학적 의미가 없어서 맞는 처리다. 하지만
+        # 횡오프셋 기동은 곡률이 정확히 우리가 타려는 값이라 FF 가 처리해야
+        # 한다. 안 그러면 그 곡률을 오차가 쌓인 뒤 피드백으로 뒤늦게 만들어야
+        # 하고, 마침 그 피드백에는 횡가속 상한(6 m/s 에서 2.1°)이 걸려 있어서
+        # 계획을 따라가지 못한다.
+        self.pub_path_planned = self.create_publisher(
+            Bool, "/planner/local_path_planned", 10
+        )
+        self._path_planned = False
         self.pub_frenet_debug = (
             self.create_publisher(
                 Float32MultiArray, str(g("frenet_debug_topic").value), 10
@@ -712,6 +952,9 @@ class LocalPlannerNode(Node):
         )
         fgm_en_topic = self.get_parameter("fgm_enable_topic").value
         self.pub_fgm_enable = self.create_publisher(Bool, fgm_en_topic, 10)
+        self.pub_fgm_prefer = self.create_publisher(
+            Float32MultiArray, str(g("fgm_prefer_angle_topic").value), 10
+        )
         self._strategy_mul_recv = 1.0
         self._strategy_cond_recv = 0
         self.mode = "GLOBAL"
@@ -825,6 +1068,20 @@ class LocalPlannerNode(Node):
         self._tf_cache = tf
         return tf
 
+    @property
+    def _gated_lateral_abs_max_m(self) -> float:
+        """코리도를 이미 통과한 목록에 다시 걸 |y| 상한.
+
+        코리도가 도는 동안에는 "레이스라인 위에 있는가" 를 이미 맵 좌표로
+        판정했으므로, 여기서 좁은 직선 튜브를 또 걸면 곡선 구간 장애물만
+        골라서 버리게 된다.
+        """
+        return (
+            self._obstacle_lateral_abs_max_corridor_m
+            if self._raceline_corridor_enable
+            else self._obstacle_lateral_abs_max_m
+        )
+
     def _filter_obstacles_for_planner(self, raw: list) -> list:
         corridor_on, laser_to_map = self._corridor_lookup(warn=True)
         if corridor_on and laser_to_map is None:
@@ -839,6 +1096,7 @@ class LocalPlannerNode(Node):
             track_pts=self.points,
             laser_to_map=laser_to_map,
             require_corridor_tf=True,
+            lateral_abs_max_corridor_m=self._obstacle_lateral_abs_max_corridor_m,
         )
 
     def _filter_obstacles_for_exit(self, raw: list) -> list:
@@ -854,6 +1112,7 @@ class LocalPlannerNode(Node):
             corridor_max_lat_m=self._corridor_max_lat,
             track_pts=self.points,
             laser_to_map=laser_to_map,
+            lateral_abs_max_corridor_m=self._obstacle_lateral_abs_max_corridor_m,
         )
 
     def _make_laser_to_map_fn(self, tf_lm):
@@ -907,6 +1166,7 @@ class LocalPlannerNode(Node):
             track_pts=self.points,
             laser_to_map=laser_to_map,
             require_corridor_tf=True,
+            lateral_abs_max_corridor_m=self._obstacle_lateral_abs_max_corridor_m,
         )
 
     def _filter_dynamic_for_exit(self, raw: list) -> list:
@@ -921,6 +1181,7 @@ class LocalPlannerNode(Node):
             corridor_max_lat_m=self._corridor_max_lat,
             track_pts=self.points,
             laser_to_map=laser_to_map,
+            lateral_abs_max_corridor_m=self._obstacle_lateral_abs_max_corridor_m,
         )
 
     def _dynamic_threat_metrics(
@@ -940,14 +1201,17 @@ class LocalPlannerNode(Node):
             filtered_dynamic,
             forward_cone_rad=self.forward_cone_rad,
             min_forward_x_m=self.avoid_min_forward_x_m,
-            lateral_abs_max_m=self.avoid_trigger_lateral_abs_max_m,
+            lateral_abs_max_m=max(
+                self.avoid_trigger_lateral_abs_max_m,
+                self._gated_lateral_abs_max_m,
+            ),
             laser_to_base_x_m=self.laser_to_base_x_m,
         )
         d_gate = closest_dynamic_obstacle_surface_m(
             filtered_dynamic,
             forward_cone_rad=None,
             min_forward_x_m=self.avoid_min_forward_x_m,
-            lateral_abs_max_m=self._obstacle_lateral_abs_max_m,
+            lateral_abs_max_m=self._gated_lateral_abs_max_m,
             laser_to_base_x_m=self.laser_to_base_x_m,
         )
         return d_closest, d_gate, closing, obs_speed
@@ -1101,6 +1365,102 @@ class LocalPlannerNode(Node):
             f"path check map ready — {msg.info.width}x{msg.info.height} "
             f"@{msg.info.resolution:.3f}m/px, inflation={self.path_check_inflation_m:.2f}m"
         )
+        self._build_wall_budget()
+
+    # 오프셋 예산을 훑을 때의 전진 간격 [m]. 맵 해상도(0.05)의 절반이면
+    # 격자를 건너뛰지 않는다.
+    _WALL_BUDGET_STEP_M = 0.025
+
+    def _build_wall_budget(self) -> None:
+        """레이스라인 각 점에서 **좌/우로 얼마나 비킬 수 있는지** 를 미리 잰다.
+
+        기동 계획기는 장애물만 보고 트랙 경계를 모른다. 원래는 경로 충돌검사가
+        그걸 받아 주기로 했는데, 실측해 보니 그 가정이 틀렸다. 이 트랙에서
+        레이스라인→벽 여유는 중앙값 0.70 m / 최소 0.30 m 라, 상한으로 박아 둔
+        0.70 m 는 **구간의 76% 에서 낼 수 없는 값**이다. 벽 쪽으로 비키는 계획이
+        일상적으로 나왔다는 뜻이다.
+
+        중요한 건 좌우가 다르다는 점이다. 레이스라인은 코너 안쪽에 붙으므로
+        한쪽은 벽이고 반대쪽은 트랙이 통째로 남는다. 실측 좌 중앙값 0.88 m /
+        우 0.78 m 인데, **둘 중 좋은 쪽**을 고르면 최소가 0.58 m 로 올라간다 —
+        즉 방향만 제대로 고르면 이 트랙 어디서든 비킬 수 있다. 그래서 예산을
+        한 개가 아니라 좌/우 두 개로 만든다.
+
+        판정 기준은 경로 충돌검사와 **같은 팽창맵**이다. 다른 기준을 쓰면
+        계획기는 된다고 하고 검사기는 아니라고 하는 상태가 생긴다.
+        """
+        im = self._inflated_map
+        if im is None or self._n < 3 or self._total_l < 1e-6:
+            self._budget_left = None
+            self._budget_right = None
+            return
+
+        tx = np.roll(self._xs_np, -1) - np.roll(self._xs_np, 1)
+        ty = np.roll(self._ys_np, -1) - np.roll(self._ys_np, 1)
+        norm = np.hypot(tx, ty)
+        norm[norm < 1e-9] = 1.0
+        # 좌 법선 (+d 방향)
+        nx, ny = -ty / norm, tx / norm
+
+        step = self._WALL_BUDGET_STEP_M
+        cap = self.maneuver_cfg.max_offset_m
+
+        def side_budget(sign: float) -> np.ndarray:
+            budget = np.zeros(self._n, dtype=np.float64)
+            alive = np.ones(self._n, dtype=bool)
+            t = step
+            while t <= cap + 1e-9:
+                free = ~im.blocked_many(
+                    self._xs_np + sign * nx * t, self._ys_np + sign * ny * t
+                )
+                # 한 번 막히면 그 뒤는 안 본다. 벽 너머의 빈 공간이 예산으로
+                # 잡히면 안 된다.
+                alive &= free
+                if not alive.any():
+                    break
+                budget[alive] = t
+                t += step
+            return budget
+
+        self._budget_left = side_budget(+1.0)
+        self._budget_right = side_budget(-1.0)
+        best = np.maximum(self._budget_left, self._budget_right)
+        self.get_logger().info(
+            f"오프셋 예산 (상한 {cap:.2f}m): "
+            f"좌 최소 {self._budget_left.min():.2f} 중앙 "
+            f"{float(np.median(self._budget_left)):.2f}m, "
+            f"우 최소 {self._budget_right.min():.2f} 중앙 "
+            f"{float(np.median(self._budget_right)):.2f}m, "
+            f"좋은쪽 최소 {best.min():.2f}m"
+        )
+
+    def _index_at_s(self, s: float) -> int:
+        return int((s % self._total_l) / self._total_l * self._n) % self._n
+
+    def _wall_budget_over(self, s_from: float, s_to: float) -> Tuple[float, float]:
+        """[s_from, s_to] 구간에서 **끝까지 유지할 수 있는** 좌/우 오프셋.
+
+        구간 최솟값을 쓴다. 기동은 그 구간 내내 오프셋을 물고 있으므로,
+        한 점이라도 못 내면 그 계획은 못 쓴다.
+        """
+        if self._budget_left is None or self._total_l < 1e-6:
+            cap = self.maneuver_cfg.max_offset_m
+            return cap, cap
+        i0 = self._index_at_s(s_from)
+        i1 = self._index_at_s(s_to)
+        if self._delta_s(s_from, s_to) >= self._total_l - 1e-6:
+            sl = slice(None)
+            bl, br = self._budget_left[sl], self._budget_right[sl]
+        elif i0 <= i1:
+            bl = self._budget_left[i0 : i1 + 1]
+            br = self._budget_right[i0 : i1 + 1]
+        else:  # 랩어라운드
+            bl = np.concatenate((self._budget_left[i0:], self._budget_left[: i1 + 1]))
+            br = np.concatenate((self._budget_right[i0:], self._budget_right[: i1 + 1]))
+        if bl.size == 0:
+            cap = self.maneuver_cfg.max_offset_m
+            return cap, cap
+        return float(bl.min()), float(br.min())
 
     def _obstacle_disks_map(self, tf_lm) -> list:
         """장애물을 맵 좌표 원판 [(x, y, r), ...] 으로. 반경엔 차폭이 포함된다."""
@@ -1172,6 +1532,17 @@ class LocalPlannerNode(Node):
         path.poses = path.poses[:kept]
         return path, True
 
+    def _path_fully_clear(self, path: Path, tf_lm) -> bool:
+        """경로 전체가 벽·장애물에 안 걸리는가. 한 점이라도 걸리면 False."""
+        if not self.path_check_enable or len(path.poses) < 2:
+            return True
+        pts = [(p.pose.position.x, p.pose.position.y) for p in path.poses]
+        cut = first_blocked_index(
+            pts, self._inflated_map, self._obstacle_disks_map(tf_lm), start_index=1
+        )
+        self._last_path_cut = cut
+        return cut >= len(pts)
+
     def _warn_avoid_path_blocked(self) -> None:
         """회피 경로가 통째로 막힘 (1초에 한 번). 감속·정지는 속도정책과 AEB 몫."""
         now = self.get_clock().now().nanoseconds
@@ -1212,14 +1583,29 @@ class LocalPlannerNode(Node):
         """
         # FGM 목표점을 차량 기준 (전방, 횡) 으로 — 조향이 얼마나 급한지가 여기서 나온다
         fwd, lat = 2.0, 0.0
-        tgt = self._fgm_target_fresh()
-        if tgt is not None:
-            # /fgm_target 은 laser frame 이라 그대로 전방/횡으로 쓸 수 있다
-            fwd = max(0.1, float(tgt.point.x))
-            lat = float(tgt.point.y)
-        else:
-            # 목표가 없거나 오래됐으면 조향 한계를 걸 근거가 없다
+        passing = avoiding
+        path_lat_at = None
+
+        if self._maneuver is not None and self._d_ego is not None:
+            # 계획 기동 중이면 "앞으로 낼 횡이동" 을 정확히 알고 있다. FGM
+            # 조준점보다 이쪽이 맞다 — 실제로 그 경로를 탈 것이기 때문이다.
+            # 조향 한계(maneuver)는 계획이 이미 예산 안으로 맞춰 놨으므로
+            # 끄고, 정지거리 면제(passing)만 받는다.
+            lat = self._maneuver.d_pass - self._d_ego
+            fwd = max(0.1, self._maneuver.obstacle_s_first)
             avoiding = False
+            passing = True
+            path_lat_at = self._maneuver_lat_at
+        else:
+            tgt = self._fgm_target_fresh()
+            if tgt is not None:
+                # /fgm_target 은 laser frame 이라 그대로 전방/횡으로 쓸 수 있다
+                fwd = max(0.1, float(tgt.point.x))
+                lat = float(tgt.point.y)
+            else:
+                # 목표가 없거나 오래됐으면 조향 한계를 걸 근거가 없다
+                avoiding = False
+                passing = False
 
         return avoid_speed_limit(
             self._speed_static_obs,
@@ -1230,6 +1616,8 @@ class LocalPlannerNode(Node):
             self.avoid_speed_params,
             laser_to_base_x_m=self.laser_to_base_x_m,
             include_maneuver=avoiding,
+            passing=passing,
+            path_lat_at=path_lat_at,
         )
 
     def _trailing_target_speed(self, v_csv: float) -> float:
@@ -1290,6 +1678,66 @@ class LocalPlannerNode(Node):
         # 앞차보다 빨리 갈 이유는 없고(추월 로직 없음), CSV 속도도 못 넘는다.
         return min(v_csv, max(0.0, v))
 
+    def _rejoin_speed_length_m(self) -> float:
+        """속도 상한을 역산할 때 쓸 재합류 길이 [m].
+
+        `REJOIN` 중에는 **지금 실제로 따라가는 경로의 길이** 를 쓴다. 그래야
+        상한이 "이 경로를 접지력 안에서 추종 가능한 속도" 라는 뜻이 된다.
+        `rejoin_max_length_m` 을 쓰면 상한이 이탈 1.6 m 에서도 전속 위라
+        사실상 안 걸리고, 복귀 내내 CSV 전속이 나가 라인에 세게 꽂힌다.
+
+        그 밖(GLOBAL/AVOID 에서 크게 벗어난 상태)에서는 아직 경로가 없으니
+        "최대한 길게 잡아도 가능한가" 를 묻는 최대 길이를 쓴다.
+        """
+        if self.mode == "REJOIN" and self._rejoin_length_m > 1e-3:
+            return self._rejoin_length_m
+        return self.rejoin_max_length_m
+
+    def _deviation_speed_limit(self) -> float:
+        """레이스라인에서 멀어진 만큼 속도를 낮춘다.
+
+        quintic `d(s)` 의 최대 |d″| 는 `5.77·|d|/L²` 이고 요구 횡가속도는
+        여기에 `v²` 가 곱해진다. 그 값을 예산 이하로 두는 속도가
+        `v = L·sqrt(a_lat / (5.77·|d|))` 다.
+
+        `REJOIN` 중에는 `L` 이 실제 경로 길이라, |d| 가 줄수록 상한이 저절로
+        커진다 — 라인에 붙어 갈수록 속도가 자연스럽게 원래대로 회복된다.
+        회복 기울기는 `avoid_a_accel_mps2` 가 따로 묶는다.
+
+        AEB 나 큰 회피로 경로에서 크게 벗어난 채 고속을 유지하면 복귀 시점에
+        조향이 포화되어 벽으로 밀린다. 그 전에 속도를 미리 깎는 게 목적이다.
+        이탈이 작을 때는 상한이 매우 커서 걸리지 않는다.
+        """
+        if not self.deviation_speed_enable:
+            return float("inf")
+        pose = self._last_pose_for_speed
+        if pose is None:
+            return float("inf")
+
+        # 계획 기동 중의 이탈은 **의도된** 것이고, 그 경로의 곡률은 계획할 때
+        # 이미 예산 안으로 맞춰 뒀다 (`_maneuver_speed_cap`). 여기서 또 깎으면
+        # 오프셋에 올라선 것만으로 감속이 걸려, 조향을 아끼려고 옆으로 비킨
+        # 대가를 속도로 치르게 된다.
+        if self._maneuver is not None:
+            return float("inf")
+
+        # REJOIN 중이면 경로가 기준선보다 **얼마나 더** 휘는지 이미 재 뒀다.
+        # 코너 안쪽 복귀는 기준선 곡률이 1/σ 로 증폭돼 들어가서, 직선 가정은
+        # 이 초과분을 통째로 놓친다. 잰 값이 있으면 그걸 쓴다.
+        if self.mode == "REJOIN" and self._rejoin_kappa_max > 1e-6:
+            return max(
+                self.avoid_speed_params.v_min,
+                math.sqrt(self.rejoin_a_lat_mps2 / self._rejoin_kappa_max),
+            )
+
+        d = self._csv_cte_abs_m(pose)
+        if not math.isfinite(d) or d <= self.deviation_speed_free_m:
+            return float("inf")
+        v = self._rejoin_speed_length_m() * math.sqrt(
+            self.rejoin_a_lat_mps2 / (self._QUINTIC_D2_PEAK * d)
+        )
+        return max(self.avoid_speed_params.v_min, v)
+
     def _planner_speed_scale(self) -> float:
         """회피 선감속과 TRAILING 갭 유지 중 더 느린 쪽. slew 는 마지막에 한 번만.
 
@@ -1305,7 +1753,27 @@ class LocalPlannerNode(Node):
             scale = self._trailing_target_speed(v_csv) / max(0.05, v_csv)
             return min(base, scale)
 
-        v_target, reason = self._avoid_target_speed(avoiding=self._override_active)
+        # 기동 속도 한계는 **지금 따라가는 경로** 의 곡률에서 나와야 한다.
+        # AVOID 는 FGM 목표를 쫓으니 그 조준각이 맞다. REJOIN 은 재합류
+        # 경로를 쫓으므로 FGM 조준각과 무관하고, 그쪽 곡률은 아래
+        # `_deviation_speed_limit` 이 이미 건다 (v = L·√(a_lat/(5.77|d|))).
+        #
+        # 여기서 mode 를 안 보면 "하지도 않는 조향" 을 이유로 제동한다.
+        # 예전엔 REJOIN 중 FGM 이 꺼져 목표가 상하면서 한계가 저절로
+        # 빠졌는데, 연속 장애물 대응으로 FGM 을 켜 두자 되살아났다.
+        # 실측: REJOIN 중 조준각이 40° 를 넘고 속도가 0.1 m/s 까지 떨어졌다.
+        #
+        # 계획 기동(offset) 중에도 마찬가지다. 그때 따라가는 건 계획된 d(s)
+        # 이지 FGM 조준점이 아니고, 그 경로의 곡률 한계는 계획 단계에서
+        # `_maneuver_speed_cap` 으로 이미 나와 있다. 여기서 FGM 조준각을
+        # 근거로 또 깎으면 "옆으로 살짝 비켜 지나가려는" 기동이 매번 감속을
+        # 부르게 되어, 감속을 줄이려고 만든 기동이 감속을 만든다.
+        maneuvering = (
+            self._override_active
+            and self.mode == "AVOID"
+            and self._maneuver is None
+        )
+        v_target, reason = self._avoid_target_speed(avoiding=maneuvering)
         if trailing:
             v_trail = self._trailing_target_speed(v_csv)
             if v_trail < v_target:
@@ -1316,6 +1784,16 @@ class LocalPlannerNode(Node):
             # 시야에서 빠지는 순간 CSV 전속으로 튀어 나간다.
             if self.aeb_escape_speed_mps < v_target:
                 v_target, reason = self.aeb_escape_speed_mps, "aeb_escape"
+
+        v_rejoin = self._deviation_speed_limit()
+        if v_rejoin < v_target:
+            v_target, reason = v_rejoin, "deviation"
+
+        # 계획된 기동이 예산을 넘는다 = 늦게 봤다. 조향을 더 넣는 대신
+        # 여기서 속도로 답한다. 여유 있게 만난 경우엔 None 이라 감속이 없다.
+        if self._maneuver_speed_cap is not None and self.mode == "AVOID":
+            if self._maneuver_speed_cap < v_target:
+                v_target, reason = self._maneuver_speed_cap, "maneuver"
 
         v_target = self._slew_limit_speed(v_target, ceiling=v_csv)
         self._last_avoid_speed = v_target
@@ -1353,6 +1831,12 @@ class LocalPlannerNode(Node):
 
         floor = prev - self.avoid_speed_params.a_brake * dt
         v = max(v_target, floor)
+        if self.avoid_a_accel_mps2 > 0.0:
+            # 회복 방향도 묶는다. 안 묶으면 장애물이 시야에서 빠지는 순간
+            # 목표속도가 한 프레임에 정책 상한까지 뛴다 (실측: 배율 0.17 →
+            # 1.00, 0.46 → 3.39 m/s, 6 m/s^2). 그 급가속이 재합류 조향과
+            # 겹치면 타이어 예산을 앞뒤로 다 써 버려 라인 밖으로 밀린다.
+            v = min(v, prev + self.avoid_a_accel_mps2 * dt)
         self._slew_prev_v = v
         return v
 
@@ -1362,16 +1846,21 @@ class LocalPlannerNode(Node):
             filtered,
             forward_cone_rad=None,
             min_forward_x_m=self.avoid_min_forward_x_m,
-            lateral_abs_max_m=self._obstacle_lateral_abs_max_m,
+            lateral_abs_max_m=self._gated_lateral_abs_max_m,
             laser_to_base_x_m=self.laser_to_base_x_m,
         )
 
     def _planner_closest_obstacle_m(self, filtered: list) -> float:
+        # 방향 판정은 전방 콘이 한다. 여기에 좁은 |y| 튜브를 겹쳐 걸면
+        # 코리도를 통과한(=레이스라인 위) 곡선 구간 장애물이 다시 잘린다.
         return closest_obstacle_surface_m(
             filtered,
             forward_cone_rad=self.forward_cone_rad,
             min_forward_x_m=self.avoid_min_forward_x_m,
-            lateral_abs_max_m=self.avoid_trigger_lateral_abs_max_m,
+            lateral_abs_max_m=max(
+                self.avoid_trigger_lateral_abs_max_m,
+                self._gated_lateral_abs_max_m,
+            ),
             laser_to_base_x_m=self.laser_to_base_x_m,
         )
 
@@ -1405,6 +1894,7 @@ class LocalPlannerNode(Node):
 
         self.pub_planner_speed_scale.publish(Float64(data=sc))
         self.pub_planner_speed_condition.publish(UInt8(data=cd))
+        self.pub_speed_reason.publish(String(data=self._last_avoid_reason or "none"))
 
     def _republish_planner_speed(self) -> None:
         self._publish_planner_speed_out()
@@ -1560,10 +2050,18 @@ class LocalPlannerNode(Node):
         if self.pub_sent_dbg is not None:
             self.pub_sent_dbg.publish(self._stamp_copy_of_path(out))
 
+    def _set_path_planned(self, planned: bool) -> None:
+        """/local_path 가 계획 기하 경로인지 알린다 (Stanley 의 FF 스위치)."""
+        self._path_planned = bool(planned)
+        self.pub_path_planned.publish(Bool(data=self._path_planned))
+
     def _publish_override_gate(self, active: bool) -> None:
         # 속도 정책이 "실제로 회피 경로를 주고 있는지" 를 봐야 해서 기억해 둔다.
         # rejoin 이 꺼져 있으면 장애물이 사라진 뒤 mode 는 바로 GLOBAL 이 된다.
         self._override_active = bool(active)
+        if not active:
+            # 경로를 안 주면 Stanley 는 CSV 를 탄다 — 거기선 FF 가 원래 켜진다.
+            self._set_path_planned(False)
         g = Bool()
         g.data = bool(active)
         self.pub_override_gate.publish(g)
@@ -1601,6 +2099,51 @@ class LocalPlannerNode(Node):
         self._ys_np = np.asarray(self._ys, dtype=np.float64)
         self._bx_np = np.roll(self._xs_np, -1)
         self._by_np = np.roll(self._ys_np, -1)
+        self._build_curvature()
+
+    # 곡률 베이스라인 [m]. 폴리라인 간격이 0.05 m 라 인접 3점으로 재면
+    # 노이즈만 잡힌다 — 실측에서 ±0.2 m 는 R=1.26 m, ±2 m 는 R=2.42 m 로
+    # 수렴하지 않는다. 차가 실제로 겪는 규모(차체 길이)로 고정한다.
+    _CURV_BASELINE_M = 1.0
+
+    def _build_curvature(self) -> None:
+        """기준선 곡률 κ(s) 와 그 변화율 κ′(s) 를 미리 깔아 둔다 (좌회전 +).
+
+        재합류 경로는 기준선에서 `d` 만큼 떨어진 오프셋 곡선이고, 그 곡률에는
+        기준선 곡률이 **`1/(1-d·κ)` 로 증폭돼** 들어간다. 코너 안쪽으로 벗어나
+        있으면(`d·κ > 0`) 분모가 작아져 같은 복귀 경로라도 실제 곡률이 몇 배가
+        된다. `d·κ → 1` 이면 오프셋 좌표계 자체가 접힌다 — 서로 다른 s 의 법선이
+        곡률 중심에서 만나 한 점으로 뭉개진다.
+
+        직선 가정(`5.77·|d0|/L²`)만으로 길이·속도를 정하면 이걸 통째로 놓친다.
+        실측: 이탈 1.5 m 로 R≈2 m 코너 안쪽에 있으면 σ=0.38 이라 6 m/s 요구
+        횡가속도가 **예산의 17 배** 인데, 직선 가정은 예산 안이라고 답한다.
+        """
+        n = self._n
+        if n < 5 or self._total_l < 1e-6:
+            self._kappa_np = np.zeros(max(n, 1), dtype=np.float64)
+            self._kappa_d_np = np.zeros(max(n, 1), dtype=np.float64)
+            return
+        step = self._total_l / n
+        half = max(1, int(round(0.5 * self._CURV_BASELINE_M / max(step, 1e-6))))
+        # 접선각을 베이스라인의 절반으로 잡고, 그 각을 다시 절반만큼 떨어뜨려
+        # 차분한다 — 합쳐서 _CURV_BASELINE_M 규모가 된다.
+        th = np.arctan2(
+            np.roll(self._ys_np, -half) - np.roll(self._ys_np, half),
+            np.roll(self._xs_np, -half) - np.roll(self._xs_np, half),
+        )
+        dth = np.roll(th, -half) - np.roll(th, half)
+        dth = (dth + np.pi) % (2.0 * np.pi) - np.pi
+        self._kappa_np = dth / (2.0 * half * step)
+        dk = np.roll(self._kappa_np, -half) - np.roll(self._kappa_np, half)
+        self._kappa_d_np = dk / (2.0 * half * step)
+
+    def _kappa_at_s(self, s: float) -> Tuple[float, float]:
+        """기준선의 (κ, κ′) at s."""
+        if self._total_l < 1e-6:
+            return 0.0, 0.0
+        i = int((s % self._total_l) / self._total_l * self._n) % self._n
+        return float(self._kappa_np[i]), float(self._kappa_d_np[i])
 
     def _closest_on_loop(
         self, xp: float, yp: float
@@ -1916,6 +2459,16 @@ class LocalPlannerNode(Node):
             + a5 * ds**5
         )
 
+    @staticmethod
+    def _eval_quintic_d1(coeff: Tuple[float, ...], ds: float) -> float:
+        _, a1, a2, a3, a4, a5 = coeff
+        return a1 + 2 * a2 * ds + 3 * a3 * ds**2 + 4 * a4 * ds**3 + 5 * a5 * ds**4
+
+    @staticmethod
+    def _eval_quintic_d2(coeff: Tuple[float, ...], ds: float) -> float:
+        _, _, a2, a3, a4, a5 = coeff
+        return 2 * a2 + 6 * a3 * ds + 12 * a4 * ds**2 + 20 * a5 * ds**3
+
     def _append_pose(self, path: Path, x: float, y: float) -> None:
         ps = PoseStamped()
         ps.header = path.header
@@ -1925,6 +2478,156 @@ class LocalPlannerNode(Node):
         ps.pose.orientation.w = 1.0
         path.poses.append(ps)
 
+    # quintic d(s)=d0*(1-10u^3+15u^4-6u^5) 의 미분 최대값 계수.
+    #   |d'|  최대: u=0.5 에서 1.875*|d0|/L        (경로가 라인과 이루는 각)
+    #   |d''| 최대: u=(1±1/sqrt(3))/2 에서 5.7735*|d0|/L^2
+    _QUINTIC_D1_PEAK = 1.875
+    _QUINTIC_D2_PEAK = 5.7735
+
+    # σ = 1-d·κ 가 이 아래면 Frenet 오프셋 좌표계가 접히기 직전이라 곡률이
+    # 발산한다. 그런 경로는 "급한 경로" 가 아니라 **좌표계가 깨진 경로** 라
+    # 속도를 낮춰서 해결되지 않는다. 실측 최소반경 1.85 m 기준 σ=0.25 는
+    # 안쪽 이탈 1.4 m 근처다.
+    _REJOIN_SIGMA_FLOOR = 0.25
+
+    def _rejoin_heading_limit_rad(self, v: float) -> float:
+        """이 속도에서 허용할 합류각 [rad]. 빠를수록 좁힌다.
+
+        합류각 ψ 로 라인에 붙으면 라인을 가로지르는 속도성분이 `v·sin(ψ)` 다.
+        추종에 지연 τ 가 있으면 그만큼 **라인을 넘어간다**: 오버슈트 ≈
+        `v·sin(ψ)·τ`. 즉 같은 각이라도 빠를수록 더 많이 넘어간다. 각이 아니라
+        **넘어가는 양** 을 예산으로 잡아야 속도에 대해 일관된다.
+
+            sin(ψ) ≤ rejoin_merge_overshoot_m / (v · rejoin_track_lag_s)
+
+        레이스라인이 벽에 붙어 있어서 넘어간 만큼이 곧 벽까지의 여유를 먹는다.
+        위아래는 묶어 둔다 — 저속에서 무한정 벌리면 예전 33° 로 돌아가고,
+        고속에서 무한정 좁히면 트랙 둘레(41 m)로는 못 만드는 길이를 요구한다.
+        """
+        v = max(0.1, abs(v))
+        sin_max = self.rejoin_merge_overshoot_m / (v * self.rejoin_track_lag_s)
+        sin_max = min(self._rejoin_heading_sin_hi, max(self._rejoin_heading_sin_lo, sin_max))
+        return math.asin(min(1.0, sin_max))
+
+    def _rejoin_path_curvature(
+        self, s0: float, coeff: Tuple[float, ...], length: float, n: int = 40
+    ) -> Tuple[float, float]:
+        """이 재합류 경로의 (최대 |초과곡률|, 최소 σ).
+
+        Frenet→직교 변환의 곡률식 (σ=1-d·κ, Δθ=atan2(d′, σ)):
+
+            κ_path = ((d″ + (κ′d + κd′)·tanΔθ)·cos²Δθ/σ + κ)·cosΔθ/σ
+
+        돌려주는 건 `κ_path` 가 아니라 **`κ_path − κ`** 다. 기준선 곡률만큼은
+        레이스라인을 그냥 달려도 어차피 감당해야 하고 CSV 속도 프로파일이 이미
+        그걸로 짜여 있다. `rejoin_a_lat_mps2`(4.0) 는 복귀 기동이 **추가로**
+        만드는 몫의 예산이므로 총량과 비교하면 안 된다 — 총량으로 재면 중간
+        속도 코너(κ≈0.16)만 지나도 v²κ=5.8 이라 직선 복귀조차 3.8 m/s 로
+        묶인다. 직선(κ=0)에서는 이 값이 예전 `5.77·|d0|/L²` 로 그대로 환원된다.
+
+        σ 가 바닥을 치면 경로 자체가 무효라 무한대를 돌려준다 — 호출부가
+        감속이 아니라 **포기** 로 처리해야 하는 경우다.
+        """
+        excess_max = 0.0
+        sigma_min = 1.0
+        for k in range(n):
+            ds = length * k / max(n - 1, 1)
+            d = self._eval_quintic(coeff, ds)
+            dp = self._eval_quintic_d1(coeff, ds)
+            dpp = self._eval_quintic_d2(coeff, ds)
+            kap, kapd = self._kappa_at_s(s0 + ds)
+            sigma = 1.0 - d * kap
+            sigma_min = min(sigma_min, sigma)
+            if sigma <= self._REJOIN_SIGMA_FLOOR:
+                return float("inf"), sigma_min
+            dth = math.atan2(dp, sigma)
+            c = math.cos(dth)
+            kappa_path = (
+                (dpp + (kapd * d + kap * dp) * math.tan(dth)) * c * c / sigma + kap
+            ) * (c / sigma)
+            # 총곡률이 조향 한계를 넘으면 속도와 무관하게 못 따라간다.
+            # 초과분만 보면 이게 안 걸린다 — 기준선이 이미 급한 코너에서
+            # 조금만 더 휘어도 핸들이 끝까지 돌아간 상태가 되기 때문이다.
+            if abs(kappa_path) > self.rejoin_max_path_curvature:
+                return float("inf"), sigma_min
+            excess_max = max(excess_max, abs(kappa_path - kap))
+        return excess_max, sigma_min
+
+    def _plan_rejoin(
+        self, s0: float, d0: float, d0p: float, d0pp: float, v: float
+    ) -> Tuple[float, Tuple[float, ...], float, float]:
+        """(길이, quintic 계수, 최대곡률, 최소σ). 실제 코너 형상을 보고 고른다.
+
+        직선 가정으로 뽑은 길이를 출발점 삼되, 그게 코너에서 맞는다는 보장이
+        없으므로 후보를 훑는다. 코너 **안쪽** 복귀에서는 길이를 늘려도 σ 가
+        나아지지 않는다(σ 는 시작점 이탈이 지배한다) — 그래서 "무조건 길게" 가
+        답이 아니고, 요구 곡률이 가장 낮은 길이를 실제로 찾아야 한다.
+
+        기동당 한 번만 도는 계산이라 후보 탐색 비용은 문제되지 않는다.
+        """
+        lo = self.rejoin_min_length_m
+        hi = self.rejoin_max_length_m
+        base = self._rejoin_length_for(d0, v)
+        budget = self.rejoin_a_lat_mps2 / max(v * v, 1e-3)  # 예산을 만족하는 κ
+
+        best = None  # (kappa_max, length, coeff, sigma_min)
+        for k in range(self._REJOIN_LENGTH_CANDIDATES):
+            frac = k / (self._REJOIN_LENGTH_CANDIDATES - 1)
+            length = lo + (hi - lo) * frac
+            coeff = self._solve_quintic(d0, d0p, d0pp, 0.0, 0.0, 0.0, length)
+            kappa, sigma = self._rejoin_path_curvature(s0, coeff, length)
+            if not math.isfinite(kappa):
+                continue
+            # 예산을 만족하는 것 중에서는 직선 가정값에 가장 가까운 걸 쓴다.
+            # 굳이 더 길게 갈 이유가 없다 — 길수록 라인 밖에 오래 머문다.
+            rank = (0, abs(length - base)) if kappa <= budget else (1, kappa)
+            if best is None or rank < best[0]:
+                best = (rank, length, coeff, kappa, sigma)
+        if best is None:
+            coeff = self._solve_quintic(d0, d0p, d0pp, 0.0, 0.0, 0.0, base)
+            _, sigma = self._rejoin_path_curvature(s0, coeff, base)
+            return base, coeff, float("inf"), sigma
+        return best[1], best[2], best[3], best[4]
+
+    _REJOIN_LENGTH_CANDIDATES = 16
+
+    def _rejoin_length_for(self, d0: float, v: float) -> float:
+        """재합류 길이. 세 제약 중 '가장 긴 쪽'을 쓴다.
+
+        1. 시간 연동 `rejoin_time_sec * v` — 최소한 이만큼은 걸려야 한다
+        2. 횡가속 예산 — 요구 횡가속도가 `v^2*5.77*|d0|/L^2` 이므로
+           `L >= sqrt(5.77*|d0|*v^2 / a_lat)`
+        3. **헤딩 편차** — 경로가 라인과 이루는 최대 각은 `atan(1.875*|d0|/L)`
+           이므로 `L >= 1.875*|d0| / tan(heading_max)`. 허용각은 속도에 따라
+           좁아진다 (`_rejoin_heading_limit_rad`)
+
+        여기까지는 **기준선이 직선이라고 가정** 한 값이다. 코너에서는 실제
+        곡률이 다르므로 `_plan_rejoin` 이 이 값을 출발점으로 다시 고른다.
+
+        3번이 없으면 짧고 급한 경로가 나온다. 실측 조건(이탈 1.2 m, 2.6 m/s)
+        에서 1·2번만으로는 L=3.4 m 가 나오는데, 그 경로는 중간에서 라인과
+        **33도** 를 이룬다. 횡가속도로는 통과지만 차는 라인을 향해 비스듬히
+        꽂히듯 들어가고, 레이스라인이 벽에 붙어 있으면 그대로 벽을 향한다.
+        추종이 조금만 늦어도 넘어가서 벽에 닿는다. 3번을 걸면 같은 조건이
+        L=8.4 m / 15° 가 된다.
+
+        헤딩 제약을 걸면 L 이 길어지는데, 부작용이 아니라 이득이다. L 이
+        커지면 요구 횡가속도(1/L^2)가 급감하고 `_deviation_speed_limit`
+        (L 에 비례)이 느슨해져서 **더 빠르게** 복귀한다. 느리고 길게 도는
+        게 아니라 완만하고 빠르게 붙는다.
+        """
+        v = abs(v)
+        d = abs(d0)
+        l_time = self.rejoin_time_sec * v
+        l_accel = math.sqrt(self._QUINTIC_D2_PEAK * d * v * v / self.rejoin_a_lat_mps2)
+        l_heading = self._QUINTIC_D1_PEAK * d / math.tan(
+            self._rejoin_heading_limit_rad(v)
+        )
+        return min(
+            self.rejoin_max_length_m,
+            max(self.rejoin_min_length_m, l_time, l_accel, l_heading),
+        )
+
     def _build_frenet_quintic_rejoin_path(
         self, current_pose: PoseStamped
     ) -> Path | None:
@@ -1933,22 +2636,49 @@ class LocalPlannerNode(Node):
         yaw = _quat_to_yaw(current_pose.pose.orientation)
 
         s0, d0, d0p, d0pp, _, _ = self._project_to_frenet(x, y, yaw)
+        self._rejoin_kappa_max = 0.0
 
-        # 재합류 거리는 속도에 비례해야 한다. 고정 길이로 두면 고속에서
-        # 0.2초 만에 붙으라는 요구가 되어 조향이 튄다.
-        L = min(
-            self.rejoin_max_length_m,
-            max(self.rejoin_min_length_m, self.rejoin_time_sec * self._ego_speed_mps),
+        L, coeff, kappa_max, sigma_min = self._plan_rejoin(
+            s0, d0, d0p, d0pp, self._ego_speed_mps
         )
+        if not math.isfinite(kappa_max):
+            # 어떤 길이로도 Frenet 이 접힌다 — 코너 안쪽으로 곡률 중심만큼
+            # 들어와 있다는 뜻이다. 이 좌표계로는 경로를 정의할 수 없으니
+            # CSV 로 넘긴다. Stanley 의 피드백은 접지력 예산에 묶여 있어서
+            # 이쪽이 깨진 경로를 주는 것보다 안전하다.
+            if self.verbose_logs:
+                self.get_logger().warn(
+                    f"REJOIN 포기: 코너 안쪽 이탈 {d0:+.2f} m 에서 Frenet 접힘 "
+                    f"(σ_min={sigma_min:.2f}) — CSV 유지"
+                )
+            return None
+        self._rejoin_length_m = L
+        self._rejoin_kappa_max = kappa_max
 
-        coeff = self._solve_quintic(d0, d0p, d0pp, 0.0, 0.0, 0.0, L)
+        # 시간 상한을 계획 길이에 맞춘다. 고정 5 초는 헤딩 제약으로 경로가
+        # 길어지기 전 기준이라, 저속·큰이탈(1.5 m / 2.5 m/s → 13.2 m)에서는
+        # 정상 복귀가 완료 직전에 끊긴다. 끊기면 override 가 내려가면서
+        # 기준경로가 CSV 로 튀어 — 막으려던 급조향이 바로 그때 나온다.
+        # 계획 통과시간의 2.5 배를 주되 설정값 밑으로는 안 내려간다.
+        # '멈춤' 은 이 상한이 아니라 정지 감지가 따로 잡는다.
+        # (저속·큰이탈 예: 1.5 m / 2.5 m/s → 10 m, 4.0 초)
+        expect_s = L / max(abs(self._ego_speed_mps), 1.0)
+        self._rejoin_budget_ns = max(self.rejoin_max_active_ns, int(2.5 * expect_s * 1e9))
+
         self._rejoin_target_s = (s0 + L) % self._total_l
 
         out = Path()
         out.header.frame_id = self.map_frame
         out.header.stamp = self.get_clock().now().to_msg()
 
-        n_samples = self.rejoin_sample_count
+        tail_step = self._total_l / max(self._n, 1)
+        tail_step = max(0.05, min(0.1, tail_step))
+
+        # 점 개수가 아니라 '간격' 을 고정한다. first_blocked_index 는 경로 점만
+        # 검사하고 사이를 보간하지 않아서, 점 간격이 곧 충돌 검사 해상도다.
+        # 개수를 고정하면 L 이 길어질수록 간격이 벌어져(16 m/30점 = 0.55 m)
+        # 얇아진 벽 팽창대를 그대로 건너뛴다. 꼬리와 같은 간격으로 깐다.
+        n_samples = max(self.rejoin_sample_count, int(L / tail_step) + 1)
         for k in range(n_samples):
             ds = L * k / max(n_samples - 1, 1)
             d = self._eval_quintic(coeff, ds)
@@ -1958,8 +2688,6 @@ class LocalPlannerNode(Node):
             py = y_ref + d * math.cos(yaw_ref)
             self._append_pose(out, px, py)
 
-        tail_step = self._total_l / max(self._n, 1)
-        tail_step = max(0.05, min(0.1, tail_step))
         for k in range(self.rejoin_tail_count):
             s_tail = s0 + L + k * tail_step
             x_ref, y_ref, _ = self._xy_yaw_at_s(s_tail)
@@ -1996,6 +2724,111 @@ class LocalPlannerNode(Node):
         _, d_now, _, _, _, _ = self._project_to_frenet(x, y, yaw)
         return abs(float(d_now))
 
+    def _rejoin_reset_progress(self, current_pose: PoseStamped | None) -> None:
+        now = self.get_clock().now().nanoseconds
+        self._rejoin_start_ns = now
+        self._rejoin_moving_ns = now
+        self._rejoin_travel_m = 0.0
+        self._rejoin_last_xy = (
+            None
+            if current_pose is None
+            else (
+                float(current_pose.pose.position.x),
+                float(current_pose.pose.position.y),
+            )
+        )
+
+    def _rejoin_track_progress(self, current_pose: PoseStamped | None) -> None:
+        """REJOIN 유지 중 이동거리와 '마지막으로 움직인 시각' 을 갱신.
+
+        모드 갱신과 발행 양쪽에서 불릴 수 있어 주기당 1회로 묶는다. 두 번
+        세면 이동거리가 두 배로 잡혀 경로를 필요보다 자주 다시 그린다.
+        """
+        if self._rejoin_progress_cycle == self._tf_cycle_id:
+            return
+        self._rejoin_progress_cycle = self._tf_cycle_id
+        if abs(self._ego_speed_mps) >= self.rejoin_stall_speed_mps:
+            self._rejoin_moving_ns = self.get_clock().now().nanoseconds
+        if current_pose is None:
+            return
+        xy = (
+            float(current_pose.pose.position.x),
+            float(current_pose.pose.position.y),
+        )
+        if self._rejoin_last_xy is not None:
+            self._rejoin_travel_m += math.hypot(
+                xy[0] - self._rejoin_last_xy[0], xy[1] - self._rejoin_last_xy[1]
+            )
+        self._rejoin_last_xy = xy
+
+    def _rejoin_abandon_reason(self) -> str:
+        """REJOIN 을 포기하고 CSV 로 돌아가야 하면 사유, 아니면 빈 문자열.
+
+        완료 판정(`_is_rejoin_finished`)은 |CTE| 가 줄어야 성립한다. 차가 서
+        있으면 CTE 는 절대 줄지 않으므로 그것만으로는 영원히 못 빠져나온다 —
+        실제로 정지 상태에서 REJOIN 에 갇힌 채 override 를 계속 내보내
+        Stanley 가 수십 초 묵은 캐시 경로를 붙들고 있었다. AVOID→REJOIN
+        대기에 시간 상한을 뒀던 것과 같은 이유다.
+
+        CSV 로 돌아가는 건 안전한 실패다 — override 가 내려가고 Stanley 가
+        평소대로 레이스라인을 따라가며, 피드백은 접지력 예산으로 묶여 있다.
+        """
+        now = self.get_clock().now().nanoseconds
+        if now - self._rejoin_moving_ns > self.rejoin_stall_ns:
+            return "정지"
+        if now - self._rejoin_start_ns > self._rejoin_budget_ns:
+            return f"{self._rejoin_budget_ns / 1e9:.1f}s 초과"
+        return ""
+
+    def _refresh_rejoin_path(self, current_pose: PoseStamped) -> bool:
+        """재합류 경로를 확보한다. 쓸 수 있으면 True.
+
+        **한 번 그리면 끝까지 그대로 쓴다.** 주기적으로 다시 그려 봤더니
+        오히려 복귀가 거칠어졌다: 차가 경로를 못 따라가 벌어지는 중에
+        재생성이 겹치면 Stanley 기준경로가 통째로 갈아치워진다 (실측 CTE
+        −0.11 → −0.43 → −0.64 로 벌어지다 재생성 순간 +0.01 로 리셋,
+        0.3 초 주기 반복). 추종 오차를 경로를 바꿔서 없애면 안 된다 —
+        그건 오차를 지우는 게 아니라 기준을 지우는 것이다.
+
+        기동은 1~2 초면 끝나므로 경로가 묵을 일도 없다. 차가 서서 오래
+        붙들리는 경우는 `_rejoin_abandon_reason` 이 따로 끊는다.
+        """
+        if self._rejoin_path_msg is not None:
+            self._rejoin_track_progress(current_pose)
+            return len(self._rejoin_path_msg.poses) >= 2
+
+        path = self._build_frenet_quintic_rejoin_path(current_pose)
+        if path is None or len(path.poses) < 2:
+            return False
+        self._rejoin_path_msg = path
+        self._rejoin_reset_progress(current_pose)
+        return True
+
+    def _publish_rejoin_bridge(self, current_pose: PoseStamped | None) -> bool:
+        """회피 경로가 더는 필요 없을 때 CSV 로 '생짜 전환' 하는 걸 막는다.
+
+        override 를 그냥 내리면 Stanley 의 기준경로가 로컬경로 → CSV 로
+        순간이동한다. 라인에서 벗어나 있으면 그 순간 CTE 가 계단으로 뛰고
+        (실측 0.00 → −1.21 m) 급조향이 나간다. 실측에서는 이 상태로 2.4 초를
+        달렸고, 정작 REJOIN 은 난폭한 복귀가 다 끝난 뒤에야 만들어졌다.
+
+        라인에서 멀면 여기서 바로 재합류 경로를 깔아 override 를 유지한다.
+        다음 주기에 `_update_mode` 가 정식으로 REJOIN 으로 넘긴다.
+        """
+        if not self.rejoin_enable or current_pose is None:
+            return False
+        if self._csv_cte_abs_m(current_pose) <= self.rejoin_finish_lateral_m:
+            return False  # 이미 라인 위다 — 붙일 게 없으니 CSV 로 넘겨도 된다
+        if not self._refresh_rejoin_path(current_pose):
+            return False
+        self._rejoin_path_msg.header.stamp = self.get_clock().now().to_msg()
+        self.pub_path.publish(self._rejoin_path_msg)
+        if self.pub_sent_dbg is not None:
+            self.pub_sent_dbg.publish(self._stamp_copy_of_path(self._rejoin_path_msg))
+        self._set_path_planned(False)  # REJOIN 게인은 FF 가 꺼진 채로 맞춰 뒀다
+        self._publish_override_gate(True)
+        return True
+
     def _is_rejoin_finished(self, current_pose: PoseStamped) -> bool:
         """CTE(|d|) ≤ rejoin_finish_lateral_m 이면 CSV 복귀 완료."""
         x = current_pose.pose.position.x
@@ -2013,6 +2846,7 @@ class LocalPlannerNode(Node):
         self._rejoin_path_msg = None
         self._avoid_on_count = 0
         self._avoid_off_count = 0
+        self._clear_maneuver()
         self._reset_trailing_state()
 
     def _avoid_blocked(self) -> bool:
@@ -2077,6 +2911,44 @@ class LocalPlannerNode(Node):
             )
         else:
             self.get_logger().info("AEB 탈출 모드 종료 — 정상 판정 복귀")
+
+    def _update_escape_heading(self, current: PoseStamped | None) -> None:
+        """탈출 조준의 기준 방향을 FGM 에 알린다.
+
+        멈춘 순간의 맵 헤딩을 한 번 잡아 두고, 매 주기 **지금 헤딩과의 차이**
+        를 낸다. 그 차이가 곧 "기억한 방향" 을 차체 기준으로 본 각도다. 탈출
+        중에 차가 왼쪽으로 돌아가면 이 값이 오른쪽으로 커지므로, FGM 이 이걸
+        선호하는 것만으로 원래 방향으로 되돌아온다.
+
+        기준을 트랙 접선이 아니라 **멈춘 순간의 헤딩** 으로 잡는 이유: AEB 는
+        직진 제동이라 멈춘 헤딩이 진행 방향과 거의 같고, 로컬라이제이션이
+        틀어져 있어도 이 값은 영향을 안 받는다.
+
+        보내는 것은 [기준각, 허용 콘] 두 값이다. 콘까지 같이 보내는 이유는
+        탈출 정책이 여기 있기 때문이다 — FGM 쪽에 따로 두면 두 값이 어긋난다.
+        탈출이 아니거나 자세를 모르면 빈 배열을 보내고, FGM 은 그때 원래대로
+        정면을 선호한다.
+        """
+        data: list[float] = []
+        if self._aeb_escape_active() and self.aeb_escape_heading_lock:
+            yaw_now = (
+                _quat_to_yaw(current.pose.orientation) if current is not None else None
+            )
+            if yaw_now is not None:
+                if self._aeb_escape_yaw is None:
+                    self._aeb_escape_yaw = yaw_now
+                    self.get_logger().warn(
+                        f"탈출 헤딩 고정 — 멈춘 방향 ±"
+                        f"{math.degrees(self.aeb_escape_heading_cone_rad):.0f}° "
+                        f"안에서만 빠져나간다"
+                    )
+                data = [
+                    _wrap_pi(self._aeb_escape_yaw - yaw_now),
+                    self.aeb_escape_heading_cone_rad,
+                ]
+        else:
+            self._aeb_escape_yaw = None
+        self.pub_fgm_prefer.publish(Float32MultiArray(data=data))
 
     def _maybe_log_trailing(self) -> None:
         if self._trailing_log_period_ns <= 0:
@@ -2253,6 +3125,24 @@ class LocalPlannerNode(Node):
                 )
             )
             obstacle_still_ahead = static_still_ahead or dynamic_still_ahead
+
+            # 계획 기동은 복귀 곡선까지 자기 안에 갖고 있다. 장애물이 시야에서
+            # 빠졌다고 여기서 모드를 내리면, 아직 오프셋에 나가 있는 상태에서
+            # override 가 풀려 Stanley 가 CSV 로 직접 되꺾는다 — 예전에 벽으로
+            # 가던 경로가 정확히 이거였다. 기동이 끝날 때까지 붙들고, 끝나면
+            # 이미 라인 위이므로 REJOIN 없이 바로 GLOBAL 로 간다.
+            if self._maneuver is not None and current_pose is not None:
+                ds = self._maneuver_ds_cache
+                if ds is not None and ds < self._maneuver.total_length_m:
+                    self._avoid_off_count = 0
+                    return
+                self._clear_maneuver()
+                if not obstacle_still_ahead:
+                    self._go_global()
+                    if old_mode != self.mode:
+                        self._log_mode_transition(old_mode, d_closest)
+                    return
+
             if obstacle_still_ahead:
                 self._avoid_off_count = 0
             elif fully_cleared:
@@ -2272,27 +3162,19 @@ class LocalPlannerNode(Node):
                     and self._csv_cte_abs_m(current_pose)
                     <= self.rejoin_finish_lateral_m
                 )
-                # 기다림에는 상한이 있어야 한다. 차가 서 있으면 CTE 는 절대
-                # 줄지 않아서, 상한이 없으면 장애물이 하나도 없는데 AVOID 에
-                # 갇힌 채 fgm_enable 이 계속 True 로 나간다.
-                wait_frames = int(self.rejoin_wait_max_ns * self.publish_hz / 1e9)
-                waited_out = (
-                    self._avoid_off_count >= self.avoid_off_count_th + wait_frames
-                )
-                # rejoin 을 쓸 때만 CTE 가 줄 때까지 AVOID 를 붙든다. rejoin 이
-                # 꺼져 있으면 이미 override 를 내려 Stanley 가 CSV 로 복귀하는
-                # 중이라, mode 만 AVOID 로 남겨두면 AEB 완화와 속도 캡이
-                # 이유 없이 길어진다.
-                if can_rejoin and not cte_ok and not waited_out:
-                    pass
-                elif can_rejoin:
-                    self._rejoin_path_msg = self._build_frenet_quintic_rejoin_path(
-                        current_pose
-                    )
-                    if (
-                        self._rejoin_path_msg is not None
-                        and len(self._rejoin_path_msg.poses) >= 2
-                    ):
+                # 라인에서 벗어나 있으면 **지금 바로** 재합류로 넘긴다.
+                #
+                # 예전에는 여기서 "CTE 가 줄 때까지" 최대 1.5 초를 AVOID 로
+                # 붙들고 기다렸다. 그런데 그 시점엔 이미 발행
+                # 쪽에서 override 를 내려 Stanley 가 CSV 를 생짜로 쫓는
+                # 중이었다 — 즉 기다리는 동안 보호받는 게 아니라 정확히
+                # 그 반대였다. 실측: 회피 해제 68.6 s → REJOIN 71.0 s, 그
+                # 2.4 초 동안 1.7 m 벗어난 채 6 m/s^2 로 가속하며 라인으로
+                # 되꺾였고, 부드럽게 붙여야 할 REJOIN 은 다 끝난 뒤 v=0
+                # 에서 시작했다. CTE 를 줄이는 건 재합류 경로가 할 일이지
+                # 기다린다고 줄어드는 게 아니다.
+                if can_rejoin and not cte_ok:
+                    if self._refresh_rejoin_path(current_pose):
                         self.mode = "REJOIN"
                     else:
                         self._go_global()
@@ -2307,6 +3189,12 @@ class LocalPlannerNode(Node):
                 self._clear_avoid_blocked()
             elif current_pose is not None and self._is_rejoin_finished(current_pose):
                 self._go_global()
+            else:
+                self._rejoin_track_progress(current_pose)
+                reason = self._rejoin_abandon_reason()
+                if reason:
+                    self.get_logger().warn(f"REJOIN 포기({reason}) — CSV 로 복귀")
+                    self._go_global()
 
         elif self.mode == "TRAILING":
             gap = self._forward_gap_s_m()
@@ -2333,6 +3221,359 @@ class LocalPlannerNode(Node):
 
         if old_mode != self.mode:
             self._log_mode_transition(old_mode, d_closest)
+
+    # ------------------------------------------------------------------
+    # 횡오프셋 기동 — 계획하고 붙들고 간다
+    # ------------------------------------------------------------------
+    def _maneuver_obstacles_sd(self) -> list:
+        """기준선 좌표계 장애물. s 는 자차 앞쪽으로의 거리.
+
+        동적 장애물도 사실상 정지해 있으면(추종 대상이 아니면) 같이 넘긴다.
+        움직이는 앞차는 TRAILING 이 따로 본다.
+        """
+        if self._s_ego is None:
+            return []
+        out = []
+        for s, d, r in self._static_sd:
+            out.append(ObstacleSD(self._delta_s(s, self._s_ego), float(d), float(r)))
+        for entry in self._dynamic_sd:
+            s, d, r, vs = entry[0], entry[1], entry[2], entry[3]
+            if abs(float(vs)) > self.trailing_min_leader_speed_mps:
+                continue  # 같이 달리는 앞차 — 비켜갈 대상이 아니다
+            out.append(ObstacleSD(self._delta_s(s, self._s_ego), float(d), float(r)))
+        return out
+
+    #: 한 주기에 s 가 이만큼 넘게 변했다면 위치추정이 튄 것이다. 그대로
+    #: 누적하면 기동 진행도가 통째로 어긋나므로 버린다.
+    _MANEUVER_MAX_STEP_M = 2.0
+
+    #: 진입/복귀 한 구간이 차지해도 되는 트랙 길이 비율. 이 트랙은 37 m 라
+    #: 예산대로 뽑으면 한 기동이 반바퀴를 먹고, 그러면 랩 대부분을 라인 밖에서
+    #: 보내게 된다. 0.18(=6.7 m)은 7 m/s 까지 감속 없이 지나갈 수 있는
+    #: 최소값이다 — 더 줄이면 곡률이 올라가 속도 상한이 걸린다.
+    _MANEUVER_LEN_TRACK_FRAC = 0.18
+
+    def _maneuver_len_cap(self, requested_m: float) -> float:
+        cap = self._MANEUVER_LEN_TRACK_FRAC * self._total_l
+        return max(0.5, min(float(requested_m), cap))
+
+    def _build_maneuver_config(self) -> None:
+        """트랙 길이를 알아야 길이 상한이 정해져서 CSV 로드 뒤에 만든다."""
+        g = self.get_parameter
+        steer_frac = min(1.0, max(0.1, float(g("avoid_offset_steer_frac").value)))
+        # 기동 여유는 **속도제한이 면제를 내주는 기준과 같아야** 한다. 이보다
+        # 좁게 계획하면, 계획대로 비켜 가는데도 정지거리 한계가 안 풀려서
+        # 회피 내내 기어간다 (감속을 줄이려고 만든 기동이 감속을 만든다).
+        # 이보다 넓게 잡을 이유도 없다 — 트랙 폭만 낭비한다.
+        margin_floor = (
+            self.avoid_speed_params.lateral_margin_m
+            + self.avoid_speed_params.pass_clear_extra_m
+        )
+        self.maneuver_cfg = ManeuverConfig(
+            half_width_m=vg.HALF_WIDTH_M,
+            lateral_margin_m=max(
+                margin_floor, float(g("avoid_offset_margin_m").value)
+            ),
+            max_offset_m=max(0.05, float(g("avoid_offset_max_m").value)),
+            a_lat_enter_mps2=max(0.2, float(g("avoid_offset_a_lat_enter").value)),
+            a_lat_exit_mps2=max(0.2, float(g("avoid_offset_a_lat_exit").value)),
+            a_lat_hard_mps2=max(0.3, float(g("avoid_offset_a_lat_hard").value)),
+            enter_min_m=max(0.2, float(g("avoid_offset_enter_min_m").value)),
+            enter_max_m=self._maneuver_len_cap(
+                float(g("avoid_offset_enter_max_m").value)
+            ),
+            exit_min_m=max(0.2, float(g("avoid_offset_exit_min_m").value)),
+            exit_max_m=self._maneuver_len_cap(
+                float(g("avoid_offset_exit_max_m").value)
+            ),
+            # 앞범퍼가 장애물 표면에 닿기 전에 오프셋에 올라와 있어야 한다.
+            hold_front_m=vg.FRONT_M + 0.20,
+            hold_rear_m=vg.LENGTH_M
+            + max(0.0, float(g("avoid_offset_hold_rear_extra_m").value)),
+            merge_gap_m=max(0.0, float(g("avoid_offset_merge_gap_m").value)),
+            v_plan_min_mps=1.5,
+            max_steer_rad=steer_frac * _MAX_STEER_RAD,
+            wheelbase_m=vg.WHEELBASE_M,
+        )
+        self.get_logger().info(
+            f"회피 기동: 여유 {self.maneuver_cfg.lateral_margin_m:.2f}m, "
+            f"오프셋≤{self.maneuver_cfg.max_offset_m:.2f}m, "
+            f"진입≤{self.maneuver_cfg.enter_max_m:.1f}m 복귀≤"
+            f"{self.maneuver_cfg.exit_max_m:.1f}m (트랙 {self._total_l:.0f}m), "
+            f"a_lat {self.maneuver_cfg.a_lat_enter_mps2:.1f}/"
+            f"{self.maneuver_cfg.a_lat_exit_mps2:.1f}/"
+            f"{self.maneuver_cfg.a_lat_hard_mps2:.1f}, "
+            f"계획조향≤{math.degrees(self.maneuver_cfg.max_steer_rad):.0f}°"
+        )
+
+    def _advance_maneuver_ds(self, current: PoseStamped | None) -> float | None:
+        """계획 앵커로부터 진행한 s [m]. **주기당 한 번만** 부르고 나머지는 캐시를 본다.
+
+        `_delta_s(s_now, s0)` 를 직접 쓰면 안 된다. 그건 [-L/2, +L/2) 로
+        정규화하므로, 기동이 트랙 반바퀴에 가까워지는 순간(37 m 트랙에서는
+        18.7 m) 진행도가 음수로 접힌다. 실제로 19.4 m 짜리 기동에서 ds 가
+        +19.8 대신 -17.7 로 나와 완료 판정이 영영 서지 않았다.
+
+        그래서 매 주기의 **증분**만 _delta_s 로 재고(그 정도 거리는 모호하지
+        않다) 누적한다. 이러면 한 바퀴를 넘겨도 진행도가 단조증가한다.
+        """
+        if self._maneuver is None or self._maneuver_s0 is None or current is None:
+            self._maneuver_ds_cache = None
+            return None
+        s_now, _ = self._frenet_xy(
+            float(current.pose.position.x), float(current.pose.position.y)
+        )
+        if self._maneuver_last_s is None:
+            self._maneuver_ds_cache = self._delta_s(s_now, self._maneuver_s0)
+        else:
+            step = self._delta_s(s_now, self._maneuver_last_s)
+            if abs(step) <= self._MANEUVER_MAX_STEP_M:
+                self._maneuver_ds_cache = (self._maneuver_ds_cache or 0.0) + step
+        self._maneuver_last_s = s_now
+        return self._maneuver_ds_cache
+
+    def _maneuver_still_clears(self, obstacles: list, ds_now: float) -> bool:
+        """지금 계획이 현재 보이는 장애물을 여전히 비켜 가는가."""
+        m = self._maneuver
+        if m is None:
+            return False
+        need = vg.HALF_WIDTH_M + self.maneuver_cfg.lateral_margin_m
+        for o in obstacles:
+            ds_obs = ds_now + o.s
+            if ds_obs < 0.0 or ds_obs > m.total_length_m + 1.0:
+                continue
+            if abs(m.d_at(ds_obs) - o.d) < o.r + need - 1e-6:
+                return False
+        return True
+
+    def _maneuver_lat_at(self, x_base: float) -> float:
+        """앞으로 x_base 만큼 갔을 때 계획 경로의 **차량 기준** 횡위치 [m].
+
+        속도제한이 "이 장애물 옆을 지날 때 우리가 어디 있나" 를 물을 때 쓴다.
+        장애물 y 는 차량 기준이고 계획 d 는 트랙 기준이라, 자차의 d 를 빼서
+        기준을 맞춘다. 회피 중에는 차가 트랙 방향과 거의 나란하므로 이
+        평행이동으로 충분하다.
+        """
+        m = self._maneuver
+        if m is None or self._maneuver_ds_cache is None or self._d_ego is None:
+            return 0.0
+        return m.d_at(self._maneuver_ds_cache + max(0.0, float(x_base))) - self._d_ego
+
+    def _plan_or_keep_maneuver(
+        self, current: PoseStamped, *, forbid_side: int = 0
+    ) -> bool:
+        """기동을 새로 세우거나 기존 것을 유지한다. 쓸 게 있으면 True.
+
+        재계획 조건을 좁게 잡는 게 핵심이다. 매 주기 자차 위치로 다시 그리면
+        차는 진입 곡선의 제일 급한 앞부분을 계속 새로 타고, 오프셋에는 영영
+        도달하지 못한 채 조향만 물고 있게 된다.
+        """
+        if self._s_ego is None:
+            return False
+        obstacles = self._maneuver_obstacles_sd()
+        ds_now = self._maneuver_ds_cache
+
+        keep = False
+        if self._maneuver is not None and ds_now is not None and forbid_side == 0:
+            _, d_now = self._frenet_xy(
+                float(current.pose.position.x), float(current.pose.position.y)
+            )
+            off_plan = abs(d_now - self._maneuver.d_at(ds_now))
+            keep = (
+                ds_now >= -0.5
+                and ds_now < self._maneuver.total_length_m
+                and off_plan <= self.avoid_offset_replan_lateral_m
+                and self._maneuver_still_clears(obstacles, ds_now)
+            )
+        if keep:
+            self._maneuver_speed_cap = self._maneuver.speed_cap_mps
+            return True
+
+        if not obstacles:
+            self._clear_maneuver()
+            return False
+
+        cx = float(current.pose.position.x)
+        cy = float(current.pose.position.y)
+        yaw = _quat_to_yaw(current.pose.orientation)
+        _, d0, d0p, _, _, _ = self._project_to_frenet(cx, cy, yaw)
+        s_now, _ = self._frenet_xy(cx, cy)
+        # 오프셋을 물고 지나갈 구간의 좌/우 여유. 이걸 안 주면 계획기가 벽
+        # 쪽으로 비키는 계획을 낸다 — 실차에서 그렇게 박았다.
+        max_left, max_right = self._wall_budget_over(*self._hold_window(obstacles))
+        fresh, plan_v = self._plan_fitting_the_track(
+            obstacles,
+            d0,
+            d0p,
+            s_now,
+            forbid_side=forbid_side,
+            max_left=max_left,
+            max_right=max_right,
+        )
+        if fresh is None:
+            self._clear_maneuver()
+            return False
+
+        self._maneuver = fresh
+        self._maneuver_s0 = s_now
+        self._maneuver_last_s = s_now
+        self._maneuver_ds_cache = 0.0
+        self._maneuver_speed_cap = _min_opt(fresh.speed_cap_mps, plan_v)
+        self._log_maneuver(fresh)
+        return True
+
+    def _plan_fitting_the_track(
+        self,
+        obstacles,
+        d0: float,
+        d0p: float,
+        s_now: float,
+        *,
+        forbid_side: int,
+        max_left: float,
+        max_right: float,
+    ) -> Tuple[OffsetManeuver | None, float | None]:
+        """트랙 안에 실제로 들어가는 기동을 찾는다. (기동, 계획속도).
+
+        진입·복귀 길이는 `sqrt(D2·|Δd|·v²/a)` 라 **v 에 선형**이다. 6 m/s 에서
+        0.58 m 를 비키려면 진입만 6.3 m 고 기동 전체가 16 m 인데, 37 m 짜리
+        트랙에서 그건 반 바퀴다. 코너를 몇 개씩 지나가므로 벽에 걸릴 수밖에 없다.
+
+        그래서 **속도를 낮춰 가며** 다시 뽑는다. 절반 속도면 절반 길이라
+        조금만 낮춰도 기동이 트랙 안에 들어온다. 실측(37 m 트랙, 전 지점에
+        정면 장애물): 6 m/s 고정이면 FGM 폴백이 51% 인데, 이 탐색을 붙이면
+        14% 로 떨어지고 76% 를 기동으로 처리한다. 감속한 경우의 목표속도는
+        중앙값 3.5 m/s 다.
+
+        이건 "고속에서 감속을 최대한 덜 한다" 와 어긋나지 않는다. 풀속도로
+        되는 자리에서는 첫 시도가 바로 통과하고, 안 되는 자리는 **어차피
+        기동이 트랙에 안 들어가는** 자리다. 거기서 대안은 FGM 으로 벽에
+        박거나 감속하거나 둘 중 하나다.
+        """
+        v_now = max(abs(self._ego_speed_mps), self.avoid_offset_plan_v_floor_mps)
+        v_try = v_now
+        while True:
+            for forbid in _forbid_order(forbid_side):
+                m = plan_maneuver(
+                    obstacles,
+                    self.maneuver_cfg,
+                    d_ego=d0,
+                    d_ego_prime=d0p,
+                    v=v_try,
+                    forbid_side=forbid,
+                    max_left=max_left,
+                    max_right=max_right,
+                )
+                if m is None:
+                    continue
+                if self._maneuver_fits_walls(m, s_now):
+                    return m, (None if v_try >= v_now - 1e-9 else v_try)
+            if v_try <= self.avoid_offset_plan_v_floor_mps + 1e-9:
+                return None, None
+            v_try = max(
+                self.avoid_offset_plan_v_floor_mps,
+                v_try - self.avoid_offset_plan_v_step_mps,
+            )
+
+    # 벽 적합성 검사 간격 [m]. 예산 격자가 0.025 라 이보다 촘촘히 볼 필요 없다.
+    _WALL_FIT_STEP_M = 0.20
+
+    def _maneuver_fits_walls(self, m: OffsetManeuver, s0: float) -> bool:
+        """계획된 d(s) 가 s 마다의 좌/우 예산 안에 들어오는가.
+
+        `_wall_budget_over` 는 유지 구간만 봐서 진입·복귀 램프를 놓친다.
+        그쪽은 |d| 가 오르내리는 중이라 스칼라 하나로 묶으면 과하게
+        보수적이거나(전 구간 최솟값) 과하게 낙관적이다(유지 구간만). 계획이
+        나온 뒤에는 d(s) 를 아니까 점마다 정확히 보면 된다.
+        """
+        if self._budget_left is None or self._total_l < 1e-6:
+            return True
+        ds = np.arange(0.0, m.total_length_m + 1e-9, self._WALL_FIT_STEP_M)
+        if ds.size == 0:
+            return True
+        d = np.array([m.d_at(float(t)) for t in ds])
+        idx = (
+            ((s0 + ds) % self._total_l) / self._total_l * self._n
+        ).astype(np.int64) % self._n
+        cap = np.where(d >= 0.0, self._budget_left[idx], self._budget_right[idx])
+        return bool(np.all(np.abs(d) <= cap + 1e-9))
+
+    def _hold_window(self, obstacles) -> Tuple[float, float]:
+        """차가 **최대 오프셋을 물고 있을** 절대 s 구간 — 벽 예산을 물을 곳.
+
+        기동 전체(진입~복귀)로 물으면 안 된다. 그 구간은 37 m 트랙에서 16 m 나
+        되고, 최솟값을 취하니 트랙에서 제일 좁은 한 곳이 언제나 걸린다. 실측에서
+        그렇게 했더니 **전 지점에서 계획이 거부**됐다.
+
+        진입·복귀 구간의 |d| 는 0 에서 목표까지 오르내리는 중이라 예산을 덜
+        쓴다. 거기까지 한 값으로 묶으면 과하게 보수적이다. 그쪽은 경로 점
+        단위 충돌검사(`_path_fully_clear`)가 정확히 잡아 주므로, 여기서는
+        **오프셋을 끝까지 물고 있는 구간**만 본다.
+        """
+        s0 = self._s_ego or 0.0
+        s_first = min((o.s for o in obstacles), default=0.0)
+        s_last = max((o.s for o in obstacles), default=0.0)
+        return (
+            s0 + s_first - self.maneuver_cfg.hold_front_m,
+            s0 + s_last + self.maneuver_cfg.hold_rear_m,
+        )
+
+    def _clear_maneuver(self) -> None:
+        self._maneuver = None
+        self._maneuver_s0 = None
+        self._maneuver_last_s = None
+        self._maneuver_ds_cache = None
+        self._maneuver_speed_cap = None
+
+    def _log_maneuver(self, m: OffsetManeuver) -> None:
+        now = self.get_clock().now().nanoseconds
+        if now - self._last_maneuver_log_ns < 500_000_000:
+            return
+        self._last_maneuver_log_ns = now
+        cap = (
+            f", 속도상한 {m.speed_cap_mps:.1f}m/s"
+            if m.speed_cap_mps is not None
+            else ""
+        )
+        self.get_logger().info(
+            f"회피 기동: {'왼' if m.side > 0 else '오른'}쪽 {abs(m.d_pass):.2f}m, "
+            f"진입 {m.enter_len_m:.1f}m, 유지끝 {m.hold_end_ds:.1f}m, "
+            f"복귀 {m.exit_len_m:.1f}m, 최대횡가속 "
+            f"{m.peak_lateral_accel_mps2:.1f}m/s²{cap}"
+        )
+
+    def _build_offset_path(self, current: PoseStamped) -> Path | None:
+        """계획된 d(s) 를 맵 좌표 경로로 편다.
+
+        계획은 앵커 s0 기준이지만 경로는 **자차 앞쪽**만 낸다. 지나온 부분을
+        같이 발행하면 Stanley 최근접점이 뒤로 잡혀 조향이 뒤집힌다.
+        """
+        m = self._maneuver
+        ds_now = self._maneuver_ds_cache
+        if m is None or ds_now is None:
+            return None
+
+        out = Path()
+        out.header.frame_id = self.map_frame
+        out.header.stamp = self.get_clock().now().to_msg()
+
+        # 복귀가 끝난 뒤에도 기준선을 따라 조금 더 이어 붙인다. 경로 끝에서
+        # Stanley 전방주시가 끊기면 그 지점에서 조향이 튄다.
+        tail = self.avoid_frenet_exit_len_m
+        step = self.avoid_offset_step_m
+        span = max(step, m.total_length_m - max(0.0, ds_now) + tail)
+        n = int(span / step)
+        lim = self.maneuver_cfg.max_offset_m
+        for k in range(n + 1):
+            ds = max(0.0, ds_now) + k * step
+            d = max(-lim, min(lim, m.d_at(ds)))
+            x_ref, y_ref, yaw_ref = self._xy_yaw_at_s(self._maneuver_s0 + ds)
+            self._append_pose(
+                out, x_ref - d * math.sin(yaw_ref), y_ref + d * math.cos(yaw_ref)
+            )
+        if len(out.poses) < 2:
+            return None
+        return out
 
     def _build_avoid_path_frenet(
         self, current: PoseStamped, fgm_x: float, fgm_y: float
@@ -2468,6 +3709,48 @@ class LocalPlannerNode(Node):
 
         return out
 
+    def _emit_avoid_path(
+        self, out: Path, current: PoseStamped, *, planned: bool = False
+    ) -> None:
+        """회피 경로 발행 + override 게이트. 계획 기동과 FGM 폴백이 공유한다."""
+        if len(out.poses) < 2:
+            self._publish_override_gate(False)
+            return
+        self._set_path_planned(planned)
+
+        base_path = (
+            self._build_sliding_path(
+                current.pose.position.x, current.pose.position.y
+            )
+            if self._need_sliding_for_debug
+            else None
+        )
+        if base_path is not None and len(base_path.poses) >= 2:
+            self._publish_local_path_bundle(out, base_path)
+        else:
+            self.pub_path.publish(out)
+            if self.pub_sent_dbg is not None:
+                self.pub_sent_dbg.publish(self._stamp_copy_of_path(out))
+        self._publish_override_gate(True)
+
+        now_ns = self.get_clock().now().nanoseconds
+        if self.verbose_logs and now_ns - self._last_latency_log_ns > 500_000_000:
+            obs_ms = (
+                (now_ns - self._last_obs_recv_ns) / 1e6
+                if self._last_obs_recv_ns > 0
+                else float("nan")
+            )
+            fgm_ms = (
+                (now_ns - self._last_fgm_recv_ns) / 1e6
+                if self._last_fgm_recv_ns > 0
+                else float("nan")
+            )
+            self.get_logger().info(
+                f"[latency] obs->planner_out={obs_ms:.1f}ms, "
+                f"fgm->planner_out={fgm_ms:.1f}ms"
+            )
+            self._last_latency_log_ns = now_ns
+
     def _maybe_log_speed_status(
         self,
         d_static: float,
@@ -2516,7 +3799,13 @@ class LocalPlannerNode(Node):
             and d_dyn_gate <= fgm_m
         )
         approaching = static_approaching or dynamic_approaching
-        enable = self.use_fgm and (self.mode == "AVOID" or approaching)
+        # REJOIN 도 켜 둔다. 연속 장애물 구간에서 하나를 피하고 복귀하는 도중
+        # 다음 게 나타나면 즉시 AVOID 로 돌아가는데(디바운스 없음), 그때
+        # FGM 이 꺼져 있었으면 목표점이 오래된 값이라 한두 프레임을 헛돈다.
+        # 켜 두면 복귀 중에도 갭이 계속 갱신돼 곧바로 이어서 회피한다.
+        enable = self.use_fgm and (
+            self.mode in ("AVOID", "REJOIN") or approaching
+        )
         msg = Bool()
         msg.data = bool(enable)
         self.pub_fgm_enable.publish(msg)
@@ -2552,6 +3841,9 @@ class LocalPlannerNode(Node):
         )
         self._update_frenet_snapshot(current, filtered, filtered_dynamic, tf_lm)
         self._publish_frenet_debug()
+        # 기동 진행도는 주기당 한 번만 전진시킨다. 아래 모드판정·속도·경로가
+        # 모두 이 캐시를 읽는다 (여러 번 부르면 증분이 중복 누적된다).
+        self._advance_maneuver_ds(current)
 
         self._update_mode(
             d_closest,
@@ -2563,9 +3855,21 @@ class LocalPlannerNode(Node):
             d_dyn_gate,
             rel_speed,
         )
+        # 속도 정책보다 **먼저** 기동을 세운다. 속도는 계획을 보고 "비켜
+        # 지나갈 거니까 정지거리 제동은 필요 없다" 를 판단하는데, 계획이 한
+        # 주기 늦게 서면 AVOID 로 넘어가는 순간마다 속도가 한 번 꺼졌다 켜진다.
+        # 아래 AVOID 분기는 이걸 그대로 재사용한다(유지 조건에 걸려 재계산 없음).
+        if (
+            self.mode == "AVOID"
+            and self.avoid_path_mode == "offset"
+            and current is not None
+        ):
+            self._plan_or_keep_maneuver(current)
+
         self._publish_planner_speed_out()
         self.pub_planner_mode.publish(String(data=self.mode))
         self._publish_fgm_enable(filtered, d_gate, filtered_dynamic, d_dyn_gate)
+        self._update_escape_heading(current)
         self._maybe_log_speed_status(
             d_closest, d_dyn_closest, obs_speed, rel_speed
         )
@@ -2591,8 +3895,47 @@ class LocalPlannerNode(Node):
             # 탈출 중에는 이 게이트를 건너뛴다. 여기서 걸러 버리면 정면에 멈춰
             # 선 상황에서 경로가 안 나와 빠져나갈 방법이 없다.
             if not escaping and not static_path and not dynamic_path:
+                # 회피 경로는 더 필요 없지만, 아직 AVOID 해제 디바운스
+                # (avoid_off_count_th) 가 안 끝났을 수 있다. 그 몇 주기 동안
+                # override 를 내려 버리면 라인에서 벗어난 만큼 조향이 튄다.
+                # 재합류 경로로 이어 붙여 기준경로가 연속이도록 한다.
+                if self._publish_rejoin_bridge(current):
+                    return
                 self._publish_override_gate(False)
                 return
+
+            # 1순위: 미리 계획한 횡오프셋 기동. FGM 조준각과 무관하게
+            # 장애물 기하와 속도만으로 나오므로 고속에서도 조향이 완만하다.
+            if self.avoid_path_mode == "offset" and current is not None:
+                # 플래너는 장애물만 보고 트랙 경계는 모른다. 벽 쪽으로 비키는
+                # 계획이 나오면 충돌검사에 걸리므로, 그 방향을 막고 반대쪽으로
+                # 한 번 더 뽑는다.
+                blocked_side = 0
+                for _attempt in (1, 2):
+                    if not self._plan_or_keep_maneuver(
+                        current, forbid_side=blocked_side
+                    ):
+                        break
+                    out = self._build_offset_path(current)
+                    if out is None:
+                        break
+                    # 계획 기동은 **통째로** 통과해야 쓴다. 잘라서 쓰면 안 된다.
+                    #
+                    # FGM 경로는 조준점까지의 직선이라 앞부분만 살려도 의미가
+                    # 있지만, 기동은 진입-유지-복귀가 한 덩어리다. 벽에 걸려
+                    # 복귀가 잘려 나간 걸 "쓸 만한 길이가 남았다" 며 받으면,
+                    # 차는 진입만 타고 최대 오프셋에 도달한다 — 그 지점이 바로
+                    # 잘려 나간 벽이다. 반대편으로 다시 뽑는 게 맞다.
+                    if self._path_fully_clear(out, tf_lm):
+                        self._clear_avoid_blocked()
+                        self._emit_avoid_path(out, current, planned=True)
+                        return
+                    blocked_side = self._maneuver.side if self._maneuver else 0
+                    self._clear_maneuver()
+                    if blocked_side == 0:
+                        break
+                # 양쪽 다 막혔다 — 계획을 버리고 FGM 폴백으로 넘긴다.
+                self._clear_maneuver()
 
             fgm_xy = self._get_fgm_target_in_map()
             if current is None or fgm_xy is None:
@@ -2629,47 +3972,16 @@ class LocalPlannerNode(Node):
                 self._publish_override_gate(False)
                 return
             self._clear_avoid_blocked()
-
-            if len(out.poses) >= 2:
-                base_path = (
-                    self._build_sliding_path(
-                        current.pose.position.x, current.pose.position.y
-                    )
-                    if self._need_sliding_for_debug
-                    else None
-                )
-                if base_path is not None and len(base_path.poses) >= 2:
-                    self._publish_local_path_bundle(out, base_path)
-                else:
-                    self.pub_path.publish(out)
-                    if self.pub_sent_dbg is not None:
-                        self.pub_sent_dbg.publish(self._stamp_copy_of_path(out))
-                self._publish_override_gate(True)
-                now_ns = self.get_clock().now().nanoseconds
-                if (
-                    self.verbose_logs
-                    and now_ns - self._last_latency_log_ns > 500_000_000
-                ):
-                    obs_ms = (
-                        (now_ns - self._last_obs_recv_ns) / 1e6
-                        if self._last_obs_recv_ns > 0
-                        else float("nan")
-                    )
-                    fgm_ms = (
-                        (now_ns - self._last_fgm_recv_ns) / 1e6
-                        if self._last_fgm_recv_ns > 0
-                        else float("nan")
-                    )
-                    self.get_logger().info(
-                        f"[latency] obs->planner_out={obs_ms:.1f}ms, "
-                        f"fgm->planner_out={fgm_ms:.1f}ms"
-                    )
-                    self._last_latency_log_ns = now_ns
-            else:
-                self._publish_override_gate(False)
+            self._emit_avoid_path(out, current)
             return
 
         if self.mode == "REJOIN":
+            # 경로를 진입 시 한 번만 만들고 계속 재발행하면, 차가 나아간
+            # 만큼 과거 위치에 앵커된 경로를 쫓게 된다. 일정 거리마다
+            # 현재 위치에서 다시 그린다.
+            if current is not None:
+                self._refresh_rejoin_path(current)
+
             if (
                 self._rejoin_path_msg is not None
                 and len(self._rejoin_path_msg.poses) >= 2
@@ -2680,6 +3992,10 @@ class LocalPlannerNode(Node):
                     self.pub_sent_dbg.publish(
                         self._stamp_copy_of_path(self._rejoin_path_msg)
                     )
+                # 재합류 경로도 quintic 이라 곡률은 실제 값이지만, 여기 게인은
+                # FF 가 꺼진 상태에서 맞춰 둔 것이다. 켜려면 따로 재튜닝해야
+                # 하고 REJOIN 은 이제 AEB 탈출 뒤처리 정도로만 남는다.
+                self._set_path_planned(False)
                 self._publish_override_gate(True)
             else:
                 self._publish_override_gate(False)

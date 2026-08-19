@@ -28,7 +28,7 @@ DEFAULT_TRACK = "raceline"
 # 개별 노드에 값을 박지 말고 반드시 여기 하나만 고친다.
 # 값이 틀리면 stanley 기동 직후 hdg_err 가 ~180° 로 뜬다.
 # ============================================================
-DEFAULT_REVERSE_TRACK = True
+DEFAULT_REVERSE_TRACK = False
 
 _TRACK_FILES = {
     "raceline": ("raceline.csv",),

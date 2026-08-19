@@ -86,7 +86,7 @@ UNKNOWN_OCC = 1.0 - 205.0 / 255.0
 
 CFG = {
     # maps/ 아래 yaml 파일명만 (절대경로 넣어도 됨)
-    "map_name": "cartographer_map_20260817_003202.yaml",
+    "map_name": "cartographer_map_20260820_014643_rosmap.yaml",
     "map_dir": _DEFAULT_MAP_DIR,
     "out_csv": os.path.join(_SCRIPT_DIR, "..", "config", "centerline.csv"),
 }
@@ -375,6 +375,25 @@ def bilinear_sample(field: np.ndarray, rows, cols):
         + field[r0, c0 + 1] * (1 - fr) * fc
         + field[r0 + 1, c0 + 1] * fr * fc
     )
+
+
+def signed_area_world(world) -> float:
+    """월드 xy 폐곡선의 부호면적 [m²]. 양수 = 반시계(CCW)."""
+    w = np.asarray(world, dtype=float)
+    x, y = w[:, 0], w[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def enforce_direction(centerline, direction, height, resolution, ox, oy):
+    """월드 진행방향이 `direction` 이 되도록 픽셀 폐루프의 순서를 맞춘다."""
+    world = [pixel_to_world(r, c, height, resolution, ox, oy) for r, c in centerline]
+    area = signed_area_world(world)
+    want_ccw = direction == "ccw"
+    if (area > 0.0) == want_ccw:
+        print(f"  direction={direction} (부호면적 {area:+.1f} m², 그대로)")
+        return centerline
+    print(f"  direction={direction} (부호면적 {area:+.1f} m² → 순서 뒤집음)")
+    return np.asarray(centerline)[::-1].copy()
 
 
 def resample_closed(points, step: float) -> np.ndarray:
@@ -680,6 +699,13 @@ def main() -> int:
         "--smooth-iters", type=int, default=120, help="리지 스무딩 반복 횟수"
     )
     parser.add_argument(
+        "--direction",
+        choices=("ccw", "cw"),
+        default="ccw",
+        help="주행 진행방향(월드 xy 기준 회전방향). 스켈레톤 사이클은 방향이 "
+        "임의로 나오므로 여기서 강제한다",
+    )
+    parser.add_argument(
         "--min-radius-m",
         type=float,
         default=0.9,
@@ -740,6 +766,11 @@ def main() -> int:
     if wall_x or self_ix:
         print("WARNING: 경로가 벽을 지나거나 자기교차합니다.", file=sys.stderr)
 
+    # 스켈레톤 폐루프는 어느 쪽으로 감기는지가 시드 노드와 인접리스트 순서에
+    # 달려 있어서, 같은 트랙을 다시 뽑아도 방향이 뒤집힐 수 있다. 뒤집히면
+    # 경로추종이 헤딩오차 180° 를 보고 즉시 풀락을 때린다. 여기서 못 박는다.
+    # 속도 프로파일보다 먼저 뒤집어야 감속/가속 패스가 진행방향에 맞는다.
+    centerline = enforce_direction(centerline, args.direction, height, resolution, ox, oy)
     world = [
         pixel_to_world(r, c, height, resolution, ox, oy) for r, c in centerline
     ]

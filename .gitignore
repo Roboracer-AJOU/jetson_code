@@ -10,3 +10,13 @@ __pycache__/
 # Runtime logs
 .runlogs/
 maps/.roslog/
+logs/
+lap_debug*.csv
+
+# 롤백 스냅샷 — 로컬 작업본이다. 되돌릴 상태는 커밋 자체가 기록이므로
+# 이걸 밀어 넣으면 같은 코드를 두 번 담게 된다 (수십 MB).
+.rollback/
+.before_restore_*.tar.gz
+
+# 임시 디버깅 스크립트. 남길 만한 게 생기면 scripts/ 나 tools/ 로 옮긴다.
+tmp_*.py

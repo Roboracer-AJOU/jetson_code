@@ -37,6 +37,11 @@ class _Tracker:
         self._kf_sigma_accel = 3.0
         self._kf_sigma_meas = 0.06
         self._kf_gate_m2 = 0.0
+        # M-of-N 확정 게이트. 기존 테스트는 추적 자체를 보는 것이므로
+        # min_hits=1 로 두어 예전과 동일하게(첫 관측 즉시 확정) 동작시킨다.
+        self.confirm_window_frames = 6
+        self.confirm_min_hits = 1
+        self._noise_rejected = 0
         self._tracks: list[Track] = []
         self._next_id = 0
 
@@ -293,3 +298,64 @@ def test_stale_tracks_are_dropped():
     for _ in range(10):  # 0.25 s > track_keep_time_s(0.12)
         trk._update_tracks([], DT)
     assert trk._tracks == []
+
+
+# ---- M-of-N 노이즈 게이트가 추적 루프에 실제로 물렸는지 ----
+
+
+def _gated(min_hits=4, window=6):
+    trk = _Tracker(mode="ema")
+    trk.confirm_window_frames = window
+    trk.confirm_min_hits = min_hits
+    return trk
+
+
+def test_persistent_obstacle_gets_confirmed_in_tracker():
+    """매 프레임 잡히는 장애물은 min_hits 프레임 만에 확정된다."""
+    trk = _gated()
+    for i in range(6):
+        trk._update_tracks([_det(2.0 - 0.1 * i, 0.0, 8.0, 4.0)], DT)
+        if i < 3:
+            assert not trk._tracks[0].hits.confirmed, f"{i}프레임에 조기 확정"
+        else:
+            assert trk._tracks[0].hits.confirmed, f"{i}프레임에 확정 실패"
+
+
+def test_flickering_noise_never_confirmed_in_tracker():
+    """4프레임에 한 번 깜빡이는 노이즈는 트랙이 살아도 확정되지 않는다.
+
+    예전 로직은 age_s 가 미검출에서 줄지 않아 이 패턴이 결국 확정됐다.
+    """
+    trk = _gated()
+    for _ in range(30):
+        trk._update_tracks([_det(3.0, 0.0, 8.0, 4.0)], DT)  # hit
+        for _ in range(3):
+            trk._update_tracks([], DT)                      # miss x3
+        for t in trk._tracks:
+            assert not t.hits.confirmed, "깜빡이는 노이즈가 확정됐다"
+    # 미검출 0.075s 는 track_keep_time_s(0.12) 보다 짧아 트랙 자체는 계속
+    # 살아있다. 발행이 안 될 뿐이다. 노이즈가 멎어야 비로소 죽고 집계된다.
+    for _ in range(10):
+        trk._update_tracks([], DT)
+    assert trk._tracks == []
+    assert trk._noise_rejected > 0, "노이즈 기각이 집계되지 않았다"
+
+
+def test_single_frame_noise_counted_as_rejected():
+    trk = _gated()
+    trk._update_tracks([_det(3.0, 0.0, 8.0, 4.0)], DT)
+    for _ in range(10):
+        trk._update_tracks([], DT)
+    assert trk._tracks == []
+    assert trk._noise_rejected == 1
+
+
+def test_confirmed_track_not_counted_as_noise():
+    """확정까지 간 실제 장애물은 사라져도 노이즈로 집계되면 안 된다."""
+    trk = _gated()
+    for _ in range(6):
+        trk._update_tracks([_det(3.0, 0.0, 8.0, 4.0)], DT)
+    for _ in range(10):
+        trk._update_tracks([], DT)
+    assert trk._tracks == []
+    assert trk._noise_rejected == 0

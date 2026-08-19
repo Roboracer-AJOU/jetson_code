@@ -41,12 +41,21 @@ class _Stub:
         self._escape_count = 0
         self._speed = 0.0
         self._log = _Log()
+        # 시간 초과 분기가 후진 탈출을 부른다. 뒤가 막힌 것으로 두면 이
+        # 파일의 관심사(전진 탈출 창)만 남는다 — 후진은 별도 파일에서 본다.
+        self.reverse_enable = kw.get("reverse_enable", False)
+        self.reverse_min_clearance = 0.60
+        self._reverse_until = 0.0
 
     def get_logger(self):
         return self._log
 
+    def _rear_clearance(self) -> float:
+        return 0.0
+
     open_window = EmergencyBrakeNode._open_escape_window
     update = EmergencyBrakeNode._update_escape_window
+    _maybe_start_reverse = EmergencyBrakeNode._maybe_start_reverse
 
 
 def test_regression_retrigger_loop_without_escape():
