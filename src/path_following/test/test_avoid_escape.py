@@ -51,6 +51,8 @@ class _Stub:
         self._log = _Log()
         self.avoid_retry_ns = int(kw.get("retry_sec", 0.5) * 1e9)
         self._avoid_blocked_until_ns = 0
+        self.avoid_blocked_frames_th = kw.get("blocked_frames_th", 5)
+        self._avoid_blocked_frames = 0
         self.aeb_escape_enable = kw.get("escape_enable", True)
         self.aeb_escape_arm_speed = kw.get("arm_speed", 0.20)
         self.aeb_escape_hold_ns = int(kw.get("hold_sec", 2.0) * 1e9)

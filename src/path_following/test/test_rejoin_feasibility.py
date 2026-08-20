@@ -270,6 +270,8 @@ class _Corner:
     _build_curvature = LocalPlannerNode._build_curvature
     _kappa_at_s = LocalPlannerNode._kappa_at_s
     _rejoin_path_curvature = LocalPlannerNode._rejoin_path_curvature
+    _rejoin_line_crossing_m = LocalPlannerNode._rejoin_line_crossing_m
+    _rejoin_crossing_cap_m = LocalPlannerNode._rejoin_crossing_cap_m
     _plan_rejoin = LocalPlannerNode._plan_rejoin
     _rejoin_length_for = LocalPlannerNode._rejoin_length_for
     _rejoin_heading_limit_rad = LocalPlannerNode._rejoin_heading_limit_rad

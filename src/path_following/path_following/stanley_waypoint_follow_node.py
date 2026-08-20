@@ -108,7 +108,7 @@ CFG = {
     "steer_scale_calibrated": True,
     "steering_smooth_alpha": 0.45,
     "wheelbase": vg.WHEELBASE_M,
-    "stanley_k": 0.5,
+    "stanley_k": 0.8,
     "stanley_softening": 0.12,
     # Stanley heading 항 배율. 원래 정의는 1.0 (heading_error 를 그대로 조향에
     # 더한다). 스케일 보정이 켜지면 여기에도 같은 비율이 곱해진다.
@@ -119,6 +119,27 @@ CFG = {
     # 약해지는 역효과. 하한 도달점을 p95 부근(0.375 m)으로 옮긴다.
     "stanley_heading_cte_blend_m": 0.45,
     "stanley_heading_min_weight": 0.15,
+    # 위 억제를 **고속에서는 풀어 준다.**
+    #
+    # Stanley 에서 헤딩항은 오버슈트를 만드는 항이 아니라 막는 항이다.
+    # δ = θ_e + atan(k·e/v) 에서 θ_e 가 있어야 오차 동역학이 1차(ė = −k·e)가
+    # 되어 라인을 안 넘는다. 그걸 깎으면 2차 무감쇠계가 되어 지나친다.
+    # oppose_only_blend 가 켜진 지금, 억제가 걸리는 경우는 정확히 "헤딩항이
+    # 복귀를 되받는 중" 뿐이다 — 즉 남은 억제는 감쇠만 골라서 깎고 있다.
+    #
+    # 폐루프 시뮬(실제 _stanley_control + 접지력 6 m/s², d0=0.5 m 에서 라인
+    # 쪽으로 각을 물고 도착):
+    #
+    #   도착각   v=5      v=6      v=7      | min_w=1.0 일 때 v=7
+    #    15°    0.000    0.000    0.000    |  0.000
+    #    20°    0.000    0.006    0.102    |  0.000
+    #    25°    0.033    0.155    0.336    |  0.263
+    #
+    # 저속에서는 넘지도 않고, 20260816 실측 튜닝이 2.5~3 m/s 구간에서 나온
+    # 값이라 그대로 둔다. 오버슈트가 실제로 생기는 6~7 m/s 에서만 1.0 으로
+    # 올린다. 두 속도 사이는 선형보간. lo ≥ hi 로 두면 스케줄이 꺼진다.
+    "stanley_heading_weight_speed_lo": 4.0,   # 이 아래는 min_weight 그대로
+    "stanley_heading_weight_speed_hi": 6.0,   # 이 위는 억제 없음(가중치 1.0)
     # 위 억제를 "헤딩항이 CTE 복귀와 반대로 밀 때" 로만 한정한다.
     #
     # 억제의 원래 목적은 경로로 되돌아오는 중에 헤딩항이 복귀를 되받아쳐
@@ -135,7 +156,7 @@ CFG = {
     # heading_gain 은 "경로 헤딩 오차 → 조향" 배율. FGM 각도가 이미 필요한
     # 회피량을 담고 있어서 1.0 을 넘기면 목표점을 지나쳐 과회피가 된다.
     # 목표점 추종(pure pursuit) 등가 게인은 2L/Ld ≈ 0.7 수준.
-    "local_path_stanley_k": 0.5,
+    "local_path_stanley_k": 0.8,
     "local_path_heading_gain": 0.8,
     "local_path_cte_speed_cap_mps": 1.2,  # 고속에서 cte_term 약화 방지
     "local_path_lookahead_m": 0.70,      # heading 기준을 앞쪽 경로로
@@ -182,7 +203,7 @@ CFG = {
     # 문제 구간인 3~5 m/s 에서 실각 0.98 로 운동학적 정확값에 맞춘다.
     "ff_gain_schedule_enable": True,  # 이전 기본값 False (고정 ff_gain 1.3)
     "ff_gain_speed_bp": [1.0, 3.0, 5.0, 7.0, 10.0],
-    "ff_gain_bp": [2.3, 2.5, 3.0, 3.3, 3.5],
+    "ff_gain_bp": [2.3, 2.5, 3.0, 3.5, 3.8],
     "ff_sign": 1.0,              # 좌우 반대면 -1.0
     "ff_lookahead_m": 0.8,       # best_i 기준 앞쪽 평균 곡률 구간 [m]
     "ff_kappa_clip": 2.5,        # |κ| 상한 [1/m] (스파이크 방지)
@@ -416,6 +437,12 @@ class StanleyWaypointFollowNode(Node):
         )
         self.stanley_heading_oppose_only_blend = param_bool(
             self.get_parameter("stanley_heading_oppose_only_blend").value
+        )
+        self.stanley_heading_weight_speed_lo = max(
+            0.0, float(self.get_parameter("stanley_heading_weight_speed_lo").value)
+        )
+        self.stanley_heading_weight_speed_hi = max(
+            0.0, float(self.get_parameter("stanley_heading_weight_speed_hi").value)
         )
         self.local_path_stanley_k = (
             max(0.05, float(self.get_parameter("local_path_stanley_k").value)) * g
@@ -958,7 +985,7 @@ class StanleyWaypointFollowNode(Node):
                 hdg_w = 1.0
             else:
                 hdg_w = max(
-                    self.stanley_heading_min_weight,
+                    self._heading_min_weight_at(speed),
                     1.0 - abs(cte) / self.stanley_heading_cte_blend_m,
                 )
             heading_term = hdg_w * heading_raw
@@ -1401,6 +1428,24 @@ class StanleyWaypointFollowNode(Node):
             if v <= vs[i]:
                 return gs[i - 1] + slopes[i - 1] * (v - vs[i - 1])
         return gs[-1]
+
+    def _heading_min_weight_at(self, speed: float) -> float:
+        """헤딩항 억제의 하한. 고속으로 갈수록 1.0 (억제 없음) 에 붙는다.
+
+        헤딩항은 복귀 감쇠다. 저속에서는 깎아도 안 넘지만, 고속에서는 그게
+        그대로 라인 넘김이 된다. 근거 수치는 CFG 주석 참고.
+        """
+        lo = self.stanley_heading_weight_speed_lo
+        hi = self.stanley_heading_weight_speed_hi
+        base = self.stanley_heading_min_weight
+        if hi <= lo:
+            return base
+        v = abs(speed)
+        if v <= lo:
+            return base
+        if v >= hi:
+            return 1.0
+        return base + (1.0 - base) * (v - lo) / (hi - lo)
 
     def _lookahead_curvature(
         self, path: List[Tuple[float, float]], nearest_idx: int

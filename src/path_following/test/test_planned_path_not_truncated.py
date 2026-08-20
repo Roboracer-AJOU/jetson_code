@@ -47,20 +47,54 @@ class _Checker:
 
     _path_fully_clear = LocalPlannerNode._path_fully_clear
     _truncate_path_at_collision = LocalPlannerNode._truncate_path_at_collision
+    _wall_stop_distance_m = LocalPlannerNode._wall_stop_distance_m
 
-    def __init__(self):
+    def __init__(self, speed_mps: float = 0.0):
         self._inflated_map = InflatedMap(_Grid(), inflation_m=0.15)
         self.path_check_enable = True
         self.path_check_backoff_m = 0.0
         self.path_check_min_length_m = 0.6
         self._last_path_cut = 0
         self._map_warned = True
+        self._ego_speed_mps = speed_mps
+        self.wall_stop_check_enable = True
+        self.wall_stop_reaction_sec = 0.15
+        self.avoid_speed_params = SimpleNamespace(a_brake=3.0)
 
     def _obstacle_disks_map(self, _tf):
         return []
 
     def get_logger(self):
         return SimpleNamespace(warn=lambda *a, **k: None)
+
+
+def test_a_short_wallward_path_is_fine_when_crawling():
+    """저속에서는 짧은 경로도 받는다 — 서면 그만이다."""
+    c = _Checker(speed_mps=0.5)
+    assert c._wall_stop_distance_m() < 0.2
+
+
+def test_the_same_path_is_refused_at_racing_speed():
+    """레이스라인이 벽에 붙은 구간에서 FGM 이 바깥 갭을 고르는 그 상황."""
+    assert _Checker(speed_mps=6.0)._wall_stop_distance_m() > 6.0
+
+
+def test_the_requirement_grows_with_speed():
+    seq = [_Checker(speed_mps=v)._wall_stop_distance_m() for v in (0, 2, 3, 4, 6, 7)]
+    assert seq == sorted(seq)
+
+
+def test_it_is_the_distance_we_actually_need_to_stop():
+    """되짚어 계산: 반응거리 + v²/2a."""
+    v, a, t = 5.0, 3.0, 0.15
+    got = _Checker(speed_mps=v)._wall_stop_distance_m()
+    assert got == pytest.approx(v * t + v * v / (2.0 * a))
+
+
+def test_turning_the_check_off_restores_the_old_rule():
+    c = _Checker(speed_mps=7.0)
+    c.wall_stop_check_enable = False
+    assert c._wall_stop_distance_m() == 0.0
 
 
 def _path(x0, x1, step=0.1, y=2.5):

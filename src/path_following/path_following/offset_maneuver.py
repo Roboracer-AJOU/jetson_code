@@ -33,12 +33,27 @@
   1) 남은 거리를 다 써서 최대한 완만하게 만들고,
   2) 그래도 예산을 넘으면 "이 속도까지 줄이면 된다" 는 상한을 같이 돌려준다.
 치우는 대신 속도를 줄이는 쪽이 조향을 크게 넣는 것보다 언제나 안전하다.
+
+지금까지 이 모듈은 기준선을 **직선으로 가정**했다. d'' 만으로 횡가속을 재고
+있었다는 뜻이다. 코너에서는 그게 무너진다 — 기준선 자체가 v²·κ 를 이미 쓰고
+있는데, 그 위에 복귀 곡선의 v²·d'' 를 얹으면 둘이 더해진다.
+
+    a_total ≈ v²·(|κ| + |d''|)
+
+R=6 m 코너를 6 m/s 로 돌면 코너만으로 6.0 m/s² 다. 접지력이 5~6 m/s²
+(IMU 실측: 2.5~2.8 m/s 코너링에서 v·ω 피크 4.84~5.59 에서 이미 밀림) 이므로
+복귀에 쓸 예산이 남아 있지 않다. 그런데 예산 검사는 d'' 만 봐서 통과했고,
+감속도 계획 실패도 안 났다. 차는 조향을 물고 라인을 가로질러 바깥 벽으로 갔다.
+
+그래서 `kappa_ref` 를 받는다. 주면 각 구간의 |κ| 를 예산에서 먼저 빼고
+(남은 것으로 길이를 뽑고), 조향 한계·속도 상한도 |κ|+|d''| 로 판단한다.
+안 주면 예전 그대로 직선 가정이다.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Sequence, Tuple
 
 # quintic d(s) = Δd·(10u³-15u⁴+6u⁵), u=s/L 의 미분 최대값 계수.
 #   |d'|  최대: u=0.5 에서        1.875·Δd/L
@@ -342,6 +357,33 @@ def choose_pass_offset(
 # ----------------------------------------------------------------------
 # 기동 계획
 # ----------------------------------------------------------------------
+#: `kappa_ref` 를 훑는 간격 [m]. 코너 진입을 놓치지 않을 만큼만 촘촘하면 된다.
+_KAPPA_SCAN_STEP_M = 0.25
+
+#: 코너가 예산을 다 먹어도 길이 계산이 0 으로 나눠지지 않게 남겨 두는 바닥.
+#: 여기에 걸렸다는 건 어차피 speed_cap 이 잡는다는 뜻이다.
+_A_BUDGET_FLOOR = 0.30
+
+
+def _kappa_span_max(
+    kappa_ref: Callable[[float], float] | None, s_from: float, s_to: float
+) -> float:
+    """[s_from, s_to] 구간에서 기준선 |κ| 의 최대값."""
+    if kappa_ref is None or s_to <= s_from:
+        return 0.0
+    out = 0.0
+    n = max(2, int((s_to - s_from) / _KAPPA_SCAN_STEP_M) + 1)
+    for i in range(n + 1):
+        s = s_from + (s_to - s_from) * i / n
+        out = max(out, abs(float(kappa_ref(s))))
+    return out
+
+
+def _budget_after_corner(a_budget: float, v: float, kappa: float) -> float:
+    """코너가 이미 쓰고 있는 v²κ 를 뺀 나머지 횡가속 예산."""
+    return max(_A_BUDGET_FLOOR, a_budget - v * v * abs(kappa))
+
+
 def plan_maneuver(
     obstacles: Sequence[ObstacleSD],
     cfg: ManeuverConfig,
@@ -353,6 +395,7 @@ def plan_maneuver(
     forbid_side: int = 0,
     max_left: float | None = None,
     max_right: float | None = None,
+    kappa_ref: Callable[[float], float] | None = None,
 ) -> OffsetManeuver | None:
     """횡오프셋 회피 기동 하나를 계획한다. 못 만들면 None.
 
@@ -361,6 +404,10 @@ def plan_maneuver(
 
     `max_left` / `max_right` 로 방향별 여유를 넘기면 벽 쪽 계획이 아예 안
     나온다. 안 주면 `cfg.max_offset_m` 만 보므로 트랙 경계를 무시한다.
+
+    `kappa_ref(ds)` 는 기동 시작점에서 전방 `ds` 인 지점의 **기준선 곡률**을
+    돌려준다. 주면 코너가 쓰는 v²κ 를 예산에서 먼저 빼고, 조향 한계와 속도
+    상한도 |κ|+|d''| 로 본다. 안 주면 직선 가정(예전 동작)이다.
     """
     group = group_blocking(obstacles, cfg, corridor_d=corridor_d)
     if group is None:
@@ -391,8 +438,12 @@ def plan_maneuver(
     steer_min_in = length_for_steer_limit(
         delta_in, cfg.max_steer_rad, cfg.wheelbase_m
     )
+    # 진입 곡선은 [0, runway] 안 어딘가에 놓인다. 그 구간의 코너가 쓰는 만큼을
+    # 예산에서 먼저 뺀다 — 남은 것으로 길이를 뽑아야 합이 접지력 안에 든다.
+    kappa_in = _kappa_span_max(kappa_ref, 0.0, runway)
+    a_enter = _budget_after_corner(cfg.a_lat_enter_mps2, v_plan, kappa_in)
     need = max(
-        length_for_budget(delta_in, v_plan, cfg.a_lat_enter_mps2),
+        length_for_budget(delta_in, v_plan, a_enter),
         steer_min_in,
         cfg.enter_min_m,
     )
@@ -420,18 +471,31 @@ def plan_maneuver(
 
     hold_end = max(lead + enter_len, group.s_last + cfg.hold_rear_m)
 
-    exit_len = min(
-        max(
-            length_for_budget(d_pass, v_plan, cfg.a_lat_exit_mps2),
-            length_for_steer_limit(d_pass, cfg.max_steer_rad, cfg.wheelbase_m),
-            cfg.exit_min_m,
-        ),
-        cfg.exit_max_m,
+    # 복귀 구간의 코너도 같은 방식으로 뺀다. 길이가 정해져야 구간을 알고,
+    # 구간을 알아야 길이가 정해지는 순환이라 두 번 돌린다 — 처음에는
+    # exit_max_m 까지 넓게 보고, 나온 길이로 한 번 더 좁혀 잡는다.
+    steer_min_out = length_for_steer_limit(
+        d_pass, cfg.max_steer_rad, cfg.wheelbase_m
     )
+    exit_len = cfg.exit_max_m
+    kappa_out = 0.0
+    for _ in range(2):
+        kappa_out = _kappa_span_max(kappa_ref, hold_end, hold_end + exit_len)
+        a_exit = _budget_after_corner(cfg.a_lat_exit_mps2, v_plan, kappa_out)
+        exit_len = min(
+            max(
+                length_for_budget(d_pass, v_plan, a_exit),
+                steer_min_out,
+                cfg.exit_min_m,
+            ),
+            cfg.exit_max_m,
+        )
     exit_coeff = solve_quintic(d_pass, 0.0, 0.0, 0.0, 0.0, 0.0, exit_len)
     peak_out = peak_abs_d2(exit_coeff, exit_len)
 
-    peak_kappa = max(peak_in, peak_out)
+    # 접지력이 보는 건 기준선 곡률과 기동 곡률의 **합**이다. 구간별로 더한 뒤
+    # 그중 최대를 쓴다 — 진입의 d'' 를 복귀 구간 코너에 더하면 없는 부하다.
+    peak_kappa = max(kappa_in + peak_in, kappa_out + peak_out)
     peak_a = v_plan * v_plan * peak_kappa
 
     # 조향 한계를 넘는 경로는 감속해도 못 탄다. 횡가속은 속도로 줄일 수 있지만

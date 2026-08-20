@@ -269,12 +269,25 @@ def test_default_reference_is_straight_ahead():
 
 
 class _Selector:
+    """빔 인덱스 i 를 각도 i·STEP 으로 두고 갭 선택만 돌린다.
+
+    히스테리시스는 인덱스가 아니라 **각도** 로 직전 갭을 기억한다 — FOV 가
+    속도에 따라 변하면 work 배열 인덱스가 다른 각도를 가리키기 때문이다.
+    """
+
+    STEP = 0.01  # rad/bin
+
     def __init__(self, last: int | None = None):
         self.min_gap_bins = 4
         self.hyst_ratio = 0.78
-        self._last_gap_center_idx = last
+        self._last_gap_center_angle = None if last is None else last * self.STEP
 
     select = FGMNode._select_gap
+
+    def pick(self, gaps, max_len, **kw):
+        n = max(int(g[-1]) for g in gaps) + 2
+        angles = np.arange(n, dtype=float) * self.STEP
+        return self.select(gaps, max_len, work_angles=angles, **kw)
 
 
 def _gap(a: int, b: int) -> np.ndarray:
@@ -285,11 +298,11 @@ def test_lock_ignores_the_gap_it_was_following():
     """탈출 중엔 한 번 문 옆 갭에 계속 끌려가면 안 된다."""
     near = _gap(48, 60)
     far = _gap(100, 140)
-    assert _Selector(last=120).select([near, far], 40, aim_idx=50, lock=True) is near
+    assert _Selector(last=120).pick([near, far], 40, aim_idx=50, lock=True) is near
 
 
 def test_without_lock_the_hysteresis_still_wins():
     """평소 주행에서는 갭 튐 방지가 그대로 살아 있어야 한다."""
     near = _gap(48, 60)
     far = _gap(100, 140)
-    assert _Selector(last=120).select([near, far], 40, aim_idx=50) is far
+    assert _Selector(last=120).pick([near, far], 40, aim_idx=50) is far

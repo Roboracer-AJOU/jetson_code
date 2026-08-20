@@ -36,7 +36,7 @@ CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
     # CSV(centerline/raceline)·로컬라이제이션 pbstream·static_obstacle_node 와
     # 반드시 같은 맵이어야 한다. 어긋나면 벽을 장애물로 보거나 그 반대가 된다.
-    "map_name": "cartographer_map_20260820_014643_rosmap.yaml",  # 이전 20260816_211739
+    "map_name": "cartographer_map_20260820_214849_rosmap.yaml",  # 이전 20260816_211739
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",
@@ -53,7 +53,8 @@ CFG = {
     "cluster_gap_threshold_m": 0.28,
     "min_cluster_points": 10,
     "max_obstacle_size_m": 0.85,
-    "min_obstacle_size_m": 0.14,
+    # static_obstacle_node 와 같은 근거로 0.14 → 0.12 (그쪽 주석 참고).
+    "min_obstacle_size_m": 0.12,
     "max_obstacle_range_m": 11.0,
     # 옆벽 잔차 컷. 회피로 비켜나는 동안에도 장애물을 계속 봐야 해서
     # 너무 좁으면 조향 도중 장애물이 사라져 경로가 되감긴다.
@@ -93,7 +94,9 @@ CFG = {
     # ---- [A2] 거리 스케일 최소 점수 ----
     # 10 m 앞 0.3 m 물체는 7점쯤 찍힌다 → 고정 10점에 걸려 통째로 사라진다.
     # floor 를 너무 낮추면 노이즈 3점이 장애물이 되니 [A5] 와 같이 켤 것.
-    "adaptive_min_points": False,
+    # 장애물이 최대 50×50 cm 라 그보다 작은 걸 잡으려면 이게 켜져 있어야 한다
+    # (근거 계산은 static_obstacle_node.py 의 같은 항목 주석 참고).
+    "adaptive_min_points": True,
     "min_cluster_points_floor": 3,
     "min_arc_m": 0.07,
     # ---- [A3] 대표점/반지름 정의 일관화 ----

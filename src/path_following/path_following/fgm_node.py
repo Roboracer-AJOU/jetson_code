@@ -21,10 +21,11 @@ import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from builtin_interfaces.msg import Duration as MsgDuration
 from geometry_msgs.msg import Point, PointStamped
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Float32MultiArray, Float64
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
 
 from path_following import vehicle_geometry as vg
 
@@ -58,7 +59,30 @@ CFG = {
     # 스캔 전처리·갭 (알고리즘)
     # 정면(레이저 +x) 기준 ±fov_half_deg 만 사용. ≤0 이면 스캔 전체.
     # Slamtec 0~360° 스캔도 wrap 후 정면 기준으로 자름.
-    "fov_half_deg": 80.0,
+    "fov_half_deg": 90.0,
+    # 속도가 붙으면 FOV 를 좁힌다 (`_fov_for_speed`).
+    #
+    # FGM 은 갭만 보고 각을 고르므로 저속에서는 45~60° 도 정답이다. 그런데
+    # 그 각은 그대로 요구 조향이 되고, 고속에서는 낼 수 없는 값이라 차가
+    # 못 따라간다. 게다가 `_avoid_target_speed` 의 maneuver 항이 "그 조향을
+    # 낼 수 있는 속도" 로 답하면서 속도까지 깎는다 — 조준각이 클수록 더 선다.
+    #
+    # 그래서 고속에서는 애초에 낼 수 있는 각만 후보로 둔다. 조준거리
+    # L=v·target_lead_time_s 의 점을 향해 도는 데 필요한 횡가속이 순수추종
+    # 기준 a = 2v²·sinψ/L 이므로
+    #
+    #     sin ψ ≤ a·L / (2 v²)
+    #
+    # 이다. a=4.5, L=0.7·v 면 5 m/s 에서 18°, 6 m/s 에서 15°, 7 m/s 에서 13°.
+    #
+    # `fov_narrow_speed` 아래는 손대지 않는다 — 저속 FGM 은 넓은 각이 있어야
+    # 코너나 막힌 곳에서 빠져나온다. 문턱에서 각이 튀면 조준도 같이 튀므로
+    # `fov_narrow_blend` 구간에 걸쳐 서서히 좁힌다.
+    "fov_speed_narrow_enable": True,
+    "fov_narrow_speed": 4.0,
+    "fov_narrow_blend": 1.0,
+    "fov_narrow_a_lat": 4.5,
+    "fov_half_min_deg": 12.0,  # 이보다 좁히지는 않는다
     # 고속에선 멀리까지 봐야 갭이 미리 보임 (목표점 거리보다 넉넉하게)
     # 이 거리 밖은 전부 "뚫린 것" 으로 뭉갠다. 짧으면 멀리 목표를 못 찍어
     # 고속에서 회피가 급해진다 (target_max_m 이 이 안쪽이어야 의미가 있다).
@@ -132,9 +156,12 @@ CFG = {
     # 목표 스무딩: EMA 1단 + 이동 속도 제한 [m/s] (고속일수록 자동 완화)
     "target_smooth_alpha": 0.70,
     "target_max_rate_mps": 3.5,
-    # RViz V자 갭 마커 (주행과 무관, 표시만)
+    # RViz/Foxglove V자 갭 마커 (주행과 무관, 표시만)
     "gap_marker_arm_scale": 1.5,
     "gap_marker_max_arm_m": 2.0,
+    # 맵 OccupancyGrid 가 z=0 평면이라 선을 그 위에 띄운다.
+    # 예전에 토픽은 나가는데 Foxglove 에서만 안 보이던 이유가 이거였다.
+    "gap_marker_z_m": 0.15,
 }
 
 
@@ -209,6 +236,15 @@ class FGMNode(Node):
             if self.publish_gap_marker
             else None
         )
+        # Foxglove Scene 은 MarkerArray 를  Cubes(/visualization_marker_array)
+        # 와 같은 경로로 그린다. 단일 Marker 토픽은 구독은 되는데 안 그리는
+        # 경우가 있어서 둘 다 낸다. 레이아웃에 이미 있는 /fgm_gap_marker 는
+        # 그대로 두고, /fgm_gap_markers 는 장애물 마커와 같은 타입이다.
+        self.gap_markers_pub = (
+            self.create_publisher(MarkerArray, "/fgm_gap_markers", 10)
+            if self.publish_gap_marker
+            else None
+        )
 
         self.preprocess_dist = float(self.get_parameter("scan_max_range_m").value)
         self.bubble_radius = float(self.get_parameter("bubble_radius_m").value)
@@ -237,6 +273,23 @@ class FGMNode(Node):
         self.fov_angle = math.radians(float(self.get_parameter("fov_half_deg").value))
         # ≤0 이면 FOV 크롭 안 함 (스캔 전방향)
         self._use_full_scan_fov = float(self.get_parameter("fov_half_deg").value) <= 0.0
+        self.fov_speed_narrow = _param_bool(
+            self.get_parameter("fov_speed_narrow_enable").value
+        )
+        self.fov_narrow_speed = max(
+            0.0, float(self.get_parameter("fov_narrow_speed").value)
+        )
+        self.fov_narrow_blend = max(
+            0.05, float(self.get_parameter("fov_narrow_blend").value)
+        )
+        self.fov_narrow_a_lat = max(
+            0.3, float(self.get_parameter("fov_narrow_a_lat").value)
+        )
+        self.fov_half_min = math.radians(
+            max(1.0, float(self.get_parameter("fov_half_min_deg").value))
+        )
+        # 이번 스캔에 실제로 쓰는 FOV. `scan_callback` 이 매 프레임 갱신한다.
+        self._fov_rad = self.fov_angle
         self.gap_thr_primary = float(self.get_parameter("gap_threshold_primary_m").value)
         self.gap_thr_fallback = float(self.get_parameter("gap_threshold_fallback_m").value)
         self.target_lead_time_s = max(
@@ -291,10 +344,18 @@ class FGMNode(Node):
         )
         _gmax = float(self.get_parameter("gap_marker_max_arm_m").value)
         self.gap_marker_max_arm_m = _gmax if _gmax > 0.0 else None
+        self.gap_marker_z_m = float(self.get_parameter("gap_marker_z_m").value)
+        self._last_gap_marker: Marker | None = None
+        if self.publish_gap_marker:
+            # 토픽을 노드 켜지는 순간부터 살려 둔다. foxglove_bridge 가
+            # 우리보다 먼저 떠도 채널이 생기고, 배터리 갈고 노드만 다시
+            # 켜도 브릿지가 토픽을 놓치지 않는다.
+            self.create_timer(0.2, self._heartbeat_gap_marker)
+            self._publish_gap_marker_delete()
 
         self.latest_obstacles: list = []
         self.latest_dynamic_obstacles: list = []
-        self._last_gap_center_idx: int | None = None
+        self._last_gap_center_angle: float | None = None
         self._filt_x: float | None = None
         self._filt_y: float | None = None
         self._ego_speed = 0.0
@@ -387,6 +448,27 @@ class FGMNode(Node):
         else:
             self.get_logger().info("탈출 조준 제한 해제 — 정면 기준 복귀")
 
+    def _fov_for_speed(self) -> float:
+        """이번 프레임에 쓸 FOV 반각 [rad].
+
+        고속에서는 낼 수 있는 각만 후보로 둔다 — 자세한 근거는 CFG 주석 참고.
+        `fov_narrow_speed` 아래는 설정값 그대로다.
+        """
+        if self._use_full_scan_fov or not self.fov_speed_narrow:
+            return self.fov_angle
+        v = abs(self._ego_speed)
+        w = (v - self.fov_narrow_speed) / self.fov_narrow_blend
+        w = min(1.0, max(0.0, w))
+        if w <= 0.0:
+            return self.fov_angle
+        lead = max(self.target_min_m, v * self.target_lead_time_s)
+        sin_max = self.fov_narrow_a_lat * lead / (2.0 * v * v)
+        reach = math.asin(min(1.0, max(0.0, sin_max)))
+        narrow = max(self.fov_half_min, min(self.fov_angle, reach))
+        # 섞는 건 sin 이 아니라 각이다 — asin 은 sin→1 근처에서 수직이라
+        # sin 을 섞으면 문턱 바로 위에서 각이 튄다.
+        return self.fov_angle + w * (narrow - self.fov_angle)
+
     def _bubble_now(self) -> float:
         """[A6] 현재 속도에서의 장애물 버블 반경 [m]."""
         if not self.bubble_speed_scale:
@@ -402,7 +484,9 @@ class FGMNode(Node):
         if was and not self._fgm_enabled:
             # 목표 스무딩만 리셋 — 갭 마커/히스테리시스는 유지
             self._reset_fgm_filter_state(keep_gap_hysteresis=True)
-            self._publish_gap_marker_delete()
+            # DELETE 를 내면 Foxglove 가 같은 ns/id 의 다음 ADD 를
+            # 무시하는 경우가 있다. 마지막 V 는 하트비트가 lifetime 으로
+            # 자연스럽게 사라지게 둔다.
 
     def _set_cpu_boost(self, enabled: bool) -> None:
         """FGM enable 시 패스 코어 1순위(nice -20). OFF면 기본(nice 5)으로 복귀."""
@@ -436,19 +520,60 @@ class FGMNode(Node):
 
     def _reset_fgm_filter_state(self, *, keep_gap_hysteresis: bool = False) -> None:
         if not keep_gap_hysteresis:
-            self._last_gap_center_idx = None
+            self._last_gap_center_angle = None
         self._filt_x = self._filt_y = None
 
+    def _fill_marker_pose(self, m: Marker) -> None:
+        # (0,0,0,0) 사원수는 무효. Foxglove Scene 은 이걸 드롭한다.
+        # RViz 는 관대해서, 이쪽에서만 안 보이던 이유가 이거였다.
+        m.pose.orientation.x = 0.0
+        m.pose.orientation.y = 0.0
+        m.pose.orientation.z = 0.0
+        m.pose.orientation.w = 1.0
+        m.frame_locked = True
+        # lifetime=0 = 안 지운다.
+        #
+        # 0.3 초를 줬더니 Foxglove 에서 안 보였다. 만료 판정은 뷰어가 **자기
+        # 시계**로 하는데, 노트북과 젯슨 시계가 어긋나 있으면 도착하자마자
+        # 만료된다 (젯슨은 RTC 배터리가 없어서 잘 어긋난다). 어차피 45 Hz 로
+        # 덮어쓰고, FGM 이 꺼져도 하트비트가 같은 마커를 계속 낸다.
+        m.lifetime = MsgDuration(sec=0, nanosec=0)
+
     def _publish_gap_marker_delete(self) -> None:
-        if self.gap_marker_pub is None:
+        """시작 때 한 번. 토픽을 살려 두는 빈 발행이지 화면에서 지우는 용이 아니다."""
+        if self.gap_marker_pub is None and self.gap_markers_pub is None:
             return
         m = Marker()
         m.header.stamp = self.get_clock().now().to_msg()
         m.header.frame_id = self._laser_frame
         m.ns = "fgm_gap"
         m.id = 0
-        m.action = Marker.DELETE
-        self.gap_marker_pub.publish(m)
+        m.type = Marker.LINE_STRIP
+        m.action = Marker.ADD
+        self._fill_marker_pose(m)
+        m.scale.x = 0.08
+        m.color.a = 0.0
+        if self.gap_marker_pub is not None:
+            self.gap_marker_pub.publish(m)
+        if self.gap_markers_pub is not None:
+            arr = MarkerArray()
+            arr.markers.append(m)
+            self.gap_markers_pub.publish(arr)
+
+    def _heartbeat_gap_marker(self) -> None:
+        """마지막 V 를 다시 내서 토픽·Foxglove 채널을 유지한다."""
+        if self._last_gap_marker is None:
+            return
+        if self.gap_marker_pub is None and self.gap_markers_pub is None:
+            return
+        m = self._last_gap_marker
+        m.header.stamp = self.get_clock().now().to_msg()
+        if self.gap_marker_pub is not None:
+            self.gap_marker_pub.publish(m)
+        if self.gap_markers_pub is not None:
+            arr = MarkerArray()
+            arr.markers.append(m)
+            self.gap_markers_pub.publish(arr)
 
     def _select_gap(
         self,
@@ -456,6 +581,7 @@ class FGMNode(Node):
         max_len: int,
         aim_idx: int | None = None,
         lock: bool = False,
+        work_angles: np.ndarray | None = None,
     ) -> np.ndarray | None:
         """따라갈 갭 하나. `aim_idx` 는 기준 방향에 해당하는 work 인덱스.
 
@@ -465,6 +591,11 @@ class FGMNode(Node):
         방향은 보통 레이스라인이 아니라 트랙 건너편이다. 콘 하나 앞에서
         반대편을 잡으면 그 갭의 가장자리부터가 이미 멀어서, 뒤이은 각도
         선정이 아무리 정면을 선호해도 되돌릴 수 없다.
+
+        직전 갭은 **각도**로 기억한다. work 배열은 FOV 안 빔만 모은 것이라,
+        FOV 가 속도에 따라 변하면 같은 인덱스가 다른 각도를 가리킨다 —
+        인덱스로 비교하면 속도가 흔들릴 때마다 엉뚱한 쪽을 당겨서 좌우로
+        방황한다.
 
         `lock` 이면 직전 갭에 붙는 히스테리시스를 건너뛴다. AEB 탈출처럼
         기준 방향이 따로 주어진 상황에서는 한 번 옆 갭을 물면 계속 그쪽으로
@@ -487,13 +618,20 @@ class FGMNode(Node):
                 return 0
             return lo - idx if idx < lo else idx - hi
 
-        if self._last_gap_center_idx is not None and not lock:
+        if (
+            self._last_gap_center_angle is not None
+            and work_angles is not None
+            and not lock
+        ):
             candidates = [g for g in wide if len(g) >= thresh_len]
             if not candidates:
                 candidates = wide
+            last = self._last_gap_center_angle
             return min(
                 candidates,
-                key=lambda g: abs(center_idx(g) - self._last_gap_center_idx),
+                key=lambda g: abs(
+                    _wrap_pi(float(work_angles[center_idx(g)]) - last)
+                ),
             )
 
         if aim_idx is not None:
@@ -655,6 +793,8 @@ class FGMNode(Node):
                 dt = d
         self._last_scan_ns = now_ns
 
+        self._fov_rad = self._fov_for_speed()
+
         ranges = np.array(scan_msg.ranges, dtype=np.float64)
         ranges = np.where(np.isinf(ranges), self.preprocess_dist, ranges)
         ranges = np.where(np.isnan(ranges), 0.0, ranges)
@@ -735,7 +875,9 @@ class FGMNode(Node):
         self.min_gap_bins = max(2, int(self.min_gap_width_rad / abs(angle_inc)))
         max_len = max(len(g) for g in gaps)
         aim_idx = int(np.argmin(np.abs(_wrap_pi_np(work_angles - aim_ref))))
-        chosen = self._select_gap(gaps, max_len, aim_idx, lock=prefer is not None)
+        chosen = self._select_gap(
+            gaps, max_len, aim_idx, lock=prefer is not None, work_angles=work_angles
+        )
         if chosen is None or len(chosen) == 0:
             return
 
@@ -743,7 +885,7 @@ class FGMNode(Node):
         center_work = int(chosen[len(chosen) // 2])
         gap_start_orig = int(sorted_orig[int(chosen[0])])
         gap_end_orig = int(sorted_orig[int(chosen[-1])])
-        self._last_gap_center_idx = center_work
+        self._last_gap_center_angle = float(work_angles[center_work])
 
         gap_start_angle = float(wrapped[gap_start_orig])
         gap_end_angle = float(wrapped[gap_end_orig])
@@ -788,6 +930,12 @@ class FGMNode(Node):
             lo = hi = 0.5 * (lo + hi)
         if prefer is not None:
             lo, hi = self._clamp_to_cone(lo, hi, aim_ref, prefer[1])
+        # 속도 제한은 **여기서만** 건다. 스캔을 좁히면 갭 탐색이 눈을 잃어서,
+        # 정작 넓게 열린 쪽이 시야 밖이면 반대쪽 좁은 갭을 고른다 — 그게
+        # 좌우로 방황하다 장애물 앞에 서는 동작이다. 갭은 넓게 보고, 그쪽으로
+        # 트는 각만 낼 수 있는 만큼으로 줄인다.
+        if self._fov_rad < self.fov_angle:
+            lo, hi = self._clamp_to_cone(lo, hi, 0.0, self._fov_rad)
         eff_angle = min(hi, max(lo, aim_ref))
 
         # 목표점을 속도에 비례해 앞으로: 고속에서 0.5 m 앞은 조향이 즉시 되감긴다
@@ -842,25 +990,28 @@ class FGMNode(Node):
         stamp_msg,
     ) -> None:
         """선택 갭 양끝 V자 (정면 기준 wrap 각도)."""
-        if self.gap_marker_pub is None:
+        if self.gap_marker_pub is None and self.gap_markers_pub is None:
             return
         marker = Marker()
         marker.header.stamp = stamp_msg
         marker.header.frame_id = self._laser_frame
         marker.ns = "fgm_gap"
         marker.id = 0
-        marker.type = Marker.LINE_LIST
+        # LINE_LIST 는 Foxglove 일부 버전에서 안 그린다. STRIP 3점이 V.
+        marker.type = Marker.LINE_STRIP
         marker.action = Marker.ADD
-        marker.scale.x = 0.05
+        marker.scale.x = 0.08
         marker.color.r = 1.0
-        marker.color.g = 0.0
+        marker.color.g = 0.15
         marker.color.b = 0.0
         marker.color.a = 1.0
+        self._fill_marker_pose(marker)
 
+        z = float(self.gap_marker_z_m)
         p_origin = Point()
         p_origin.x = 0.0
         p_origin.y = 0.0
-        p_origin.z = 0.0
+        p_origin.z = z
 
         if not self._use_full_scan_fov:
             start_angle = max(-self.fov_angle, min(self.fov_angle, start_angle))
@@ -881,18 +1032,23 @@ class FGMNode(Node):
         p_start = Point()
         p_start.x = float(len_s * math.cos(start_angle))
         p_start.y = float(len_s * math.sin(start_angle))
-        p_start.z = 0.0
+        p_start.z = z
 
         p_end = Point()
         p_end.x = float(len_e * math.cos(end_angle))
         p_end.y = float(len_e * math.sin(end_angle))
-        p_end.z = 0.0
+        p_end.z = z
 
-        marker.points.append(p_origin)
         marker.points.append(p_start)
         marker.points.append(p_origin)
         marker.points.append(p_end)
-        self.gap_marker_pub.publish(marker)
+        self._last_gap_marker = marker
+        if self.gap_marker_pub is not None:
+            self.gap_marker_pub.publish(marker)
+        if self.gap_markers_pub is not None:
+            arr = MarkerArray()
+            arr.markers.append(marker)
+            self.gap_markers_pub.publish(arr)
 
     def publish_gap_marker(
         self,

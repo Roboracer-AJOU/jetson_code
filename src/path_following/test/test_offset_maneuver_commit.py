@@ -66,8 +66,15 @@ class _Node:
     _maneuver_fits_walls = LocalPlannerNode._maneuver_fits_walls
     _WALL_FIT_STEP_M = LocalPlannerNode._WALL_FIT_STEP_M
 
+    def _kappa_at_s(self, s):
+        return 0.0, 0.0
+
     def __init__(self, obstacles_map=(), v=6.0, wall_left=None, wall_right=None):
         self.maneuver_cfg = CFG
+        # 기준선이 직선이라 κ=0 이다. 코너 인식을 켠 채로 두는 게 맞다 —
+        # 이 파일의 기대값이 그대로 통과한다는 것 자체가 "직선에서는 코너
+        # 인식이 아무것도 안 바꾼다" 는 보증이 된다.
+        self.avoid_offset_corner_aware = True
         # 좌/우 오프셋 예산. None 이면 트랙이 무한히 넓다고 본다.
         self.wall_left = wall_left
         self.wall_right = wall_right

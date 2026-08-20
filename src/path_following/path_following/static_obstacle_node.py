@@ -53,7 +53,7 @@ CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
     # integrated_obstacle_node·로컬라이제이션 pbstream·CSV 와 같은 맵이어야 한다.
     # 이전 값은 이틀 전 맵이라 세 곳과 전부 어긋나 있었다.
-    "map_name": "cartographer_map_20260820_014643_rosmap.yaml",  # 이전 20260816_234629
+    "map_name": "cartographer_map_20260820_214849_rosmap.yaml",  # 이전 20260816_234629
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",  # 실차 (시뮬: ego_racecar/laser)
@@ -87,7 +87,22 @@ CFG = {
     "abd_sigma_r_m": 0.02,
     "abd_min_gap_m": 0.05,
     "abd_max_gap_m": 0.35,
-    "adaptive_min_points": False,
+    # 고정 10 점은 먼 데 있는 작은 물체를 통째로 놓친다. 물체 폭 w 가 거리 r
+    # 에서 찍히는 점 수는 w/(r·angle_increment) 이고 실측 increment 가
+    # 0.00421 rad 이라, 10 점을 채우는 한계 거리가 w×23.8 m 다:
+    #
+    #   50 cm → 11.9 m      30 cm → 7.1 m      20 cm → 4.8 m      15 cm → 3.6 m
+    #
+    # 장애물이 최대 50×50 cm 라 그보다 작은 건 4~7 m 에서야 보인다. 6 m/s 면
+    # 충돌 0.8 초 전이고, 회피 게이트를 12 m 로 열어 놔도 소용이 없다.
+    #
+    # 적응형은 점 수 대신 **호 길이** 를 요구한다: min_arc_m/(r·increment) 를
+    # floor 와 min_cluster_points 사이로 자른다. 그러면 먼 거리에서 문턱이
+    # 내려가 20 cm 짜리도 사거리 끝(11 m)까지 잡힌다.
+    #
+    # 3 점짜리 노이즈가 늘어나는 대신, 아래 min_obstacle_size_m(span) 과
+    # M-of-N 확정(6 프레임 중 4)이 걸러 준다. 되돌리려면 False.
+    "adaptive_min_points": True,
     "min_cluster_points_floor": 3,
     "min_arc_m": 0.07,
     "consistent_centroid": False,
@@ -101,7 +116,13 @@ CFG = {
     "near_wall_min_points": 14,
     "near_wall_min_span_m": 0.20,
     "max_obstacle_size_m": 0.85,
-    "min_obstacle_size_m": 0.14,
+    # 측정 span 은 실제 폭보다 빔 간격 하나만큼 짧게 나온다((n-1)·r·increment).
+    # 11 m 에서 간격이 4.6 cm 라, 0.14 게이트는 20 cm 물체를 9.5 m 밖에서
+    # 잘라 버리고 15 cm 는 2.2 m 까지 와야 통과한다. 0.12 로 내리면 20 cm 가
+    # 사거리 끝까지, 15 cm 가 5.9 m 까지 잡힌다.
+    # 벽 잔차는 이 게이트가 아니라 near_wall_min_span_m(0.20) 과 M-of-N 이
+    # 막는다. 유령 장애물이 늘면 여기부터 0.14 로 되돌릴 것.
+    "min_obstacle_size_m": 0.12,
     "max_obstacle_range_m": 11.0,
     "max_obstacle_lateral_m": 1.40,
     # 단발 잔차 깜빡임 완화 — 스캔 Hz와 무관하게 "초" 기준

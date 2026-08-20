@@ -123,37 +123,82 @@ def test_never_leaves_the_verified_gap():
 
 
 class _Selector:
+    """빔 인덱스 i 를 각도 i·STEP 으로 두고 갭 선택만 돌린다.
+
+    히스테리시스는 인덱스가 아니라 **각도** 로 직전 갭을 기억한다 — FOV 가
+    속도에 따라 변하면 work 배열 인덱스가 다른 각도를 가리키기 때문이다.
+    """
+
+    STEP = 0.01  # rad/bin
+
     def __init__(self, min_bins: int = 4, last: int | None = None):
         self.min_gap_bins = min_bins
         self.hyst_ratio = 0.78
-        self._last_gap_center_idx = last
+        self._last_gap_center_angle = None if last is None else last * self.STEP
 
     select = FGMNode._select_gap
+
+    def pick(self, gaps, max_len, **kw):
+        n = max((int(g[-1]) for g in gaps), default=0) + 2
+        angles = np.arange(n, dtype=float) * self.STEP
+        return self.select(gaps, max_len, work_angles=angles, **kw)
 
 
 def _gap(a: int, b: int) -> np.ndarray:
     return np.arange(a, b)
 
 
+def test_regression_the_history_survives_a_changing_fov():
+    """FOV 가 바뀌면 work 인덱스 공간이 통째로 밀린다.
+
+    갭 탐색은 FOV 안 빔만 모아 work 배열을 만든다. 속도에 따라 FOV 가
+    좁아지면 같은 갭이 다른 인덱스에 앉는데, 직전 갭을 **인덱스**로 기억하면
+    그 순간 엉뚱한 쪽이 "가깝다" 고 나온다 — 좌우로 방황하는 원인이었다.
+
+    같은 각도의 갭 두 개를, FOV 가 좁아져 인덱스가 20 밀린 다음 프레임에서
+    다시 고른다. 각도로 기억하면 따라가던 쪽을 그대로 문다.
+    """
+    step = _Selector.STEP
+    # 이전 프레임: 좁은 FOV. 따라가던 갭이 work 인덱스 30 에 있었다.
+    old_idx, shift = 30, 100
+    # 이번 프레임: 감속으로 FOV 가 열려 앞쪽에 빔 100 개가 더 붙었다.
+    # 같은 각도의 그 갭은 이제 인덱스 130 이다.
+    right = _gap(shift + old_idx - 20, shift + old_idx + 21)  # 중심 130
+    left = _gap(40, 81)  # 중심 60 — 옛 인덱스 30 에는 이쪽이 "가깝다"
+    angles = (np.arange(300, dtype=float) - shift) * step
+
+    sel = _Selector()
+    sel._last_gap_center_angle = old_idx * step  # 각도는 안 변한다
+
+    chosen = sel.select([left, right], 41, aim_idx=130, work_angles=angles)
+    assert chosen is right, "각도로 기억하면 따라가던 쪽을 그대로 문다"
+
+    # 옛 방식(인덱스 비교)이었다면 왼쪽으로 튀었다는 것을 같이 박아 둔다.
+    def old_pick(gaps, last_idx):
+        return min(gaps, key=lambda g: abs(int(g[len(g) // 2]) - last_idx))
+
+    assert old_pick([left, right], old_idx) is left
+
+
 def test_picks_gap_nearest_straight_not_the_widest():
     """회귀: 콘 하나 옆의 좁은 통로 대신 트랙 건너편을 잡던 문제."""
     near = _gap(48, 56)     # 정면(50) 을 품는 좁은 갭
     far = _gap(100, 160)    # 훨씬 넓지만 멀리 있는 갭
-    chosen = _Selector().select([near, far], max_len=60, aim_idx=50)
+    chosen = _Selector().pick([near, far], max_len=60, aim_idx=50)
     assert chosen is near, "제일 넓은 갭을 골랐다 (예전 동작)"
 
 
 def test_prefers_wider_gap_when_equally_far_from_straight():
     left = _gap(20, 28)
     right = _gap(72, 92)   # 정면(50) 에서 같은 거리지만 더 넓다
-    chosen = _Selector().select([left, right], max_len=20, aim_idx=50)
+    chosen = _Selector().pick([left, right], max_len=20, aim_idx=50)
     assert chosen is right
 
 
 def test_skips_gaps_too_narrow_to_pass():
     sliver = _gap(49, 51)   # min_gap_bins 미만 — 차가 못 들어간다
     usable = _gap(70, 90)
-    chosen = _Selector(min_bins=4).select([sliver, usable], 20, aim_idx=50)
+    chosen = _Selector(min_bins=4).pick([sliver, usable], 20, aim_idx=50)
     assert chosen is usable
 
 
@@ -161,22 +206,22 @@ def test_hysteresis_still_wins_when_history_exists():
     """이력이 있으면 정면보다 '아까 따라가던 갭' 이 우선 — 갭 튐 방지."""
     near = _gap(48, 60)
     far = _gap(100, 140)
-    chosen = _Selector(last=120).select([near, far], 40, aim_idx=50)
+    chosen = _Selector(last=120).pick([near, far], 40, aim_idx=50)
     assert chosen is far
 
 
 def test_falls_back_to_widest_without_straight_index():
     near = _gap(48, 56)
     far = _gap(100, 160)
-    assert _Selector().select([near, far], 60, aim_idx=None) is far
+    assert _Selector().pick([near, far], 60, aim_idx=None) is far
 
 
 def test_empty_gap_list():
-    assert _Selector().select([], 0, aim_idx=50) is None
+    assert _Selector().pick([], 0, aim_idx=50) is None
 
 
 @pytest.mark.parametrize("idx,expect_near", [(50, True), (130, False)])
 def test_selection_follows_where_straight_is(idx, expect_near):
     near, far = _gap(48, 56), _gap(100, 160)
-    chosen = _Selector().select([near, far], 60, aim_idx=idx)
+    chosen = _Selector().pick([near, far], 60, aim_idx=idx)
     assert (chosen is near) is expect_near

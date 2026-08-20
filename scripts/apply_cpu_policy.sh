@@ -5,6 +5,10 @@
 #   로컬 센서:           CPU 5    — LiDAR/IMU 드라이버. 패스와 공유
 #   패스(경로추종):      CPU 5-7  + nice 우선순위
 #
+# nice 는 데이터가 흐르는 순서대로 준다. 상류가 밀리면 하류가 아무리 빨라도
+# 낡은 값을 처리할 뿐이라, 하류를 올리는 건 지연을 못 줄인다.
+#   control -15 > 센서 -12 > 검출·플래너·FGM -11 > stanley -10 > aeb -8
+#
 # 8코어 전제다. nvpmodel 15W 는 CPU 4-7 을 오프라인으로 내리므로 MAXN 이어야 한다:
 #   sudo nvpmodel -m 0 && sudo jetson_clocks
 # 코어가 4개뿐이면 taskset 이 실패하고 커널 기본 스케줄링으로 돌아간다.
@@ -150,7 +154,9 @@ apply_policy() {
   done < <(pids_matching 'path_following/lib/path_following/control_node|python[0-9.]* control_node\.py')
 
   # FGM enable 중이면 FGM을 패스 코어 1순위 (nice -20). 플래그: /tmp/f1tenth_fgm_boost
-  local fgm_nice=5
+  # 평소 값도 회피 체인과 같은 -11 이다. 예전 5 는 stanley(-10) 는 물론
+  # path-launch 근처까지 밀려서, 정작 회피가 필요한 순간에 제일 늦게 돌았다.
+  local fgm_nice=-11
   local fgm_boost=0
   if [[ -f /tmp/f1tenth_fgm_boost ]]; then
     case "$(tr -d '[:space:]' < /tmp/f1tenth_fgm_boost 2>/dev/null || true)" in
@@ -158,10 +164,17 @@ apply_policy() {
     esac
   fi
 
+  # 회피 체인(검출 → 플래너 → FGM)이 stanley·aeb 보다 뒤에 있었다. 그런데
+  # 이 셋은 stanley 가 먹을 경로를 **만드는** 쪽이다. 생산자가 소비자한테
+  # 선점당하면 그만큼 늦은 경로가 넘어가고, 우선순위를 올린 소비자는 낡은
+  # 입력을 빨리 처리할 뿐이라 아무 소용이 없다. 그래서 파이프라인 순서대로
+  # 매긴다: 센서(-12) → 검출(-11) → 플래너/FGM(-11) → stanley(-10).
+  #
+  # control(-15) 은 그대로 맨 위다 — 여긴 구동기라 마감이 진짜다.
   while read -r lp; do apply_one "5-7" -10 "${lp}" "stanley"; done < <(pids_matching 'stanley_waypoint_follow_node')
-  while read -r lp; do apply_one "5-7" -5 "${lp}" "planner"; done < <(pids_matching 'local_planner_node')
+  while read -r lp; do apply_one "5-7" -11 "${lp}" "planner"; done < <(pids_matching 'local_planner_node')
   while read -r lp; do apply_one "5-7" -8 "${lp}" "aeb"; done < <(pids_matching 'emergency_brake_node')
-  while read -r lp; do apply_one "5-7" 0 "${lp}" "obstacle"; done < <(pids_matching 'integrated_obstacle_node|static_obstacle_node')
+  while read -r lp; do apply_one "5-7" -11 "${lp}" "obstacle"; done < <(pids_matching 'integrated_obstacle_node|static_obstacle_node')
   local fgm_label="fgm"
   [[ "${fgm_boost}" -eq 1 ]] && fgm_label="fgm-boost"
   while read -r lp; do

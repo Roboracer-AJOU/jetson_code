@@ -67,8 +67,13 @@ class _Node:
     _maneuver_fits_walls = LocalPlannerNode._maneuver_fits_walls
     _WALL_FIT_STEP_M = LocalPlannerNode._WALL_FIT_STEP_M
 
+    def _kappa_at_s(self, s):
+        return 0.0, 0.0
+
     def __init__(self, v=6.0, left=0.70, right=0.70):
         self.maneuver_cfg = CFG
+        # 직선 기준선이라 κ=0 — 코너 인식을 켜도 아래 기대값이 그대로여야 한다.
+        self.avoid_offset_corner_aware = True
         self._ego_speed_mps = v
         self.avoid_offset_plan_v_floor_mps = 2.0
         self.avoid_offset_plan_v_step_mps = 0.5
