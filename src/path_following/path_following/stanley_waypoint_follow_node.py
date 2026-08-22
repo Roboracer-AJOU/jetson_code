@@ -109,7 +109,7 @@ CFG = {
     "steer_scale_calibrated": True,
     "steering_smooth_alpha": 0.45,
     "wheelbase": vg.WHEELBASE_M,
-    "stanley_k": 0.8,
+    "stanley_k": 1.8,
     "stanley_softening": 0.12,
     # Stanley heading 항 배율. 원래 정의는 1.0 (heading_error 를 그대로 조향에
     # 더한다). 스케일 보정이 켜지면 여기에도 같은 비율이 곱해진다.
