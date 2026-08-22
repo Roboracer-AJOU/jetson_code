@@ -381,6 +381,11 @@ class FGMNode(Node):
         self._last_scan_ns: int | None = None
         self._last_corridor_warn_ns = 0
         self._last_gap_fit_counts = (0, 0)
+        self._scan_positive = None
+        self._scan_cx = None
+        self._scan_cy = None
+        self._xy_src_ranges = None
+        self._xy_src_wrapped = None
         self._prefer_angle = 0.0
         self._prefer_cone = 0.0
         self._prefer_ns = 0
@@ -748,6 +753,34 @@ class FGMNode(Node):
         것까지의 전방거리를 낸다. 갭 판정이 각도 기준이라 놓치는 "멀리서 좁아지는
         통로"를 여기서 잡는다.
         """
+        cx, cy = self._scan_xy(geom_ranges, wrapped)
+        # 조준방향을 x 축으로 돌린 좌표. 빔마다 삼각함수를 부르던 걸 스칼라
+        # 두 개로 바꾼다 — 회전은 스캔 전체에 공통이므로 원래 각도별로
+        # 계산할 이유가 없었다.
+        ca = math.cos(angle)
+        sa = math.sin(angle)
+        along = cx * ca + cy * sa
+        perp = cy * ca - cx * sa
+
+        blocking = (
+            self._scan_positive
+            & (along > 0.0)
+            & (np.abs(perp) < self.corridor_half_width)
+        )
+        sel = along[blocking]
+        if sel.size == 0:
+            return self.preprocess_dist
+        return max(0.0, float(sel.min()) - self.corridor_stop_margin)
+
+    def _corridor_clear_reference(
+        self, geom_ranges: np.ndarray, wrapped: np.ndarray, angle: float
+    ) -> float:
+        """빔마다 삼각함수를 부르는 원래 식. 회귀 테스트의 기준값이다.
+
+        주행 경로에서는 안 쓴다 — `_corridor_clear_distance` 가 같은 답을
+        훨씬 싸게 낸다. 대신 그게 정말 같은 답인지 확인할 무언가가 있어야
+        해서 남겨 둔다. 지우면 최적화가 맞다는 걸 보일 방법이 없어진다.
+        """
         d_ang = _wrap_pi_np(wrapped - angle)
         valid = (geom_ranges > 0.0) & (np.abs(d_ang) < math.pi * 0.5)
         if not np.any(valid):
@@ -760,6 +793,30 @@ class FGMNode(Node):
         if not np.any(blocking):
             return self.preprocess_dist
         return max(0.0, float(along[blocking].min()) - self.corridor_stop_margin)
+
+    def _scan_xy(self, geom_ranges: np.ndarray, wrapped: np.ndarray):
+        """이 스캔의 직교좌표 (x, y). 같은 배열이면 다시 안 만든다.
+
+        코리도 검사는 스캔당 수십 번 돈다 (갭 적합성 × 갭 수, 조준 후보 11개).
+        그때마다 `wrap → cos → sin` 을 전 빔에 걸고 있었다. 그런데 회전 대상은
+        매번 같은 스캔이라, 한 번 직교좌표로 펴 두면 각도별로 남는 건 스칼라
+        회전뿐이다.
+
+        배열 **신원** 으로 확인한다. 스캔 콜백이 매번 새 배열을 만들므로
+        이걸로 같은 스캔인지 판별이 된다.
+        """
+        if (
+            self._xy_src_ranges is geom_ranges
+            and self._xy_src_wrapped is wrapped
+            and self._scan_cx is not None
+        ):
+            return self._scan_cx, self._scan_cy
+        self._scan_cx = geom_ranges * np.cos(wrapped)
+        self._scan_cy = geom_ranges * np.sin(wrapped)
+        self._scan_positive = geom_ranges > 0.0
+        self._xy_src_ranges = geom_ranges
+        self._xy_src_wrapped = wrapped
+        return self._scan_cx, self._scan_cy
 
     def _aim_range(
         self, gap_start_angle: float, gap_end_angle: float, prefer, aim_ref: float

@@ -619,6 +619,11 @@ class LocalPlannerNode(Node):
         )
         # laser→map TF 주기 캐시 → _lookup_laser_to_map_transform
         self._tf_cycle_id = 0
+        # 주기당 장애물 필터 결과 캐시 — `_filter_cached` 참고
+        self._filter_cache: dict = {}
+        self._filter_cache_cycle = -1
+        # CSV 시각화 경로는 내용이 고정이라 한 번만 만든다
+        self._csv_viz_msg = None
         self._tf_cache_cycle = -1
         self._tf_cache = None
 
@@ -1257,7 +1262,38 @@ class LocalPlannerNode(Node):
             else self._obstacle_lateral_abs_max_m
         )
 
+    def _filter_cached(self, tag: str, raw: list, build):
+        """주기 안에서 같은 입력이면 필터 결과를 재사용한다.
+
+        네 종류의 장애물 필터가 한 주기에 두 번씩 불린다 — 게이트 판정에서
+        한 번, 모드 판정(`_obstacles_remain`)에서 또 한 번. 입력도 파라미터도
+        TF 도 그 사이에 안 바뀌므로 두 번째는 첫 번째와 같은 답을 다시 만드는
+        것뿐이다. 필터는 장애물마다 레이스라인 전체와의 거리를 재므로 (750
+        세그먼트) 공짜가 아니다.
+
+        캐시를 지우는 기준은 `_tf_cycle_id` 다. `timer_publish` 맨 앞에서
+        올라가므로 주기가 바뀌면 자동으로 비워진다. 주기 밖(다른 콜백)에서
+        불릴 때를 대비해 원본 리스트 **신원** 도 같이 본다 — 구독 콜백이
+        `list(msg.data)` 로 새 객체를 넣으므로 데이터가 바뀌면 여기서 걸린다.
+
+        반환 리스트를 호출부가 고치면 안 된다. 지금은 전부 읽기만 한다.
+        """
+        if self._filter_cache_cycle != self._tf_cycle_id:
+            self._filter_cache_cycle = self._tf_cycle_id
+            self._filter_cache.clear()
+        hit = self._filter_cache.get(tag)
+        if hit is not None and hit[0] is raw:
+            return hit[1]
+        out = build()
+        self._filter_cache[tag] = (raw, out)
+        return out
+
     def _filter_obstacles_for_planner(self, raw: list) -> list:
+        return self._filter_cached(
+            "static_gate", raw, lambda: self._build_static_gate(raw)
+        )
+
+    def _build_static_gate(self, raw: list) -> list:
         corridor_on, laser_to_map = self._corridor_lookup(warn=True)
         if corridor_on and laser_to_map is None:
             return []
@@ -1275,6 +1311,11 @@ class LocalPlannerNode(Node):
         )
 
     def _filter_obstacles_for_exit(self, raw: list) -> list:
+        return self._filter_cached(
+            "static_exit", raw, lambda: self._build_static_exit(raw)
+        )
+
+    def _build_static_exit(self, raw: list) -> list:
         """회피 해제용: 코리도 안 장애만 (벽 raw 제외)."""
         corridor_on, laser_to_map = self._corridor_lookup()
         if corridor_on and laser_to_map is None:
@@ -1328,6 +1369,11 @@ class LocalPlannerNode(Node):
         return True, self._make_laser_to_map_fn(tf_lm)
 
     def _filter_dynamic_for_planner(self, raw: list) -> list:
+        return self._filter_cached(
+            "dynamic_gate", raw, lambda: self._build_dynamic_gate(raw)
+        )
+
+    def _build_dynamic_gate(self, raw: list) -> list:
         corridor_on, laser_to_map = self._corridor_lookup()
         if corridor_on and laser_to_map is None:
             return []
@@ -1345,6 +1391,11 @@ class LocalPlannerNode(Node):
         )
 
     def _filter_dynamic_for_exit(self, raw: list) -> list:
+        return self._filter_cached(
+            "dynamic_exit", raw, lambda: self._build_dynamic_exit(raw)
+        )
+
+    def _build_dynamic_exit(self, raw: list) -> list:
         corridor_on, laser_to_map = self._corridor_lookup()
         if corridor_on and laser_to_map is None:
             return []
@@ -2323,21 +2374,26 @@ class LocalPlannerNode(Node):
     def _publish_csv_track_viz(self) -> None:
         if self.pub_csv_track is None or len(self.points) < 2:
             return
-        now = self.get_clock().now().to_msg()
-        out = Path()
-        out.header.frame_id = self.map_frame
-        out.header.stamp = now
-        s = self._csv_viz_stride
-        for i in range(0, len(self.points), s):
-            x, y = self.points[i]
-            ps = PoseStamped()
-            ps.header.frame_id = self.map_frame
-            ps.header.stamp = now
-            ps.pose.position.x = float(x)
-            ps.pose.position.y = float(y)
-            ps.pose.position.z = 0.0
-            ps.pose.orientation.w = 1.0
-            out.poses.append(ps)
+        # 이 경로는 **한 번도 안 바뀐다** — CSV 를 그대로 그린 것이다. 그런데
+        # 750점을 매번 새로 조립하면 발행 한 번에 14 ms 다 (실측). 2 Hz 라도
+        # 코어의 3 % 를 시각화에 쓰는 셈이라, 한 번 만들어 두고 스탬프만 간다.
+        # 헤더는 전 포즈가 공유하므로 갱신도 한 줄이면 끝난다.
+        out = self._csv_viz_msg
+        if out is None:
+            out = Path()
+            out.header.frame_id = self.map_frame
+            poses = []
+            for i in range(0, len(self.points), self._csv_viz_stride):
+                x, y = self.points[i]
+                ps = PoseStamped()
+                ps.header = out.header
+                ps.pose.position.x = float(x)
+                ps.pose.position.y = float(y)
+                ps.pose.orientation.w = 1.0
+                poses.append(ps)
+            out.poses = poses
+            self._csv_viz_msg = out
+        out.header.stamp = self.get_clock().now().to_msg()
         self.pub_csv_track.publish(out)
 
     def _build_sliding_path(
@@ -2507,6 +2563,15 @@ class LocalPlannerNode(Node):
         self._ys_np = np.asarray(self._ys, dtype=np.float64)
         self._bx_np = np.roll(self._xs_np, -1)
         self._by_np = np.roll(self._ys_np, -1)
+        # 세그먼트 기하는 레이스라인에서만 정해진다. `_closest_on_loop` 이
+        # 주기당 여러 번(ego + 장애물 + rejoin/기동) 도는 자리라, 여기서 한 번
+        # 만들어 두지 않으면 매번 750점짜리 뺄셈·곱셈을 다시 한다.
+        self._abx_np = self._bx_np - self._xs_np
+        self._aby_np = self._by_np - self._ys_np
+        self._ab2_np = self._abx_np * self._abx_np + self._aby_np * self._aby_np
+        self._ab_ok_np = self._ab2_np >= 1e-14
+        self._ab_bad_np = ~self._ab_ok_np
+        self._ab_zeros_np = np.zeros_like(self._ab2_np)
         self._build_curvature()
 
     # 곡률 베이스라인 [m]. 폴리라인 간격이 0.05 m 라 인접 3점으로 재면
@@ -2557,20 +2622,18 @@ class LocalPlannerNode(Node):
         self, xp: float, yp: float
     ) -> Tuple[float, float, int, float]:
         ax, ay = self._xs_np, self._ys_np
-        bx, by = self._bx_np, self._by_np
-        abx, aby = bx - ax, by - ay
-        ab2 = abx * abx + aby * aby
+        abx, aby = self._abx_np, self._aby_np
         t = np.divide(
             (xp - ax) * abx + (yp - ay) * aby,
-            ab2,
-            out=np.zeros_like(ab2),
-            where=ab2 >= 1e-14,
+            self._ab2_np,
+            out=self._ab_zeros_np.copy(),
+            where=self._ab_ok_np,
         )
-        t = np.clip(t, 0.0, 1.0)
+        np.clip(t, 0.0, 1.0, out=t)
         qx = ax + t * abx
         qy = ay + t * aby
         d2 = (xp - qx) ** 2 + (yp - qy) ** 2
-        d2 = np.where(ab2 < 1e-14, np.inf, d2)
+        d2[self._ab_bad_np] = np.inf
         i = int(np.argmin(d2))
         return float(qx[i]), float(qy[i]), i, float(t[i])
 

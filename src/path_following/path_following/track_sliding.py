@@ -183,6 +183,53 @@ def _closest_point_on_segment(
     return ax + t * abx, ay + t * aby, t
 
 
+class SegmentGeometry:
+    """폐폴리라인의 세그먼트 기하. 점 위치와 무관한 부분만 담는다.
+
+    `ax, ay` 는 각 세그먼트 시작점, `abx, aby` 는 세그먼트 벡터, `ab2` 는 그
+    길이제곱이다. 전부 폴리라인만으로 정해지므로 한 번 만들면 끝이다.
+    """
+
+    __slots__ = ("n", "ax", "ay", "abx", "aby", "ab2", "ok", "zeros")
+
+    def __init__(self, pts: List[Tuple[float, float]]) -> None:
+        xy = np.asarray(pts, dtype=np.float64)
+        self.n = int(xy.shape[0])
+        self.ax = np.ascontiguousarray(xy[:, 0])
+        self.ay = np.ascontiguousarray(xy[:, 1])
+        self.abx = np.roll(self.ax, -1) - self.ax
+        self.aby = np.roll(self.ay, -1) - self.ay
+        self.ab2 = self.abx * self.abx + self.aby * self.aby
+        self.ok = self.ab2 >= 1e-14
+        self.zeros = np.zeros_like(self.ab2)
+
+
+# 폴리라인은 기동 중 안 바뀌므로 사실상 한두 개다. 리스트 **객체 자체** 를
+# 같이 들고 있어야 한다 — id 만 키로 쓰면 리스트가 해제된 뒤 같은 주소에
+# 다른 리스트가 앉았을 때 남의 기하를 돌려주게 된다.
+_GEOM_CACHE: dict = {}
+_GEOM_CACHE_MAX = 4
+
+
+def segment_geometry(pts: List[Tuple[float, float]]) -> SegmentGeometry:
+    """`pts` 의 세그먼트 기하 (캐시).
+
+    이게 없으면 `lateral_distance_to_closed_polyline` 이 호출마다 750점
+    리스트를 ndarray 로 변환하고 roll 두 번에 곱셈까지 다시 한다. 그 값들은
+    레이스라인에서만 정해지는데, 실측에서 호출 1회 549 µs 중 대부분이
+    거기였다 (플래너 40 Hz × 장애물 수만큼 도는 자리다).
+    """
+    key = id(pts)
+    hit = _GEOM_CACHE.get(key)
+    if hit is not None and hit[0] is pts:
+        return hit[1]
+    geom = SegmentGeometry(pts)
+    if len(_GEOM_CACHE) >= _GEOM_CACHE_MAX:
+        _GEOM_CACHE.clear()
+    _GEOM_CACHE[key] = (pts, geom)
+    return geom
+
+
 def lateral_distance_to_closed_polyline(
     mx: float, my: float, pts: List[Tuple[float, float]]
 ) -> float:
@@ -190,19 +237,15 @@ def lateral_distance_to_closed_polyline(
     맵 평면에서 점 (mx,my) 과 폐폴리라인(pts) 사이 최단 거리(m).
     트랙 코리도 필터: 레이스라인에 가깝지 않으면(벽 등) 큰 값.
     """
-    n = len(pts)
-    if n < 2:
+    if len(pts) < 2:
         return float("inf")
-    xy = np.asarray(pts, dtype=np.float64)
-    ax, ay = xy[:, 0], xy[:, 1]
-    bx, by = np.roll(ax, -1), np.roll(ay, -1)
-    abx, aby = bx - ax, by - ay
-    ab2 = abx * abx + aby * aby
+    g = segment_geometry(pts)
+    ax, ay, abx, aby = g.ax, g.ay, g.abx, g.aby
     t = np.divide(
         (mx - ax) * abx + (my - ay) * aby,
-        ab2,
-        out=np.zeros_like(ab2),
-        where=ab2 >= 1e-14,
+        g.ab2,
+        out=g.zeros.copy(),
+        where=g.ok,
     )
     t = np.clip(t, 0.0, 1.0)
     qx = ax + t * abx
@@ -227,55 +270,70 @@ class LoopTrackSliding:
         self.path_anchor_half_width = max(30, int(path_anchor_half_width))
         self._track_anchor_seg = 0
         self._anchor_initialized = False
+        self._offsets: np.ndarray | None = None
+        self._all: np.ndarray | None = None
 
     def reset_anchor(self) -> None:
         self._anchor_initialized = False
         self._track_anchor_seg = 0
 
     def closest_projection_on_loop(self, mx: float, my: float) -> Tuple[float, float, int]:
+        """앵커 주변에서 가장 가까운 세그먼트 투영. (qx, qy, seg_i).
+
+        예전엔 세그먼트마다 파이썬 함수를 부르는 루프였다 (앵커폭 120 이면
+        241 회, 33 Hz 기준 358 µs). 같은 계산을 numpy 한 번으로 접는다.
+
+        인덱스 순서는 예전 루프와 **똑같이** `k = -half … +half` 로 만든다.
+        `d2 < best_d2` 는 동점일 때 먼저 본 것을 남기고 `argmin` 도 첫 번째를
+        돌려주므로, 순서가 같으면 고르는 세그먼트도 같다. 앵커는 다음 주기
+        탐색 범위를 정하므로 여기서 하나만 어긋나도 궤적이 갈린다.
+        """
         pts = self.points
         n = len(pts)
-        half = self.path_anchor_half_width
+        g = segment_geometry(pts)
 
-        def eval_seg(i: int) -> Tuple[float, float, float]:
-            ax, ay = pts[i]
-            bx, by = pts[(i + 1) % n]
-            qx, qy, _t = _closest_point_on_segment(mx, my, ax, ay, bx, by)
+        def search(idx: np.ndarray) -> Tuple[float, float, int, float]:
+            ax = g.ax[idx]
+            ay = g.ay[idx]
+            abx = g.abx[idx]
+            aby = g.aby[idx]
+            ab2 = g.ab2[idx]
+            t = np.divide(
+                (mx - ax) * abx + (my - ay) * aby,
+                ab2,
+                out=np.zeros_like(ab2),
+                where=g.ok[idx],
+            )
+            np.clip(t, 0.0, 1.0, out=t)
+            qx = ax + t * abx
+            qy = ay + t * aby
             d2 = (mx - qx) ** 2 + (my - qy) ** 2
-            return qx, qy, d2
-
-        best_qx, best_qy = 0.0, 0.0
-        best_seg = 0
-        best_d2 = float("inf")
+            k = int(np.argmin(d2))
+            return float(qx[k]), float(qy[k]), int(idx[k]), float(d2[k])
 
         if not self._anchor_initialized:
-            for i in range(n):
-                qx, qy, d2 = eval_seg(i)
-                if d2 < best_d2:
-                    best_d2 = d2
-                    best_qx, best_qy = qx, qy
-                    best_seg = i
+            best_qx, best_qy, best_seg, best_d2 = search(self._all_idx(n))
             self._anchor_initialized = True
         else:
-            for k in range(-half, half + 1):
-                i = (self._track_anchor_seg + k) % n
-                qx, qy, d2 = eval_seg(i)
-                if d2 < best_d2:
-                    best_d2 = d2
-                    best_qx, best_qy = qx, qy
-                    best_seg = i
+            half = self.path_anchor_half_width
+            idx = (self._track_anchor_seg + self._window_offsets(half)) % n
+            best_qx, best_qy, best_seg, best_d2 = search(idx)
 
         if best_d2 > 100.0:
-            best_d2 = float("inf")
-            for i in range(n):
-                qx, qy, d2 = eval_seg(i)
-                if d2 < best_d2:
-                    best_d2 = d2
-                    best_qx, best_qy = qx, qy
-                    best_seg = i
+            best_qx, best_qy, best_seg, best_d2 = search(self._all_idx(n))
 
         self._track_anchor_seg = best_seg
         return (best_qx, best_qy, best_seg)
+
+    def _window_offsets(self, half: int) -> np.ndarray:
+        if self._offsets is None or self._offsets.size != 2 * half + 1:
+            self._offsets = np.arange(-half, half + 1, dtype=np.int64)
+        return self._offsets
+
+    def _all_idx(self, n: int) -> np.ndarray:
+        if self._all is None or self._all.size != n:
+            self._all = np.arange(n, dtype=np.int64)
+        return self._all
 
     def sliding_xy(self, mx: float, my: float) -> List[Tuple[float, float]]:
         n = len(self.points)

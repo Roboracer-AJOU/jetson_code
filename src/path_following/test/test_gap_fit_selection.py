@@ -31,8 +31,15 @@ class _Stub:
         self.gap_edge_inset_rad = math.radians(inset_deg)
         self.fov_angle = math.radians(90.0)
         self._fov_rad = math.radians(fov_deg)
+        # 코리도 검사가 스캔당 재사용하는 직교좌표 캐시
+        self._scan_positive = None
+        self._scan_cx = None
+        self._scan_cy = None
+        self._xy_src_ranges = None
+        self._xy_src_wrapped = None
 
     _corridor_clear_distance = FGMNode._corridor_clear_distance
+    _scan_xy = FGMNode._scan_xy
     _clamp_to_cone = staticmethod(FGMNode._clamp_to_cone)
     _aim_range = FGMNode._aim_range
     _gap_best_clear_m = FGMNode._gap_best_clear_m

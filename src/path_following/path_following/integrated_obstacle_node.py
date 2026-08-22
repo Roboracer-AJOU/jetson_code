@@ -313,6 +313,13 @@ class IntegratedObstacleNode(Node):
         self.create_subscription(LaserScan, scan_topic, self.scan_callback, 10)
         self.static_pub = self.create_publisher(Float32MultiArray, static_topic, 10)
         self.dynamic_pub = self.create_publisher(Float32MultiArray, dynamic_topic, 10)
+        # 마커 재사용 버퍼 — `scan_callback` 참고
+        self._marker_msg = MarkerArray()
+        self._marker_pool: list[Marker] = []
+        self._delete_all_marker = Marker()
+        self._delete_all_marker.action = Marker.DELETEALL
+        # 수명은 상수라 마커마다 새로 만들 이유가 없다 (아무도 안 고친다)
+        self._marker_lifetime = MsgDuration(sec=0, nanosec=200000000)
         self.marker_pub = (
             self.create_publisher(MarkerArray, markers_topic, 10)
             if self._publish_markers
@@ -712,6 +719,21 @@ class IntegratedObstacleNode(Node):
     def _is_dynamic(track: Track, speed_threshold: float, min_age_s: float) -> bool:
         return track.age_s >= min_age_s and track.speed >= speed_threshold
 
+    def _track_marker(self, k: int) -> Marker:
+        """풀에서 k 번째 트랙 마커. 트랙마다 안 바뀌는 값은 여기서 한 번만."""
+        pool = self._marker_pool
+        while len(pool) <= k:
+            m = Marker()
+            m.header.frame_id = self._laser_frame
+            m.ns = "integrated_obstacles"
+            m.type = Marker.CUBE
+            m.action = Marker.ADD
+            m.scale.z = 0.2
+            m.color.a = 0.8
+            m.lifetime = self._marker_lifetime
+            pool.append(m)
+        return pool[k]
+
     def _publish_empty(self) -> None:
         if self.marker_pub is not None:
             delete = MarkerArray()
@@ -749,11 +771,12 @@ class IntegratedObstacleNode(Node):
 
         static_data: list[float] = []
         dynamic_data: list[float] = []
-        marker_array = MarkerArray() if self.marker_pub is not None else None
-        if marker_array is not None:
-            delete_marker = Marker()
-            delete_marker.action = Marker.DELETEALL
-            marker_array.markers.append(delete_marker)
+        # 마커는 매 스캔(40 Hz) 나가는 순수 시각화다. Marker 를 새로 만들면
+        # 개당 70 µs 라 트랙 몇 개만 돼도 무시 못 할 값이 된다. 객체는 풀에
+        # 두고 값만 갈아 끼운다 — 발행 후 붙들고 있는 곳이 없어 안전하다.
+        markers = None
+        if self.marker_pub is not None:
+            markers = [self._delete_all_marker]
         now_msg = self.get_clock().now().to_msg()
 
         static_count = 0
@@ -795,31 +818,24 @@ class IntegratedObstacleNode(Node):
                 color = (1.0, 0.0, 0.0)
                 static_count += 1
 
-            if marker_array is not None:
-                marker = Marker()
-                marker.header.frame_id = self._laser_frame
+            if markers is not None:
+                marker = self._track_marker(len(markers) - 1)
                 marker.header.stamp = now_msg
-                marker.ns = "integrated_obstacles"
                 marker.id = track.track_id
-                marker.type = Marker.CUBE
-                marker.action = Marker.ADD
                 marker.pose.position.x = track.laser_x
                 marker.pose.position.y = track.laser_y
-                marker.pose.position.z = 0.0
                 marker.scale.x = max(track.radius * 2.0, 0.1)
                 marker.scale.y = max(track.radius * 2.0, 0.1)
-                marker.scale.z = 0.2
-                marker.color.a = 0.8
                 marker.color.r = color[0]
                 marker.color.g = color[1]
                 marker.color.b = color[2]
-                marker.lifetime = MsgDuration(sec=0, nanosec=200000000)
-                marker_array.markers.append(marker)
+                markers.append(marker)
 
         self.static_pub.publish(Float32MultiArray(data=static_data))
         self.dynamic_pub.publish(Float32MultiArray(data=dynamic_data))
-        if self.marker_pub is not None and marker_array is not None:
-            self.marker_pub.publish(marker_array)
+        if markers is not None:
+            self._marker_msg.markers = markers
+            self.marker_pub.publish(self._marker_msg)
 
         if self._noise_rejected and (
             now_ns - self._last_noise_log_ns >= self.log_throttle_ns
