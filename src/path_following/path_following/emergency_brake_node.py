@@ -126,14 +126,33 @@ CFG = {
     # 이 안에 뭔가 있어야 "앞이 막혀서" 선 것으로 본다 (라이다 기준).
     # 범퍼 기준 0.6 m — 그 밖이면 못 가는 이유가 장애물이 아니다.
     "reverse_stuck_obstacle_m": round(vg.LASER_TO_FRONT_M + 0.60, 3),
+    # **코앞** 이면 위 1.0 초를 안 기다린다. 범퍼 앞 0.25 m 안에 뭐가 있는데
+    # 차가 서 있으면 더 볼 것이 없다 — 전진으로 못 나가는 게 이미 확정이다.
+    # (버블 반각이 asin(0.55/거리) 라 이 거리에서는 90°, 즉 갈 데가 없다.)
+    # 다만 0 은 아니다. VESC 속도가 순간 0 을 찍는 것과 진짜 정지를 가르려면
+    # 몇 틱은 봐야 한다.
+    "reverse_close_obstacle_m": round(vg.LASER_TO_FRONT_M + 0.25, 3),
+    "reverse_close_stuck_sec": 0.3,
     # 물러난 직후엔 이만큼 다시 안 건다. 플래너가 나갈 기회를 줘야 하고,
     # 안 그러면 뒤가 빌 때까지 계속 뒷걸음질한다.
-    "reverse_cooldown_sec": 3.0,
-    # 이 거리만큼 물러나면 끝. 전진 탈출이 열리는 최소치 + 여유.
-    "reverse_travel_m": 0.40,
+    # 한 번에 0.2 m 씩 끊어 물러나므로(아래) 한 걸음으로 안 열리는 경우가 있다.
+    # 그때 3 초를 기다리면 상자 앞에서 오래 굳어 보인다.
+    "reverse_cooldown_sec": 1.5,
+    # 한 걸음에 이만큼 물러난다.
+    #
+    # 예전엔 0.40 이었다. 전진 탈출이 열리는 기하학적 최소치가 그쯤이라
+    # (반각 90°→50°) 한 번에 끝내려던 값이다. 그런데 뒤 여유를 0.60 m 나
+    # 요구하게 되고, 트랙 폭을 생각하면 그 조건이 자주 안 맞아서 "그대로
+    # 선다" 로 빠졌다.
+    #
+    # 지금은 짧게 끊는다. 한 걸음으로 안 열리면 쿨다운 뒤 또 한 걸음 물러난다.
+    # 필요한 만큼 가되, 매번 뒤 여유를 다시 확인하고 가는 셈이라 뒤가 좁은
+    # 자리에서도 할 수 있는 만큼은 한다.
+    "reverse_travel_m": 0.20,
     "reverse_max_sec": 2.0,
     # 뒤가 이만큼 안 비어 있으면 시작하지 않는다 (범퍼 기준).
-    "reverse_min_clearance_m": 0.60,
+    # 한 걸음(0.20) + 중단 임계(0.25) 는 있어야 도중에 안 끊긴다.
+    "reverse_min_clearance_m": 0.45,
     # 후진 중 뒤 여유가 여기까지 줄면 즉시 중단. 벽에 대고 밀면 안 된다.
     "reverse_abort_clearance_m": 0.25,
     # 맵에서 "차가 여기 들어가나" 를 볼 때 반폭에 더할 여유. 뒤는 안 보고
@@ -247,6 +266,12 @@ class EmergencyBrakeNode(Node):
         )
         self.reverse_map_margin = max(0.0, float(g("reverse_map_margin_m").value))
         self.reverse_stuck_sec = max(0.0, float(g("reverse_stuck_sec").value))
+        self.reverse_close_obstacle = max(
+            0.0, float(g("reverse_close_obstacle_m").value)
+        )
+        self.reverse_close_stuck_sec = max(
+            0.0, float(g("reverse_close_stuck_sec").value)
+        )
         self.reverse_stuck_obstacle = max(
             0.0, float(g("reverse_stuck_obstacle_m").value)
         )
@@ -570,25 +595,36 @@ class EmergencyBrakeNode(Node):
             self._open_escape_window(now)
         return False
 
-    def _stuck_against_something(self, now: float, closest: float) -> bool:
-        """서 있은 지 오래됐고 앞이 막혔는가.
+    def _stuck_against_something(self, now: float, closest: float) -> str:
+        """서 있고 앞이 막혔는가. 막혔으면 사유 문자열, 아니면 "".
 
         탈출 창의 종료 사유를 안 본다. 창이 hard_stop 으로 한 틱 만에 닫히는
         경우가 실제로 있었고 (`closest` 가 임계와 같은 값에 걸터앉을 때),
         그러면 시간 초과 판정에 영원히 도달하지 못한다. 여기서는 결과만
         본다 — 서 있으면 못 나가는 것이다.
+
+        기다리는 시간은 얼마나 가까운지로 갈린다. 코앞(범퍼 0.25 m 안)이면
+        전진 탈출이 열릴 여지가 기하학적으로 없으므로 오래 볼 이유가 없다.
         """
         if self._speed > self.stuck_speed:
             self._idle_since = 0.0
-            return False
+            return ""
         if self._idle_since <= 0.0:
             self._idle_since = now
-            return False
-        if now - self._idle_since < self.reverse_stuck_sec:
-            return False
-        return closest < self.reverse_stuck_obstacle
+            return ""
 
-    def _maybe_start_reverse(self, now: float) -> None:
+        idle = now - self._idle_since
+        if closest < self.reverse_close_obstacle:
+            if idle >= self.reverse_close_stuck_sec:
+                return f"코앞 {closest:.2f}m 에 서 있다"
+            return ""
+        if idle < self.reverse_stuck_sec:
+            return ""
+        if closest < self.reverse_stuck_obstacle:
+            return f"{idle:.1f}s 째 못 나간다 (앞 {closest:.2f}m)"
+        return ""
+
+    def _maybe_start_reverse(self, now: float, why: str = "전진으로 못 나갔다") -> None:
         """전진으로 못 나간다 — 뒤가 비었으면 물러난다."""
         if not (self.reverse_enable and self._reverse_until <= 0.0):
             return
@@ -609,7 +645,7 @@ class EmergencyBrakeNode(Node):
         self._reverse_travel = 0.0
         self._reverse_count += 1
         self.get_logger().warn(
-            f"후진 탈출 시작 #{self._reverse_count} — 최대 조향으로도 못 나갔다. "
+            f"후진 탈출 시작 #{self._reverse_count} — {why}. "
             f"뒤 여유 {rear:.2f}m, {self.reverse_travel:.2f}m 물러난다"
         )
 
@@ -748,8 +784,10 @@ class EmergencyBrakeNode(Node):
         # 창이 어떻게 닫히든, 서 있는데 앞이 막혔으면 물러난다. 창의 시간
         # 초과만 보던 때는 hard_stop 으로 한 틱 만에 닫히는 경우를 통째로
         # 놓쳤다 (실차에서 탈출 창 #105 까지 헛돌았다).
-        if self._reverse_until <= 0.0 and self._stuck_against_something(now, closest):
-            self._maybe_start_reverse(now)
+        if self._reverse_until <= 0.0:
+            stuck_why = self._stuck_against_something(now, closest)
+            if stuck_why:
+                self._maybe_start_reverse(now, stuck_why)
         reversing = self._update_reverse(now, dt)
         # 후진이 끝나면서 전진 창을 새로 열었을 수 있다. 위 줄이 이미 지나간
         # 뒤라, 이걸 안 보면 그 한 틱에 standoff 가 물어 창이 헛돈다.

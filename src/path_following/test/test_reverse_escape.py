@@ -11,8 +11,10 @@ FGM 은 조향으로만 빠져나간다. 그런데 막힌 반각은
 없다. 실차에서 이때 전진 탈출 창 3 초를 제자리에서 다 쓰고, 창이 닫히면
 standoff 가 다시 물어 영영 그 자리였다.
 
-0.4 m 만 물러나면 같은 식이 50° 로 떨어져 전진 탈출이 그때부터 가능해진다.
-그래서 "아무 진전 없이 시간 초과" 를 최대 조향 실패로 보고 곧게 물러난다.
+물러나면 같은 식이 풀린다. 한 걸음(0.20 m)씩 끊어 물러나고, 그래도 안 열리면
+쿨다운 뒤 또 한 걸음 간다 — 뒤 여유를 매번 다시 보면서 갈 수 있는 만큼만
+가려는 것이다. 걸리는 조건은 둘이다: 전진 탈출이 아무 진전 없이 시간 초과
+했거나, **코앞** 에 두고 서 있거나.
 
 후진은 제동과 달리 차를 **움직이는** 명령이라 실패 규칙이 반대다. 신호가
 끊기면 걸지 않고 푼다. 그 비대칭이 여기 절반을 차지한다.
@@ -29,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from path_following import vehicle_geometry as vg  # noqa: E402
 from path_following.control_node import VehicleControlNode  # noqa: E402
-from path_following.emergency_brake_node import EmergencyBrakeNode  # noqa: E402
+from path_following.emergency_brake_node import CFG, EmergencyBrakeNode  # noqa: E402
 
 TICK = 0.02
 
@@ -52,13 +54,23 @@ class _Aeb:
 
     def __init__(self, rear: float = 1.5, **kw):
         self.reverse_enable = kw.get("reverse_enable", True)
-        self.reverse_travel = kw.get("reverse_travel", 0.40)
+        self.reverse_travel = kw.get("reverse_travel", CFG["reverse_travel_m"])
         self.reverse_max_sec = kw.get("reverse_max_sec", 2.0)
-        self.reverse_min_clearance = kw.get("reverse_min_clearance", 0.60)
+        self.reverse_min_clearance = kw.get(
+            "reverse_min_clearance", CFG["reverse_min_clearance_m"]
+        )
         self.reverse_abort_clearance = kw.get("reverse_abort_clearance", 0.25)
         self.reverse_stuck_sec = kw.get("reverse_stuck_sec", 1.0)
         self.reverse_stuck_obstacle = kw.get("reverse_stuck_obstacle", 0.79)
-        self.reverse_cooldown_sec = kw.get("reverse_cooldown_sec", 3.0)
+        self.reverse_close_obstacle = kw.get(
+            "reverse_close_obstacle", CFG["reverse_close_obstacle_m"]
+        )
+        self.reverse_close_stuck_sec = kw.get(
+            "reverse_close_stuck_sec", CFG["reverse_close_stuck_sec"]
+        )
+        self.reverse_cooldown_sec = kw.get(
+            "reverse_cooldown_sec", CFG["reverse_cooldown_sec"]
+        )
         self.stuck_speed = 0.05
         self._reverse_ready_at = 0.0
         self._idle_since = 0.0
@@ -140,7 +152,7 @@ def test_success_and_hard_stop_never_reach_the_reverse():
 
 def test_a_blocked_rear_means_we_just_sit_there():
     """앞뒤 다 막혔으면 미는 것보다 서 있는 게 낫다."""
-    a = _Aeb(rear=0.30)  # min_clearance 0.60 미만
+    a = _Aeb(rear=0.30)  # min_clearance(0.45) 미만
     a.start(0.0)
     assert a._reverse_until == 0.0
     assert "전진도 후진도 막혔다" in a.log
@@ -179,10 +191,10 @@ def _back_up(a: _Aeb, speed: float = 0.4, ticks: int = 400, rear_of=None):
 
 
 def test_it_stops_after_backing_up_far_enough():
-    a = _Aeb(reverse_travel=0.40)
+    a = _Aeb(reverse_travel=0.20)
     a.start(0.0)
     _, n = _back_up(a, speed=0.4)
-    assert n == 50, "0.4 m/s × 1.0 s = 0.40 m"
+    assert n == 25, "0.4 m/s × 0.5 s = 0.20 m"
     assert a._reverse_until == 0.0
     assert a._reverse_travel == 0.0, "종료 시 누적 거리는 초기화된다"
     assert "물러남" in a.log
@@ -209,7 +221,8 @@ def test_it_stops_on_time_even_if_the_wheels_are_spinning():
 
 def test_a_wall_appearing_behind_aborts_immediately():
     """뒤가 좁아지면 목표 거리를 못 채웠어도 즉시 선다."""
-    a = _Aeb(reverse_abort_clearance=0.25)
+    # 중단이 걸리는 걸 보려면 목표가 좁아지는 지점보다 멀어야 한다
+    a = _Aeb(reverse_abort_clearance=0.25, reverse_travel=0.40)
     a.start(0.0)
     # 0.2 m 물러난 시점에 뒤가 0.2 m 로 좁아진다
     _, n = _back_up(a, speed=0.4, rear_of=lambda d: 1.5 if d < 0.2 else 0.2)
@@ -227,13 +240,19 @@ def test_an_idle_machine_reports_not_reversing():
 
 
 def _sit_still(a: _Aeb, closest: float, secs: float, speed: float = 0.0):
-    """정지 상태로 시간을 흘리고, 후진이 걸린 시각을 낸다 (없으면 None)."""
+    """정지 상태로 시간을 흘리고, 후진이 걸린 시각을 낸다 (없으면 None).
+
+    `_timer_cb` 와 같은 순서로 부른다 — 판정이 낸 사유를 그대로 넘긴다.
+    """
     a._speed = speed
     now = 0.0
     for _ in range(int(secs / TICK)):
         now += TICK
-        if a._reverse_until <= 0.0 and a.is_stuck(now, closest):
-            a.start(now)
+        if a._reverse_until > 0.0:
+            continue
+        why = a.is_stuck(now, closest)
+        if why:
+            a.start(now, why)
             if a._reverse_until > 0.0:
                 return now
     return None
@@ -263,9 +282,31 @@ def test_regression_the_hardstop_loop_no_longer_traps_the_car():
     assert "후진 탈출 시작" in a.log
 
 
-def test_it_waits_the_full_second_before_giving_up():
+# 판정이 갈리는 두 거리 (라이다 기준). 범퍼로는 각각 0.11 m 와 0.41 m.
+CLOSE = CFG["reverse_close_obstacle_m"] - 0.14   # 0.30 — 코앞
+NEAR = CFG["reverse_close_obstacle_m"] + 0.16    # 0.60 — 가깝지만 코앞은 아님
+
+
+def test_something_right_in_front_does_not_wait_a_full_second():
+    """코앞이면 볼 것도 없다 — 서 있다는 것 자체가 답이다.
+
+    이 거리(범퍼 0.11 m)에서는 버블 반각이 90° 라 최대 조향을 줘도 열린
+    방향이 없다. 1 초를 더 지켜본다고 달라질 게 없어서 바로 물러난다.
+    """
+    a = _Aeb()
+    at = _sit_still(a, closest=CLOSE, secs=3.0)
+    assert at == pytest.approx(CFG["reverse_close_stuck_sec"], abs=2 * TICK)
+    assert "코앞" in a.log
+
+
+def test_it_still_waits_a_full_second_when_it_is_merely_near():
+    """코앞이 아니면 예전대로 1 초를 지켜본다.
+
+    이 거리(범퍼 0.41 m)에서는 조향으로 빠져나갈 여지가 남아 있다.
+    바로 후진하면 나갈 수 있는 자리에서도 뒷걸음질하게 된다.
+    """
     a = _Aeb(reverse_stuck_sec=1.0)
-    at = _sit_still(a, closest=0.30, secs=3.0)
+    at = _sit_still(a, closest=NEAR, secs=3.0)
     assert at == pytest.approx(1.0, abs=2 * TICK)
 
 
@@ -283,22 +324,61 @@ def test_crawling_forward_resets_the_clock():
         now += TICK
         # 0.5 초마다 한 틱씩 움직인다
         a._speed = 0.5 if i % 25 == 0 else 0.0
-        if a.is_stuck(now, 0.30):
+        if a.is_stuck(now, NEAR):
             a.start(now)
     assert a._reverse_until == 0.0, f"기어가는 중인데 후진: {a.log}"
 
 
+def test_twitching_in_place_right_against_a_box_still_backs_up():
+    """같은 떨림이라도 코앞이면 물러난다.
+
+    0.5 초에 한 틱, 즉 0.5 초에 1 cm 다. 범퍼 11 cm 앞에 상자를 두고 그러고
+    있으면 나아가는 게 아니라 굳은 것이다 — 실차에서 이 상태로 오래 서 있었다.
+    """
+    a = _Aeb()
+    now = 0.0
+    for i in range(200):
+        now += TICK
+        a._speed = 0.5 if i % 25 == 0 else 0.0
+        if a._reverse_until <= 0.0 and a.is_stuck(now, CLOSE):
+            a.start(now)
+    assert a._reverse_until > 0.0 or a._reverse_count > 0, f"안 물러난다: {a.log}"
+
+
 def test_it_does_not_back_up_over_and_over():
     """물러난 직후 또 걸리면 뒤가 빌 때까지 뒷걸음질한다."""
-    a = _Aeb(reverse_cooldown_sec=3.0)
+    a = _Aeb()
     a.start(0.0)
     _back_up(a)                      # 정상 종료 → 쿨다운 시작
     assert a._reverse_ready_at > 0.0
+
+    # 쿨다운 안에서는 코앞에 두고 아무리 서 있어도 다시 안 걸린다
     a._speed = 0.0
     a._idle_since = 0.0
-    # 쿨다운 안에서는 아무리 서 있어도 안 걸린다
-    now = a._reverse_ready_at - 0.5
-    assert a.is_stuck(now, 0.30) is False or (a.start(now) or a._reverse_until == 0.0)
+    now = 0.0
+    while now < a._reverse_ready_at - TICK:
+        now += TICK
+        if a.is_stuck(now, CLOSE):
+            a.start(now)
+    assert a._reverse_until == 0.0, f"쿨다운 중에 또 물러났다: {a.log}"
+    assert a._reverse_count == 1
+
+
+def test_after_the_cooldown_it_takes_another_step():
+    """한 걸음으로 안 열리면 또 한 걸음. 0.20 m 씩 끊는 대가다."""
+    a = _Aeb()
+    a.start(0.0)
+    _back_up(a)
+    assert a._reverse_count == 1
+
+    a._speed = 0.0
+    a._idle_since = 0.0
+    now = a._reverse_ready_at
+    for _ in range(int(1.0 / TICK)):
+        now += TICK
+        if a._reverse_until <= 0.0 and a.is_stuck(now, CLOSE):
+            a.start(now)
+    assert a._reverse_count == 2, f"두 번째 걸음이 안 나간다: {a.log}"
 
 
 def test_a_blocked_rear_does_not_spam_the_log():
@@ -338,8 +418,10 @@ class _Rear:
         self._map = gmap
         self._tf = tf
         self.reverse_map_margin = kw.get("margin", 0.10)
-        self.reverse_travel = kw.get("travel", 0.40)
-        self.reverse_min_clearance = kw.get("min_clearance", 0.60)
+        self.reverse_travel = kw.get("travel", CFG["reverse_travel_m"])
+        self.reverse_min_clearance = kw.get(
+            "min_clearance", CFG["reverse_min_clearance_m"]
+        )
 
     _REVERSE_PROBE_STEP_M = STEP
 
@@ -354,18 +436,20 @@ def _wall_at(x_wall: float):
     return _Map(lambda x, y: abs(x - x_wall))
 
 
-LIMIT = 1.0  # travel 0.40 + min_clearance 0.60
+# 이보다 멀리 재 봐야 쓰지도 않는다 (한 걸음 + 시작 문턱)
+LIMIT = CFG["reverse_travel_m"] + CFG["reverse_min_clearance_m"]
 
 
 def test_it_reports_how_far_the_bumper_can_travel():
-    """뒤끝이 x=-0.41 이고 벽이 x=-1.41 이면 1.0 m 갈 수 있다.
+    """뒤끝이 x=-0.41 이고 벽이 x=-1.11 이면 0.70 m 갈 수 있다.
 
     다만 중심선 기준이라 차 반폭+여유(0.25) 만큼 일찍 막힌 것으로 본다.
     보수적인 쪽이라 그대로 둔다.
     """
     need = vg.HALF_WIDTH_M + 0.10
-    got = _Rear(_wall_at(-(vg.LASER_TO_REAR_M + 1.0))).clearance()
-    want = 1.0 - need  # 0.75
+    got = _Rear(_wall_at(-(vg.LASER_TO_REAR_M + 0.70))).clearance()
+    want = 0.70 - need  # 0.45 — 상한(LIMIT)보다 작아야 재는 값이 나온다
+    assert want < LIMIT
     # 0.05 간격으로 훑으므로 한 칸까지는 늦게 잡힐 수 있다
     assert want <= got <= want + STEP + 1e-9
 
