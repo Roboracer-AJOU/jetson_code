@@ -26,7 +26,11 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from path_following.detection_confirm import HitHistory
 from path_following.scan_cluster import ClusterParams, cluster_scan_xy
-from path_following.static_obstacle_node import StaticMap, resolve_map_yaml
+from path_following.static_obstacle_node import (
+    StaticMap,
+    near_wall_point_gate,
+    resolve_map_yaml,
+)
 from path_following.track_kf import ConstantVelocityKF
 from path_following.track_sliding import param_bool
 
@@ -36,7 +40,7 @@ CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
     # CSV(centerline/raceline)·로컬라이제이션 pbstream·static_obstacle_node 와
     # 반드시 같은 맵이어야 한다. 어긋나면 벽을 장애물로 보거나 그 반대가 된다.
-    "map_name": "cartographer_map_20260820_214849_rosmap.yaml",  # 이전 20260816_211739
+    "map_name": "cartographer_map_20260822_164229_rosmap.yaml",  # 이전 20260816_211739
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",
@@ -45,10 +49,9 @@ CFG = {
     "static_obstacles_topic": "/static_obstacles",
     "dynamic_obstacles_topic": "/dynamic_obstacles",
     "markers_topic": "/visualization_marker_array",
-    # 맵 벽 팽창 반경. 오차 예산 근거는 static_obstacle_node.py 주석 참고.
-    # 7 m/s 에서 측위 0.10 + 스캔왜곡 0.09 + 격자·노이즈 0.045 = 0.235
-    # → 격자 올림 0.25 (= 정확히 5셀). 두 노드가 같은 값을 유지할 것.
-    "wall_match_radius_m": 0.25,
+    # 맵 벽 팽창 반경. 근거와 실측은 static_obstacle_node.py 주석 참고.
+    # 두 노드가 같은 값을 유지할 것.
+    "wall_match_radius_m": 0.10,
     "tf_timeout_sec": 0.10,
     "cluster_gap_threshold_m": 0.28,
     "min_cluster_points": 10,
@@ -120,9 +123,12 @@ CFG = {
     # 에서는 이 가드가 아무 일도 하지 않는다. 그래서 실장애를 놓칠 위험
     # 없이 벽 잔차만 골라 억제한다. 끄려면 False.
     # wall_match_radius_m 를 줄인 만큼 이 띠를 넓혀서, 새로 드러난 구간을
-    # 증거량(점수·span)으로 판단하게 한다.
+    # 증거량(점수·span)으로 판단하게 한다. 팽창 0.25+여유 0.20 이 원래
+    # 맵 벽 기준 0.45 m 까지를 덮었으므로, 팽창을 0.10 으로 내린 지금은
+    # 0.35 여야 같은 범위가 유지된다. 지워지지 않게 된 구간이 아무 판단도
+    # 안 받고 통과하는 일이 없어야 한다.
     "wall_residual_guard": True,
-    "wall_clearance_m": 0.20,
+    "wall_clearance_m": 0.35,
     "near_wall_min_points": 14,
     "near_wall_min_span_m": 0.20,
     "log_detections": False,
@@ -467,10 +473,13 @@ class IntegratedObstacleNode(Node):
             # [A5] 팽창 밴드에 붙은 잔차는 측위 흔들림일 확률이 높다.
             # 진짜 장애물이라면 점도 많고 폭도 있어야 한다.
             if wall_dist is not None and wall_dist[ci] < self._wall_clearance_m:
-                if (
-                    cl.n_points < self._near_wall_min_points
-                    or cl.span_m < self._near_wall_min_span_m
-                ):
+                gate = near_wall_point_gate(
+                    self._near_wall_min_points,
+                    self._near_wall_min_span_m,
+                    math.hypot(cl.center_x, cl.center_y),
+                    angle_inc,
+                )
+                if cl.n_points < gate or cl.span_m < self._near_wall_min_span_m:
                     continue
 
             cidx = cl.idx

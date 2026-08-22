@@ -1,0 +1,262 @@
+[INFO] [1787388297.110332835] [wall_filter_probe]: 맵 cartographer_map_20260822_164229_rosmap.yaml  팽창 0.25 m
+[WARN] [1787388297.871555894] [wall_filter_probe]: TF 없음: "laser" passed to lookupTransform argument source_frame does not exist. 
+[WARN] [1787388297.918224963] [wall_filter_probe]: TF 없음: "laser" passed to lookupTransform argument source_frame does not exist. 
+[WARN] [1787388297.920746266] [wall_filter_probe]: TF 없음: "laser" passed to lookupTransform argument source_frame does not exist. 
+[WARN] [1787388297.943715597] [wall_filter_probe]: TF 없음: "laser" passed to lookupTransform argument source_frame does not exist. 
+[INFO] [1787388298.939311775] [wall_filter_probe]: [  1.8s] 지워짐  99.4%  0.5m밖 생존점   5개 (0.77~3.49m, 폭 6.38m, 최소 16개 필요)  →  /static_obstacles 0개
+[INFO] [1787388299.939420852] [wall_filter_probe]: [  2.8s] 지워짐  99.9%  0.5m밖 생존점   1개 (3.46~3.46m, 폭 0.00m, 최소 5개 필요)  →  /static_obstacles 0개
+[INFO] [1787388300.945574619] [wall_filter_probe]: [  3.8s] 지워짐 100.0%  0.5m밖 생존점 0개  →  /static_obstacles 0개
+[INFO] [1787388301.938408255] [wall_filter_probe]: [  4.8s] 지워짐  99.8%  0.5m밖 생존점   2개 (3.45~3.48m, 폭 0.01m, 최소 5개 필요)  →  /static_obstacles 0개
+[INFO] [1787388302.939780683] [wall_filter_probe]: [  5.8s] 지워짐  99.9%  0.5m밖 생존점   1개 (3.47~3.47m, 폭 0.00m, 최소 5개 필요)  →  /static_obstacles 0개
+[INFO] [1787388303.940760429] [wall_filter_probe]: [  6.8s] 지워짐  99.9%  0.5m밖 생존점   1개 (0.76~0.76m, 폭 0.00m, 최소 22개 필요)  →  /static_obstacles 0개
+[INFO] [1787388304.940867391] [wall_filter_probe]: [  7.8s] 지워짐  99.8%  0.5m밖 생존점   2개 (3.45~3.46m, 폭 0.01m, 최소 5개 필요)  →  /static_obstacles 0개
+[INFO] [1787388305.940524581] [wall_filter_probe]: [  8.8s] 지워짐  99.8%  0.5m밖 생존점   2개 (3.47~3.49m, 폭 0.01m, 최소 5개 필요)  →  /static_obstacles 0개
+[INFO] [1787388306.938878840] [wall_filter_probe]: [  9.8s] 지워짐  99.8%  0.5m밖 생존점   2개 (0.79~3.48m, 폭 6.37m, 최소 8개 필요)  →  /static_obstacles 0개
+[INFO] [1787388307.940068670] [wall_filter_probe]: [ 10.8s] 지워짐  99.8%  0.5m밖 생존점   2개 (0.79~3.47m, 폭 6.30m, 최소 8개 필요)  →  /static_obstacles 0개
+[INFO] [1787388308.939210569] [wall_filter_probe]: [ 11.8s] 지워짐 100.0%  0.5m밖 생존점 0개  →  /static_obstacles 0개
+[INFO] [1787388309.939525335] [wall_filter_probe]: [ 12.8s] 지워짐  98.6%  0.5m밖 생존점  12개 (0.87~2.75m, 폭 10.86m, 최소 18개 필요)  →  /static_obstacles 0개
+[INFO] [1787388310.965182905] [wall_filter_probe]: [ 13.8s] 지워짐  98.9%  0.5m밖 생존점   8개 (0.84~0.93m, 폭 1.09m, 최소 20개 필요)  →  /static_obstacles 0개
+[INFO] [1787388311.973175558] [wall_filter_probe]: [ 14.8s] 지워짐  97.6%  0.5m밖 생존점  17개 (1.78~8.79m, 폭 35.06m, 최소 9개 필요)  →  /static_obstacles 0개
+[INFO] [1787388312.964848872] [wall_filter_probe]: [ 15.8s] 지워짐  97.4%  0.5m밖 생존점  14개 (7.47~7.52m, 폭 0.41m, 최소 3개 필요)  →  /static_obstacles 0개
+[INFO] [1787388313.964460720] [wall_filter_probe]: [ 16.8s] 지워짐  96.1%  0.5m밖 생존점  24개 (0.83~5.88m, 폭 22.15m, 최소 3개 필요)  →  /static_obstacles 0개
+[INFO] [1787388314.969448487] [wall_filter_probe]: [ 17.8s] 지워짐  95.8%  0.5m밖 생존점  26개 (1.06~4.94m, 폭 31.00m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388315.968774428] [wall_filter_probe]: [ 18.8s] 지워짐  95.2%  0.5m밖 생존점  29개 (0.78~4.91m, 폭 30.81m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388316.965614063] [wall_filter_probe]: [ 19.8s] 지워짐  96.1%  0.5m밖 생존점  24개 (4.85~4.86m, 폭 30.52m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388317.971439510] [wall_filter_probe]: [ 20.8s] 지워짐  95.6%  0.5m밖 생존점  26개 (1.04~4.86m, 폭 30.55m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388318.970002985] [wall_filter_probe]: [ 21.8s] 지워짐  95.5%  0.5m밖 생존점  28개 (0.81~4.86m, 폭 30.52m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388319.967517928] [wall_filter_probe]: [ 22.8s] 지워짐  95.9%  0.5m밖 생존점  26개 (4.84~4.86m, 폭 30.53m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388320.980300190] [wall_filter_probe]: [ 23.9s] 지워짐  95.2%  0.5m밖 생존점  30개 (0.76~4.88m, 폭 30.61m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388321.970578816] [wall_filter_probe]: [ 24.8s] 지워짐  94.9%  0.5m밖 생존점  29개 (0.75~4.89m, 폭 30.70m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388322.966615635] [wall_filter_probe]: [ 25.8s] 지워짐  93.8%  0.5m밖 생존점  33개 (0.75~4.91m, 폭 30.82m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388323.973304175] [wall_filter_probe]: [ 26.9s] 지워짐  96.2%  0.5m밖 생존점  24개 (4.84~4.86m, 폭 30.52m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388324.969280783] [wall_filter_probe]: [ 27.8s] 지워짐  95.8%  0.5m밖 생존점  28개 (0.82~4.87m, 폭 30.57m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388325.967896418] [wall_filter_probe]: [ 28.8s] 지워짐  95.7%  0.5m밖 생존점  26개 (1.07~4.89m, 폭 30.73m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388326.968656354] [wall_filter_probe]: [ 29.8s] 지워짐  95.3%  0.5m밖 생존점  29개 (0.81~4.88m, 폭 30.63m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388327.966033428] [wall_filter_probe]: [ 30.8s] 지워짐  95.7%  0.5m밖 생존점  27개 (0.95~4.87m, 폭 30.57m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388328.966506750] [wall_filter_probe]: [ 31.8s] 지워짐  95.2%  0.5m밖 생존점  31개 (0.80~4.87m, 폭 30.55m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388329.966213973] [wall_filter_probe]: [ 32.8s] 지워짐  95.9%  0.5m밖 생존점  25개 (4.85~4.89m, 폭 30.70m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388330.970934809] [wall_filter_probe]: [ 33.8s] 지워짐  95.7%  0.5m밖 생존점  24개 (4.82~4.86m, 폭 30.54m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388331.970468891] [wall_filter_probe]: [ 34.8s] 지워짐  95.3%  0.5m밖 생존점  27개 (1.06~4.86m, 폭 30.54m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388332.970886875] [wall_filter_probe]: [ 35.8s] 지워짐  94.6%  0.5m밖 생존점  28개 (0.77~4.87m, 폭 30.59m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388333.969159130] [wall_filter_probe]: [ 36.8s] 지워짐  94.7%  0.5m밖 생존점  30개 (0.81~4.88m, 폭 30.65m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388334.969954250] [wall_filter_probe]: [ 37.8s] 지워짐  95.4%  0.5m밖 생존점  25개 (0.78~4.86m, 폭 30.52m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388335.969154078] [wall_filter_probe]: [ 38.8s] 지워짐  94.8%  0.5m밖 생존점  30개 (0.75~4.86m, 폭 30.51m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388336.968446824] [wall_filter_probe]: [ 39.8s] 지워짐  94.6%  0.5m밖 생존점  29개 (0.82~4.87m, 폭 30.58m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388337.965743632] [wall_filter_probe]: [ 40.8s] 지워짐  95.2%  0.5m밖 생존점  27개 (0.80~4.86m, 폭 30.51m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388338.966678967] [wall_filter_probe]: [ 41.8s] 지워짐  93.9%  0.5m밖 생존점  34개 (0.74~4.87m, 폭 30.61m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388339.970367987] [wall_filter_probe]: [ 42.8s] 지워짐  93.8%  0.5m밖 생존점  34개 (0.80~5.17m, 폭 32.47m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388340.968537476] [wall_filter_probe]: [ 43.8s] 지워짐  97.0%  0.5m밖 생존점  17개 (1.02~5.21m, 폭 32.43m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388341.966923628] [wall_filter_probe]: [ 44.8s] 지워짐  97.4%  0.5m밖 생존점  15개 (0.75~5.43m, 폭 32.97m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388342.966630969] [wall_filter_probe]: [ 45.8s] 지워짐  98.7%  0.5m밖 생존점   8개 (4.70~4.73m, 폭 0.14m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388343.966226648] [wall_filter_probe]: [ 46.8s] 지워짐  98.6%  0.5m밖 생존점   9개 (0.84~4.72m, 폭 20.46m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388344.967161820] [wall_filter_probe]: [ 47.8s] 지워짐  98.4%  0.5m밖 생존점  10개 (0.91~4.72m, 폭 23.87m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388345.966669731] [wall_filter_probe]: [ 48.8s] 지워짐  97.3%  0.5m밖 생존점  10개 (0.81~4.72m, 폭 20.47m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388346.966865863] [wall_filter_probe]: [ 49.8s] 지워짐  98.3%  0.5m밖 생존점   9개 (1.05~4.72m, 폭 23.50m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388347.968994390] [wall_filter_probe]: [ 50.8s] 지워짐  98.0%  0.5m밖 생존점  11개 (0.77~4.72m, 폭 10.36m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388348.971463742] [wall_filter_probe]: [ 51.8s] 지워짐  98.3%  0.5m밖 생존점  10개 (0.80~4.73m, 폭 18.84m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388349.967914353] [wall_filter_probe]: [ 52.8s] 지워짐  98.4%  0.5m밖 생존점   9개 (0.77~4.72m, 폭 24.22m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388350.966675668] [wall_filter_probe]: [ 53.8s] 지워짐  98.4%  0.5m밖 생존점   9개 (4.70~4.72m, 폭 0.16m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388351.968772114] [wall_filter_probe]: [ 54.8s] 지워짐  98.9%  0.5m밖 생존점   7개 (4.70~4.72m, 폭 0.12m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388352.975935811] [wall_filter_probe]: [ 55.9s] 지워짐  98.1%  0.5m밖 생존점  11개 (0.82~4.72m, 폭 10.75m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388353.966785312] [wall_filter_probe]: [ 56.8s] 지워짐  98.7%  0.5m밖 생존점   8개 (4.71~4.72m, 폭 0.14m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388354.967175557] [wall_filter_probe]: [ 57.8s] 지워짐  98.1%  0.5m밖 생존점  12개 (0.83~4.72m, 폭 24.11m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388355.970326752] [wall_filter_probe]: [ 58.8s] 지워짐  97.5%  0.5m밖 생존점  15개 (0.79~4.73m, 폭 10.78m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388356.967914313] [wall_filter_probe]: [ 59.8s] 지워짐  98.1%  0.5m밖 생존점  12개 (0.81~4.72m, 폭 24.19m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388357.966193517] [wall_filter_probe]: [ 60.8s] 지워짐  98.4%  0.5m밖 생존점  10개 (0.87~4.72m, 폭 24.22m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388358.967217991] [wall_filter_probe]: [ 61.8s] 지워짐  98.6%  0.5m밖 생존점   9개 (0.77~4.72m, 폭 10.58m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388359.966583871] [wall_filter_probe]: [ 62.8s] 지워짐  98.7%  0.5m밖 생존점   8개 (4.71~4.72m, 폭 0.14m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388360.968994769] [wall_filter_probe]: [ 63.8s] 지워짐  97.7%  0.5m밖 생존점  13개 (0.81~4.73m, 폭 10.68m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388361.969129336] [wall_filter_probe]: [ 64.8s] 지워짐  97.6%  0.5m밖 생존점  14개 (0.79~4.72m, 폭 24.25m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388362.967211256] [wall_filter_probe]: [ 65.8s] 지워짐  98.1%  0.5m밖 생존점  12개 (0.85~4.73m, 폭 10.68m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388363.968959098] [wall_filter_probe]: [ 66.8s] 지워짐  98.6%  0.5m밖 생존점   9개 (0.87~4.72m, 폭 10.77m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388364.966328918] [wall_filter_probe]: [ 67.8s] 지워짐  97.7%  0.5m밖 생존점  13개 (0.81~4.72m, 폭 10.78m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388365.966525128] [wall_filter_probe]: [ 68.8s] 지워짐  98.4%  0.5m밖 생존점  10개 (0.83~4.73m, 폭 10.79m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388366.969477872] [wall_filter_probe]: [ 69.8s] 지워짐  98.4%  0.5m밖 생존점  10개 (0.79~4.72m, 폭 22.95m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388367.966966788] [wall_filter_probe]: [ 70.8s] 지워짐  98.6%  0.5m밖 생존점   9개 (1.01~4.73m, 폭 23.57m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388368.968582656] [wall_filter_probe]: [ 71.8s] 지워짐  97.2%  0.5m밖 생존점  15개 (0.81~4.72m, 폭 10.59m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388369.966707520] [wall_filter_probe]: [ 72.8s] 지워짐  98.1%  0.5m밖 생존점  12개 (0.77~4.73m, 폭 10.62m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388370.967443636] [wall_filter_probe]: [ 73.8s] 지워짐  98.9%  0.5m밖 생존점   7개 (4.71~4.72m, 폭 0.12m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388371.968378076] [wall_filter_probe]: [ 74.8s] 지워짐  98.1%  0.5m밖 생존점  12개 (0.82~4.72m, 폭 10.66m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388372.966898071] [wall_filter_probe]: [ 75.8s] 지워짐  96.7%  0.5m밖 생존점  21개 (0.78~4.91m, 폭 29.92m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388373.968079494] [wall_filter_probe]: [ 76.8s] 지워짐  95.6%  0.5m밖 생존점  28개 (1.05~4.91m, 폭 30.43m, 최소 4개 필요)  →  /static_obstacles 2개
+[INFO] [1787388374.969518218] [wall_filter_probe]: [ 77.8s] 지워짐  95.2%  0.5m밖 생존점  30개 (1.04~4.98m, 폭 5.90m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388375.969439051] [wall_filter_probe]: [ 78.8s] 지워짐  96.2%  0.5m밖 생존점  24개 (0.88~4.67m, 폭 18.36m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388376.968259119] [wall_filter_probe]: [ 79.8s] 지워짐  95.8%  0.5m밖 생존점  27개 (0.75~4.67m, 폭 18.60m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388377.970194158] [wall_filter_probe]: [ 80.8s] 지워짐  96.4%  0.5m밖 생존점  23개 (4.64~4.67m, 폭 0.47m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388378.969166615] [wall_filter_probe]: [ 81.8s] 지워짐  96.1%  0.5m밖 생존점  24개 (0.99~4.67m, 폭 5.42m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388379.967447495] [wall_filter_probe]: [ 82.8s] 지워짐  96.0%  0.5m밖 생존점  25개 (0.97~4.67m, 폭 4.91m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388380.969522523] [wall_filter_probe]: [ 83.8s] 지워짐  95.5%  0.5m밖 생존점  27개 (0.82~4.70m, 폭 18.45m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388381.971617601] [wall_filter_probe]: [ 84.8s] 지워짐  95.3%  0.5m밖 생존점  26개 (1.09~4.70m, 폭 8.90m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388382.967946472] [wall_filter_probe]: [ 85.8s] 지워짐  96.0%  0.5m밖 생존점  25개 (0.82~4.67m, 폭 18.30m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388383.968973760] [wall_filter_probe]: [ 86.8s] 지워짐  96.3%  0.5m밖 생존점  23개 (4.64~4.66m, 폭 0.45m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388384.967229027] [wall_filter_probe]: [ 87.8s] 지워짐  95.9%  0.5m밖 생존점  26개 (4.64~4.73m, 폭 0.50m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388385.970101878] [wall_filter_probe]: [ 88.8s] 지워짐  95.6%  0.5m밖 생존점  26개 (0.81~4.68m, 폭 18.68m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388386.972370769] [wall_filter_probe]: [ 89.8s] 지워짐  95.1%  0.5m밖 생존점  30개 (0.81~4.69m, 폭 18.51m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388387.969325363] [wall_filter_probe]: [ 90.8s] 지워짐  96.3%  0.5m밖 생존점  23개 (1.13~4.67m, 폭 5.74m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388388.970167003] [wall_filter_probe]: [ 91.8s] 지워짐  96.3%  0.5m밖 생존점  23개 (4.64~4.67m, 폭 0.43m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388389.967995913] [wall_filter_probe]: [ 92.8s] 지워짐  95.9%  0.5m밖 생존점  27개 (0.81~4.67m, 폭 18.75m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388390.969010419] [wall_filter_probe]: [ 93.8s] 지워짐  96.1%  0.5m밖 생존점  24개 (4.64~4.67m, 폭 0.49m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388391.973559104] [wall_filter_probe]: [ 94.9s] 지워짐  95.9%  0.5m밖 생존점  26개 (0.86~4.70m, 폭 18.60m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388392.967448101] [wall_filter_probe]: [ 95.8s] 지워짐  95.6%  0.5m밖 생존점  28개 (0.80~4.69m, 폭 18.74m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388393.967532882] [wall_filter_probe]: [ 96.8s] 지워짐  95.9%  0.5m밖 생존점  25개 (1.04~4.66m, 폭 5.17m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388394.968808831] [wall_filter_probe]: [ 97.8s] 지워짐  96.0%  0.5m밖 생존점  25개 (0.83~4.67m, 폭 18.28m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388395.967239539] [wall_filter_probe]: [ 98.8s] 지워짐  96.0%  0.5m밖 생존점  25개 (0.81~4.67m, 폭 18.71m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388396.969516846] [wall_filter_probe]: [ 99.8s] 지워짐  96.0%  0.5m밖 생존점  25개 (0.82~4.67m, 폭 18.63m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388397.968045186] [wall_filter_probe]: [100.8s] 지워짐  96.1%  0.5m밖 생존점  25개 (4.64~4.69m, 폭 0.49m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388398.967551764] [wall_filter_probe]: [101.8s] 지워짐  95.8%  0.5m밖 생존점  27개 (0.79~4.67m, 폭 18.58m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388399.967539612] [wall_filter_probe]: [102.8s] 지워짐  96.1%  0.5m밖 생존점  25개 (0.87~4.69m, 폭 18.38m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388400.967659444] [wall_filter_probe]: [103.8s] 지워짐  95.9%  0.5m밖 생존점  26개 (0.78~4.70m, 폭 18.79m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388401.969245169] [wall_filter_probe]: [104.8s] 지워짐  95.9%  0.5m밖 생존점  25개 (1.01~4.67m, 폭 5.44m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388402.969927504] [wall_filter_probe]: [105.8s] 지워짐  96.1%  0.5m밖 생존점  25개 (0.80~4.67m, 폭 18.81m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388403.967526576] [wall_filter_probe]: [106.8s] 지워짐  96.1%  0.5m밖 생존점  25개 (1.09~4.67m, 폭 5.79m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388404.966955130] [wall_filter_probe]: [107.8s] 지워짐  95.8%  0.5m밖 생존점  27개 (0.77~4.69m, 폭 18.92m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388405.968769525] [wall_filter_probe]: [108.8s] 지워짐  96.2%  0.5m밖 생존점  24개 (1.09~4.67m, 폭 8.42m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388406.968937191] [wall_filter_probe]: [109.8s] 지워짐  96.4%  0.5m밖 생존점  23개 (4.63~4.69m, 폭 0.43m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388407.967860565] [wall_filter_probe]: [110.8s] 지워짐  96.5%  0.5m밖 생존점  22개 (1.11~4.67m, 폭 5.48m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388408.970331654] [wall_filter_probe]: [111.8s] 지워짐  95.1%  0.5m밖 생존점  31개 (0.81~4.70m, 폭 18.75m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388409.969737623] [wall_filter_probe]: [112.8s] 지워짐  96.0%  0.5m밖 생존점  26개 (0.86~4.68m, 폭 18.53m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388410.970977714] [wall_filter_probe]: [113.8s] 지워짐  96.4%  0.5m밖 생존점  23개 (4.64~4.69m, 폭 0.45m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388411.970638724] [wall_filter_probe]: [114.8s] 지워짐  95.8%  0.5m밖 생존점  27개 (0.79~4.67m, 폭 18.77m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388412.967464184] [wall_filter_probe]: [115.8s] 지워짐  95.4%  0.5m밖 생존점  29개 (0.79~4.70m, 폭 18.68m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388413.966552637] [wall_filter_probe]: [116.8s] 지워짐  95.5%  0.5m밖 생존점  29개 (0.81~4.69m, 폭 18.72m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388414.967233415] [wall_filter_probe]: [117.8s] 지워짐  95.9%  0.5m밖 생존점  27개 (0.81~4.67m, 폭 18.65m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388415.968050081] [wall_filter_probe]: [118.8s] 지워짐  95.3%  0.5m밖 생존점  30개 (0.80~4.70m, 폭 18.78m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388416.967683447] [wall_filter_probe]: [119.8s] 지워짐  96.5%  0.5m밖 생존점  23개 (0.81~4.67m, 폭 18.39m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388417.965282971] [wall_filter_probe]: [120.8s] 지워짐  95.3%  0.5m밖 생존점  30개 (0.75~4.70m, 폭 18.79m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388418.968786311] [wall_filter_probe]: [121.8s] 지워짐  94.8%  0.5m밖 생존점  34개 (0.81~4.68m, 폭 18.72m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388419.965967583] [wall_filter_probe]: [122.8s] 지워짐  96.0%  0.5m밖 생존점  25개 (0.81~4.71m, 폭 18.44m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388420.967158370] [wall_filter_probe]: [123.8s] 지워짐  95.8%  0.5m밖 생존점  27개 (1.01~4.67m, 폭 5.85m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388421.968622775] [wall_filter_probe]: [124.8s] 지워짐  95.5%  0.5m밖 생존점  28개 (0.82~4.67m, 폭 18.63m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388422.968988552] [wall_filter_probe]: [125.8s] 지워짐  96.4%  0.5m밖 생존점  22개 (4.64~4.66m, 폭 0.41m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388423.966911392] [wall_filter_probe]: [126.8s] 지워짐  96.2%  0.5m밖 생존점  24개 (4.64~4.69m, 폭 0.47m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388424.967263466] [wall_filter_probe]: [127.8s] 지워짐  96.2%  0.5m밖 생존점  25개 (4.64~4.67m, 폭 0.49m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388425.967189787] [wall_filter_probe]: [128.8s] 지워짐  95.7%  0.5m밖 생존점  28개 (0.78~4.68m, 폭 18.57m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388426.969283322] [wall_filter_probe]: [129.8s] 지워짐  95.9%  0.5m밖 생존점  26개 (0.82~4.67m, 폭 18.72m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388427.967899792] [wall_filter_probe]: [130.8s] 지워짐  96.6%  0.5m밖 생존점  22개 (4.64~4.66m, 폭 0.43m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388428.967440128] [wall_filter_probe]: [131.8s] 지워짐  95.8%  0.5m밖 생존점  27개 (0.81~4.67m, 폭 18.69m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388429.967426660] [wall_filter_probe]: [132.8s] 지워짐  96.0%  0.5m밖 생존점  26개 (0.78~4.67m, 폭 18.77m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388430.969062479] [wall_filter_probe]: [133.8s] 지워짐  96.2%  0.5m밖 생존점  24개 (0.78~4.67m, 폭 18.39m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388431.970187198] [wall_filter_probe]: [134.8s] 지워짐  96.3%  0.5m밖 생존점  24개 (4.64~4.67m, 폭 0.49m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388432.968076133] [wall_filter_probe]: [135.8s] 지워짐  96.4%  0.5m밖 생존점  23개 (4.64~4.66m, 폭 0.45m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388433.970521762] [wall_filter_probe]: [136.8s] 지워짐  95.5%  0.5m밖 생존점  29개 (0.79~4.68m, 폭 18.52m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388434.992194592] [wall_filter_probe]: [137.9s] 지워짐  96.1%  0.5m밖 생존점  25개 (4.64~4.70m, 폭 0.49m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388435.996252848] [wall_filter_probe]: [138.9s] 지워짐  95.9%  0.5m밖 생존점  26개 (0.83~4.67m, 폭 18.35m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388436.993599712] [wall_filter_probe]: [139.9s] 지워짐  96.2%  0.5m밖 생존점  24개 (0.80~4.67m, 폭 18.50m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388437.991552068] [wall_filter_probe]: [140.9s] 지워짐  95.8%  0.5m밖 생존점  27개 (0.83~4.67m, 폭 18.53m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388438.994084031] [wall_filter_probe]: [141.9s] 지워짐  96.3%  0.5m밖 생존점  24개 (4.64~4.70m, 폭 0.47m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388439.992312096] [wall_filter_probe]: [142.9s] 지워짐  95.4%  0.5m밖 생존점  29개 (0.79~4.67m, 폭 18.47m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388440.993120374] [wall_filter_probe]: [143.9s] 지워짐  95.9%  0.5m밖 생존점  26개 (0.85~4.68m, 폭 18.34m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388441.991737971] [wall_filter_probe]: [144.9s] 지워짐  96.2%  0.5m밖 생존점  24개 (0.84~4.67m, 폭 18.43m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388442.992645250] [wall_filter_probe]: [145.9s] 지워짐  96.2%  0.5m밖 생존점  25개 (1.06~4.67m, 폭 4.91m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388443.991338167] [wall_filter_probe]: [146.9s] 지워짐  95.4%  0.5m밖 생존점  27개 (0.84~4.69m, 폭 18.42m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388444.991224907] [wall_filter_probe]: [147.9s] 지워짐  95.8%  0.5m밖 생존점  27개 (0.93~4.70m, 폭 5.35m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388445.998296961] [wall_filter_probe]: [148.9s] 지워짐  96.2%  0.5m밖 생존점  24개 (4.64~4.69m, 폭 0.47m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388446.991823874] [wall_filter_probe]: [149.9s] 지워짐  95.4%  0.5m밖 생존점  29개 (0.80~4.68m, 폭 18.76m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388447.994983758] [wall_filter_probe]: [150.9s] 지워짐  96.3%  0.5m밖 생존점  24개 (1.07~4.67m, 폭 4.99m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388448.998952914] [wall_filter_probe]: [151.9s] 지워짐  96.3%  0.5m밖 생존점  24개 (4.64~4.69m, 폭 0.47m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388449.994469780] [wall_filter_probe]: [152.9s] 지워짐  95.4%  0.5m밖 생존점  30개 (0.76~4.67m, 폭 18.73m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388450.996220137] [wall_filter_probe]: [153.9s] 지워짐  95.8%  0.5m밖 생존점  27개 (0.80~4.67m, 폭 18.58m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388451.991761344] [wall_filter_probe]: [154.9s] 지워짐  95.9%  0.5m밖 생존점  26개 (0.84~4.69m, 폭 18.35m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388452.998870500] [wall_filter_probe]: [155.9s] 지워짐  95.7%  0.5m밖 생존점  28개 (0.81~4.67m, 폭 18.51m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388453.995801191] [wall_filter_probe]: [156.9s] 지워짐  96.3%  0.5m밖 생존점  24개 (4.61~4.67m, 폭 0.49m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388454.993079738] [wall_filter_probe]: [157.9s] 지워짐  96.0%  0.5m밖 생존점  26개 (4.64~4.68m, 폭 0.49m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388455.996008023] [wall_filter_probe]: [158.9s] 지워짐  95.3%  0.5m밖 생존점  31개 (0.80~4.69m, 폭 18.80m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388456.992329134] [wall_filter_probe]: [159.9s] 지워짐  95.3%  0.5m밖 생존점  30개 (0.79~4.67m, 폭 18.47m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388457.993089563] [wall_filter_probe]: [160.9s] 지워짐  96.3%  0.5m밖 생존점  24개 (4.64~4.68m, 폭 0.49m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388458.993809265] [wall_filter_probe]: [161.9s] 지워짐  96.1%  0.5m밖 생존점  25개 (0.81~4.67m, 폭 18.45m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388459.992944662] [wall_filter_probe]: [162.9s] 지워짐  95.2%  0.5m밖 생존점  31개 (0.81~4.69m, 폭 18.77m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388460.993182711] [wall_filter_probe]: [163.9s] 지워짐  95.3%  0.5m밖 생존점  31개 (0.82~4.68m, 폭 18.45m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388461.992858585] [wall_filter_probe]: [164.9s] 지워짐  96.2%  0.5m밖 생존점  25개 (0.78~4.67m, 폭 18.67m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388462.992704967] [wall_filter_probe]: [165.9s] 지워짐  95.4%  0.5m밖 생존점  30개 (0.78~4.67m, 폭 18.65m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388463.992885829] [wall_filter_probe]: [166.9s] 지워짐  95.8%  0.5m밖 생존점  27개 (0.79~4.67m, 폭 18.80m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388465.018997807] [wall_filter_probe]: [167.9s] 지워짐  95.6%  0.5m밖 생존점  29개 (0.78~4.67m, 폭 18.60m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388466.021165060] [wall_filter_probe]: [168.9s] 지워짐  95.6%  0.5m밖 생존점  28개 (0.81~4.67m, 폭 18.32m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388467.070424890] [wall_filter_probe]: [169.9s] 지워짐  96.3%  0.5m밖 생존점  24개 (0.85~4.67m, 폭 18.33m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388468.021354144] [wall_filter_probe]: [170.9s] 지워짐  95.7%  0.5m밖 생존점  27개 (1.06~4.68m, 폭 5.47m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388469.019515594] [wall_filter_probe]: [171.9s] 지워짐  96.2%  0.5m밖 생존점  25개 (4.64~4.67m, 폭 0.47m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388470.018383722] [wall_filter_probe]: [172.9s] 지워짐  96.2%  0.5m밖 생존점  24개 (4.64~4.68m, 폭 0.45m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388471.017646969] [wall_filter_probe]: [173.9s] 지워짐  96.0%  0.5m밖 생존점  25개 (1.00~4.69m, 폭 5.30m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388472.018699217] [wall_filter_probe]: [174.9s] 지워짐  95.6%  0.5m밖 생존점  28개 (0.77~4.67m, 폭 18.65m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388473.017641741] [wall_filter_probe]: [175.9s] 지워짐  95.9%  0.5m밖 생존점  26개 (0.76~4.67m, 폭 18.77m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388474.017940585] [wall_filter_probe]: [176.9s] 지워짐  96.3%  0.5m밖 생존점  24개 (4.64~4.67m, 폭 0.45m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388475.019482532] [wall_filter_probe]: [177.9s] 지워짐  94.7%  0.5m밖 생존점  35개 (0.80~4.67m, 폭 18.64m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388476.018956995] [wall_filter_probe]: [178.9s] 지워짐  94.9%  0.5m밖 생존점  33개 (0.82~4.67m, 폭 18.61m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388477.018822098] [wall_filter_probe]: [179.9s] 지워짐  96.1%  0.5m밖 생존점  25개 (4.64~4.69m, 폭 0.51m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388478.020644588] [wall_filter_probe]: [180.9s] 지워짐  95.9%  0.5m밖 생존점  26개 (0.78~4.70m, 폭 18.67m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388479.020564333] [wall_filter_probe]: [181.9s] 지워짐  96.1%  0.5m밖 생존점  25개 (0.83~4.68m, 폭 18.48m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388480.018907417] [wall_filter_probe]: [182.9s] 지워짐  95.8%  0.5m밖 생존점  27개 (0.82~4.70m, 폭 18.62m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388481.020122561] [wall_filter_probe]: [183.9s] 지워짐  95.9%  0.5m밖 생존점  27개 (0.83~4.66m, 폭 18.43m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388482.018896838] [wall_filter_probe]: [184.9s] 지워짐  96.3%  0.5m밖 생존점  24개 (0.82~4.67m, 폭 18.52m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388483.018444544] [wall_filter_probe]: [185.9s] 지워짐  96.5%  0.5m밖 생존점  23개 (4.64~4.70m, 폭 0.47m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388484.018236135] [wall_filter_probe]: [186.9s] 지워짐  96.1%  0.5m밖 생존점  25개 (4.64~4.68m, 폭 0.49m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388485.018686978] [wall_filter_probe]: [187.9s] 지워짐  96.0%  0.5m밖 생존점  26개 (0.75~4.68m, 폭 18.44m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388486.045951854] [wall_filter_probe]: [188.9s] 지워짐  95.8%  0.5m밖 생존점  27개 (0.80~4.68m, 폭 18.67m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388487.045744206] [wall_filter_probe]: [189.9s] 지워짐  96.3%  0.5m밖 생존점  24개 (0.83~4.67m, 폭 18.23m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388488.043455215] [wall_filter_probe]: [190.9s] 지워짐  96.6%  0.5m밖 생존점  22개 (4.64~4.67m, 폭 0.43m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388489.044339922] [wall_filter_probe]: [191.9s] 지워짐  96.1%  0.5m밖 생존점  25개 (4.64~4.70m, 폭 0.49m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388490.045951593] [wall_filter_probe]: [192.9s] 지워짐  95.6%  0.5m밖 생존점  26개 (0.82~4.67m, 폭 18.69m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388491.044480176] [wall_filter_probe]: [193.9s] 지워짐  94.9%  0.5m밖 생존점  32개 (0.80~4.28m, 폭 16.94m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388492.046293562] [wall_filter_probe]: [194.9s] 지워짐  95.3%  0.5m밖 생존점  32개 (3.55~3.61m, 폭 0.48m, 최소 5개 필요)  →  /static_obstacles 1개
+[INFO] [1787388493.046261962] [wall_filter_probe]: [195.9s] 지워짐  93.9%  0.5m밖 생존점  39개 (0.82~2.94m, 폭 11.45m, 최소 6개 필요)  →  /static_obstacles 1개
+[INFO] [1787388494.070983469] [wall_filter_probe]: [196.9s] 지워짐  92.7%  0.5m밖 생존점  49개 (2.23~2.27m, 폭 0.48m, 최소 8개 필요)  →  /static_obstacles 1개
+[INFO] [1787388495.071221777] [wall_filter_probe]: [197.9s] 지워짐  91.9%  0.5m밖 생존점  60개 (1.63~1.70m, 폭 0.43m, 최소 11개 필요)  →  /static_obstacles 1개
+[INFO] [1787388496.072908535] [wall_filter_probe]: [199.0s] 지워짐  90.5%  0.5m밖 생존점  68개 (1.58~10.88m, 폭 3.80m, 최소 11개 필요)  →  /static_obstacles 1개
+[INFO] [1787388497.068263278] [wall_filter_probe]: [199.9s] 지워짐  90.4%  0.5m밖 생존점  69개 (1.58~10.89m, 폭 3.80m, 최소 11개 필요)  →  /static_obstacles 1개
+[INFO] [1787388498.071170489] [wall_filter_probe]: [200.9s] 지워짐  90.6%  0.5m밖 생존점  69개 (1.64~10.97m, 폭 3.50m, 최소 10개 필요)  →  /static_obstacles 1개
+[INFO] [1787388499.095335546] [wall_filter_probe]: [202.0s] 지워짐  93.2%  0.5m밖 생존점  45개 (2.41~2.47m, 폭 0.48m, 최소 7개 필요)  →  /static_obstacles 1개
+[INFO] [1787388500.096100364] [wall_filter_probe]: [203.0s] 지워짐  94.7%  0.5m밖 생존점  35개 (0.85~3.29m, 폭 12.92m, 최소 6개 필요)  →  /static_obstacles 1개
+[INFO] [1787388501.097849142] [wall_filter_probe]: [204.0s] 지워짐  94.3%  0.5m밖 생존점  38개 (0.80~4.14m, 폭 25.96m, 최소 5개 필요)  →  /static_obstacles 1개
+[INFO] [1787388502.094079488] [wall_filter_probe]: [205.0s] 지워짐  96.2%  0.5m밖 생존점  25개 (1.75~4.97m, 폭 31.21m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388503.120627565] [wall_filter_probe]: [206.0s] 지워짐  95.4%  0.5m밖 생존점  31개 (1.57~5.62m, 폭 35.30m, 최소 3개 필요)  →  /static_obstacles 1개
+[INFO] [1787388504.120475785] [wall_filter_probe]: [207.0s] 지워짐  94.6%  0.5m밖 생존점  35개 (1.04~5.64m, 폭 35.39m, 최소 3개 필요)  →  /static_obstacles 1개
+[INFO] [1787388505.119452122] [wall_filter_probe]: [208.0s] 지워짐  96.2%  0.5m밖 생존점  25개 (1.59~5.61m, 폭 35.20m, 최소 3개 필요)  →  /static_obstacles 1개
+[INFO] [1787388506.121415467] [wall_filter_probe]: [209.0s] 지워짐  96.1%  0.5m밖 생존점  27개 (1.01~5.19m, 폭 32.62m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388507.119885439] [wall_filter_probe]: [210.0s] 지워짐  96.6%  0.5m밖 생존점  23개 (4.76~4.81m, 폭 30.21m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388508.119902070] [wall_filter_probe]: [211.0s] 지워짐  96.5%  0.5m밖 생존점  23개 (1.06~4.75m, 폭 29.80m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388509.122927118] [wall_filter_probe]: [212.0s] 지워짐  96.3%  0.5m밖 생존점  25개 (0.93~4.75m, 폭 29.80m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388510.121909470] [wall_filter_probe]: [213.0s] 지워짐  96.2%  0.5m밖 생존점  25개 (1.79~5.17m, 폭 32.46m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388511.120333513] [wall_filter_probe]: [214.0s] 지워짐  96.1%  0.5m밖 생존점  26개 (1.61~7.34m, 폭 46.06m, 최소 3개 필요)  →  /static_obstacles 0개
+[INFO] [1787388512.121687986] [wall_filter_probe]: [215.0s] 지워짐  94.4%  0.5m밖 생존점  38개 (1.61~7.22m, 폭 45.36m, 최소 3개 필요)  →  /static_obstacles 1개
+[INFO] [1787388513.120248939] [wall_filter_probe]: [216.0s] 지워짐  95.3%  0.5m밖 생존점  32개 (1.68~7.24m, 폭 45.47m, 최소 3개 필요)  →  /static_obstacles 1개
+[INFO] [1787388514.121858085] [wall_filter_probe]: [217.0s] 지워짐  95.4%  0.5m밖 생존점  32개 (5.70~7.42m, 폭 46.59m, 최소 3개 필요)  →  /static_obstacles 1개
+[INFO] [1787388515.120712720] [wall_filter_probe]: [218.0s] 지워짐  97.2%  0.5m밖 생존점  19개 (5.23~5.27m, 폭 33.07m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388516.120246732] [wall_filter_probe]: [219.0s] 지워짐  96.5%  0.5m밖 생존점  21개 (4.75~4.79m, 폭 30.06m, 최소 4개 필요)  →  /static_obstacles 0개
+[INFO] [1787388517.120968518] [wall_filter_probe]: [220.0s] 지워짐  95.9%  0.5m밖 생존점  27개 (1.05~4.08m, 폭 25.61m, 최소 5개 필요)  →  /static_obstacles 1개
+[INFO] [1787388518.120456909] [wall_filter_probe]: [221.0s] 지워짐  94.7%  0.5m밖 생존점  35개 (3.38~3.44m, 폭 21.60m, 최소 5개 필요)  →  /static_obstacles 1개
+[INFO] [1787388519.122644686] [wall_filter_probe]: [222.0s] 지워짐  93.3%  0.5m밖 생존점  43개 (2.78~2.81m, 폭 17.64m, 최소 6개 필요)  →  /static_obstacles 1개
+[INFO] [1787388520.119719984] [wall_filter_probe]: [223.0s] 지워짐  91.2%  0.5m밖 생존점  60개 (0.83~2.13m, 폭 13.36m, 최소 8개 필요)  →  /static_obstacles 0개
+[INFO] [1787388521.128819331] [wall_filter_probe]: [224.0s] 지워짐  87.2%  0.5m밖 생존점  88개 (0.83~1.46m, 폭 9.17m, 최소 12개 필요)  →  /static_obstacles 1개
+[INFO] [1787388522.121330870] [wall_filter_probe]: [225.0s] 지워짐  86.8%  0.5m밖 생존점  92개 (0.84~1.26m, 폭 7.94m, 최소 14개 필요)  →  /static_obstacles 1개
+[INFO] [1787388523.120007943] [wall_filter_probe]: [226.0s] 지워짐  86.5%  0.5m밖 생존점  93개 (0.82~1.27m, 폭 7.96m, 최소 14개 필요)  →  /static_obstacles 1개
+[INFO] [1787388524.121756473] [wall_filter_probe]: [227.0s] 지워짐  87.4%  0.5m밖 생존점  86개 (1.21~1.27m, 폭 7.97m, 최소 14개 필요)  →  /static_obstacles 0개
+[INFO] [1787388525.126917844] [wall_filter_probe]: [228.0s] 지워짐  89.2%  0.5m밖 생존점  73개 (0.79~1.62m, 폭 10.19m, 최소 11개 필요)  →  /static_obstacles 1개
+[INFO] [1787388526.121916011] [wall_filter_probe]: [229.0s] 지워짐  92.3%  0.5m밖 생존점  51개 (0.86~2.46m, 폭 15.46m, 최소 7개 필요)  →  /static_obstacles 1개
+[INFO] [1787388527.124680160] [wall_filter_probe]: [230.0s] 지워짐  93.9%  0.5m밖 생존점  40개 (0.82~3.31m, 폭 20.79m, 최소 6개 필요)  →  /static_obstacles 1개
+[INFO] [1787388528.126115008] [wall_filter_probe]: [231.0s] 지워짐  95.9%  0.5m밖 생존점  27개 (1.78~4.16m, 폭 26.09m, 최소 5개 필요)  →  /static_obstacles 1개
+[INFO] [1787388529.123161197] [wall_filter_probe]: [232.0s] 지워짐  96.5%  0.5m밖 생존점  24개 (4.45~4.49m, 폭 28.18m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388530.122152517] [wall_filter_probe]: [233.0s] 지워짐  95.8%  0.5m밖 생존점  26개 (1.05~4.48m, 폭 28.14m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388531.122372507] [wall_filter_probe]: [234.0s] 지워짐  95.9%  0.5m밖 생존점  28개 (1.05~4.48m, 폭 28.11m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388532.121216921] [wall_filter_probe]: [235.0s] 지워짐  96.3%  0.5m밖 생존점  25개 (4.44~4.48m, 폭 28.13m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388533.121751965] [wall_filter_probe]: [236.0s] 지워짐  96.8%  0.5m밖 생존점  21개 (4.44~4.47m, 폭 28.09m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388534.122263429] [wall_filter_probe]: [237.0s] 지워짐  96.1%  0.5m밖 생존점  25개 (1.04~4.47m, 폭 28.09m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388535.120571237] [wall_filter_probe]: [238.0s] 지워짐  96.6%  0.5m밖 생존점  23개 (4.44~4.48m, 폭 28.11m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388536.123137151] [wall_filter_probe]: [239.0s] 지워짐  96.8%  0.5m밖 생존점  22개 (4.43~4.47m, 폭 28.07m, 최소 4개 필요)  →  /static_obstacles 1개
+[INFO] [1787388537.120725048] [wall_filter_probe]: [240.0s] 지워짐  96.5%  0.5m밖 생존점  24개 (4.43~4.48m, 폭 28.11m, 최소 4개 필요)  →  /static_obstacles 1개
+
+스캔 9560 장
+  스캔당 유효점      중앙 641
+  벽으로 지워진 비율  중앙 96.0%  최소 69.4%  최대 100.0%
+  살아남은 점 수      중앙 26  최대 406
+  살아남은 최원거리    중앙 4.69 m  95% 5.52 m  최대 11.00 m
+  /static_obstacles 최대 클러스터 수  2 (9571 프레임 수신)
+
+  판정: 검출까지 정상 (2개). 늦음의 원인은 검출부가 아니다.
+
+스캔 9560 장
+  스캔당 유효점      중앙 641
+  벽으로 지워진 비율  중앙 96.0%  최소 69.4%  최대 100.0%
+  살아남은 점 수      중앙 26  최대 406
+  살아남은 최원거리    중앙 4.69 m  95% 5.52 m  최대 11.00 m
+  /static_obstacles 최대 클러스터 수  2 (9571 프레임 수신)
+
+  판정: 검출까지 정상 (2개). 늦음의 원인은 검출부가 아니다.

@@ -35,17 +35,21 @@ MAP_BUILDER.use_trajectory_builder_2d = true
 TRAJECTORY_BUILDER_2D.num_accumulated_range_data = 1
 TRAJECTORY_BUILDER_2D.use_imu_data = true
 TRAJECTORY_BUILDER_2D.imu_gravity_time_constant = 80.0
-TRAJECTORY_BUILDER_2D.max_range = 40.
+-- 반대편 벽/루프 혼동↓. 40m면 좁은 트랙에서 평행벽 constraint가 직선을 당김.
+TRAJECTORY_BUILDER_2D.max_range = 22.
 TRAJECTORY_BUILDER_2D.voxel_filter_size = 0.10
 
 TRAJECTORY_BUILDER_2D.use_online_correlative_scan_matching = true
--- 창이 크면 1m 복도에서 점수 높은 곳을 뒤로 집어 TF가 뚜둑 밀림.
-TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 0.10
+-- 직선 복도: 옆벽은 종방향으로 비슷해서 창이 넓으면 점수 높은 뒤쪽에 붙음.
+-- 스캔 간 이동은 odom+IMU 예측, 창은 예측 잔차(수 cm)만 커버하면 됨.
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 0.06
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window = math.rad(8.)
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.translation_delta_cost_weight = 24.
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.rotation_delta_cost_weight = 28.0
 
+-- translation_weight↑: 직선 종방향은 wheel odom+IMU를 더 믿고 라이다 슬라이딩↓
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.occupied_space_weight = 20.
-TRAJECTORY_BUILDER_2D.ceres_scan_matcher.translation_weight = 10.
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.translation_weight = 22.
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.rotation_weight = 60.
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.ceres_solver_options.max_num_iterations = 10
 

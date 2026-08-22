@@ -2,18 +2,20 @@
 -- 파일 이름만 pose_graph_mapping.lua — include 경로를 유지하기 위함.
 
 POSE_GRAPH = {
-  optimize_every_n_nodes = 80,
+  -- 직선 가속 중 자주 optimize하면 복도 constraint가 종방향을 한 번에 당김.
+  optimize_every_n_nodes = 100,
   constraint_builder = {
-    sampling_ratio = 0.04,
-    max_constraint_distance = 15.,
-    min_score = 0.65,
+    sampling_ratio = 0.03,
+    max_constraint_distance = 12.,
+    min_score = 0.70,
     global_localization_min_score = 0.82,
-    loop_closure_translation_weight = 1.1e4,
+    loop_closure_translation_weight = 8e3,
     loop_closure_rotation_weight = 1e5,
     log_matches = false,
     fast_correlative_scan_matcher = {
-      linear_search_window = 1.2,
-      angular_search_window = math.rad(20.),
+      -- 1.2m면 직선 구간에서 평행벽 루프가 뒤쪽으로 끌어당김.
+      linear_search_window = 0.6,
+      angular_search_window = math.rad(12.),
       branch_and_bound_depth = 7,
     },
     ceres_scan_matcher = {
@@ -56,8 +58,9 @@ POSE_GRAPH = {
     rotation_weight = 1.6e4,
     local_slam_pose_translation_weight = 1e5,
     local_slam_pose_rotation_weight = 1e5,
-    odometry_translation_weight = 1e4,
-    odometry_rotation_weight = 1e3,
+    -- 직선 종방향: odom을 보조로 더 믿되 3e4+는 2바퀴 스케일 보정을 막음.
+    odometry_translation_weight = 2e4,
+    odometry_rotation_weight = 5e3,
     fixed_frame_pose_translation_weight = 1e1,
     fixed_frame_pose_rotation_weight = 1e2,
     fixed_frame_pose_use_tolerant_loss = false,

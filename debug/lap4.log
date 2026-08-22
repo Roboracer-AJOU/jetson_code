@@ -1,0 +1,25 @@
+  17.029  v=4.03  d= 3.90  mode=AVOID    [local_planner_node] FGM 회피 분기인데 pose 또는 /fgm_target 없음 — /local_path 미발행.
+  17.085  v=4.14  d= 3.69  mode=AVOID    [fgm_node] gap 은 열렸지만 차폭이 안 들어감 — aim=-30° clear=0.57m < 1.00m. 목표점을 당겨 찍음
+  18.105  v=1.92  d= 0.89  mode=AVOID    [emergency_brake_node] EMERGENCY BRAKE [STANDOFF] — ttc=0.08s beams=2 closest=0.15m v=1.91m/s mode=AVOID(완화)
+  18.453  v=1.46  d= 0.58  mode=AVOID    [local_planner_node] AEB 탈출 모드 진입 — FGM 회피경로 강제 발행, 속도 ≤0.80m/s (aeb_total=1)
+  18.456  v=1.46  d= 0.58  mode=AVOID    [local_planner_node] 탈출 헤딩 고정 — 멈춘 방향 ±55° 안에서만 빠져나간다
+  18.473  v=1.44  d= 0.58  mode=AVOID    [fgm_node] 탈출 조준 제한 — 기준 +0° ±55°
+  22.235  v=1.80  d=    -  mode=REJOIN   [fgm_node] gap 은 열렸지만 차폭이 안 들어감 — aim=-33° clear=0.72m < 1.00m. 목표점을 당겨 찍음
+  27.708  v=3.66  d=    -  mode=AVOID    [local_planner_node] FGM 회피 분기인데 pose 또는 /fgm_target 없음 — /local_path 미발행.
+  32.980  v=4.22  d=    -  mode=AVOID    [local_planner_node] FGM 회피 분기인데 pose 또는 /fgm_target 없음 — /local_path 미발행.
+  35.350  v=2.69  d=    -  mode=AVOID    [local_planner_node] 회피 경로가 6번째 점에서 막힘 — 쓸 만한 길이가 안 나와 회피 포기, CSV 유지. 감속 후 AEB 가 받는다. 원인=장애물 (장애물 6, 벽 16) 확보 0.45 m < 요구 0.60 m (v=2.7) FGM=+21°
+  35.352  v=2.69  d=    -  mode=AVOID    [fgm_node] gap 은 열렸지만 차폭이 안 들어감 — aim=-78° clear=0.47m < 1.00m. 목표점을 당겨 찍음
+  41.881  v=4.51  d= 0.56  mode=AVOID    [local_planner_node] FGM 회피 분기인데 pose 또는 /fgm_target 없음 — /local_path 미발행.
+  46.331  v=4.28  d= 3.92  mode=AVOID    [local_planner_node] FGM 회피 분기인데 pose 또는 /fgm_target 없음 — /local_path 미발행.
+  48.606  v=2.68  d=    -  mode=REJOIN   [fgm_node] gap 은 열렸지만 차폭이 안 들어감 — aim=+37° clear=0.80m < 1.00m. 목표점을 당겨 찍음
+  50.113  v=0.61  d=    -  mode=GLOBAL   [emergency_brake_node] EMERGENCY BRAKE [STANDOFF] — ttc=0.36s beams=1 closest=0.17m v=0.61m/s
+  50.446  v=0.20  d=    -  mode=GLOBAL   [local_planner_node] AEB 탈출 모드 진입 — FGM 회피경로 강제 발행, 속도 ≤0.80m/s (aeb_total=2)
+  50.449  v=0.20  d=    -  mode=AVOID    [local_planner_node] 탈출 헤딩 고정 — 멈춘 방향 ±55° 안에서만 빠져나간다
+  50.450  v=0.20  d=    -  mode=AVOID    [local_planner_node] FGM 회피 분기인데 pose 또는 /fgm_target 없음 — /local_path 미발행.
+  50.472  v=0.11  d=    -  mode=AVOID    [fgm_node] 탈출 조준 제한 — 기준 +0° ±55°
+  50.480  v=0.13  d=    -  mode=AVOID    [fgm_node] gap 은 열렸지만 차폭이 안 들어감 — aim=+24° clear=0.00m < 1.00m. 목표점을 당겨 찍음
+  50.501  v=0.13  d=    -  mode=AVOID    [local_planner_node] 회피 경로가 1번째 점에서 막힘 — 쓸 만한 길이가 안 나와 회피 포기, CSV 유지. 감속 후 AEB 가 받는다. 원인=벽 (벽 1, 장애물 35) 확보 0.00 m < 요구 0.25 m (v=0.1) FGM=+24°
+  51.502  v=0.00  d=    -  mode=AVOID    [fgm_node] gap 은 열렸지만 차폭이 안 들어감 — aim=+29° clear=0.00m < 1.00m. 목표점을 당겨 찍음
+  51.503  v=0.00  d=    -  mode=AVOID    [local_planner_node] 회피 경로가 1번째 점에서 막힘 — 쓸 만한 길이가 안 나와 회피 포기, CSV 유지. 감속 후 AEB 가 받는다. 원인=벽 (벽 1, 장애물 35) 확보 0.00 m < 요구 0.25 m (v=0.0) FGM=+25°
+  52.529  v=0.00  d=    -  mode=AVOID    [fgm_node] gap 은 열렸지만 차폭이 안 들어감 — aim=+25° clear=0.00m < 1.00m. 목표점을 당겨 찍음
+  52.532  v=0.00  d=    -  mode=AVOID    [local_planner_node] 회피 경로가 1번째 점에서 막힘 — 쓸 만한 길이가 안 나와 회피 포기, CSV 유지. 감속 후 AEB 가 받는다. 원인=벽 (벽 1, 장애물 35) 확보 0.00 m < 요구 0.25 m (v=0.0) FGM=+25°

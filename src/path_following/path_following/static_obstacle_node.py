@@ -53,7 +53,7 @@ CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
     # integrated_obstacle_node·로컬라이제이션 pbstream·CSV 와 같은 맵이어야 한다.
     # 이전 값은 이틀 전 맵이라 세 곳과 전부 어긋나 있었다.
-    "map_name": "cartographer_map_20260820_214849_rosmap.yaml",  # 이전 20260816_234629
+    "map_name": "cartographer_map_20260822_164229_rosmap.yaml",  # 이전 20260816_234629
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",  # 실차 (시뮬: ego_racecar/laser)
@@ -72,11 +72,26 @@ CFG = {
     # 팽창은 ceil(r/resolution) 셀이라 0.25 는 정확히 5셀(=0.25m)이다.
     # scan stamp 로 TF 를 조회하도록 고치기 전에는 여기에 시각 불일치
     # 14cm 가 더 붙어서 0.42 가 필요했다 (_lookup_laser_to_map 참고).
-    # 새로 드러나는 0.25~0.42 띠는 아래 near_wall 가드가 점수·span 으로
-    # 거른다 (얇은 벽 잔차는 탈락, 실물 박스는 통과).
+    #
+    # ---- 그런데 0.25 는 벽에 붙은 장애물을 통째로 지운다 (20260822 실측) ----
+    # 벽에 붙인 50 cm 박스를 3.4 m 앞에 두고 989 스캔을 재 보면, 박스 점들이
+    # 맵 벽에서 0.10~0.43 m 에 걸쳐 있다. LiDAR 가 정면과 측면을 같이 보는데
+    # 측면은 벽 쪽으로 파고들기 때문이다. 팽창이 그 구간을 먹으면 남는 건
+    # 10점 / 폭 0.12 m 뿐이라 min_obstacle_size_m(0.12) 에서 탈락한다.
+    # 실제로 벽에 붙였을 때 31초 내내 검출 0, 가운데로 옮기면 135초 내내
+    # 검출 1 이었다. 회피가 "한 박자 늦는" 게 아니라 아예 시작을 못 했고,
+    # AEB 가 원시 스캔으로 2.5 m 에서 잡아 세우는 게 유일한 반응이었다.
+    #
+    # 같은 스캔에 노드와 동일한 클러스터링·가드를 걸어 팽창만 바꿔 보면
+    #   0.25 → 검출 0.3%   0.20 → 19%   0.15 → 83%   0.10 → 100%
+    # 이고 유령 검출은 어느 값에서도 0/스캔이었다 (debug/inflation_sweep.py).
+    # 정지 측정이라 스캔왜곡 항(0.09)이 빠져 있으니, 위 예산에서 그 항을 뺀
+    # 0.145 가 정지 기준이고 0.10 은 거기서 한 칸 더 들어간 값이다.
+    # 그 대가는 아래 near_wall 가드를 넓혀서 증거량으로 갚는다.
+    #
     # 더 낮추려면 점별 디스큐나 측위 개선이 먼저다 —
     # scripts/measure_wall_residual.py 로 실측해서 근거를 만들 것.
-    "wall_match_radius_m": 0.25,
+    "wall_match_radius_m": 0.10,
     "tf_timeout_sec": 0.10,
     "cluster_gap_threshold_m": 0.28,
     "min_cluster_points": 10,
@@ -110,9 +125,11 @@ CFG = {
     "radius_min_m": 0.05,
     # 벽 잔차 오검출 억제. integrated_obstacle_node 와 같은 기준으로 맞춘다.
     # wall_match_radius_m 를 줄인 만큼 이 띠를 넓혀서, 새로 드러난 구간을
-    # 증거량(점수·span)으로 판단하게 한다.
+    # 증거량(점수·span)으로 판단하게 한다. 팽창 0.25+여유 0.20 이 원래
+    # 맵 벽 기준 0.45 m 까지를 덮었으므로, 팽창을 0.10 으로 내린 지금은
+    # 0.35 여야 같은 범위가 유지된다.
     "wall_residual_guard": True,
-    "wall_clearance_m": 0.20,
+    "wall_clearance_m": 0.35,
     "near_wall_min_points": 14,
     "near_wall_min_span_m": 0.20,
     "max_obstacle_size_m": 0.85,
@@ -142,6 +159,27 @@ CFG = {
     # Foxglove/RViz MarkerArray
     "publish_markers": True,
 }
+
+
+def near_wall_point_gate(
+    fixed_min: int, min_span_m: float, range_m: float, angle_increment: float
+) -> int:
+    """벽 근처 클러스터에 요구할 최소 점 수. 거리에 따라 완화된다.
+
+    고정값 14 는 물리적 크기가 아니라 각분해능에 묶인 수라, 같은 물체가
+    거리에 따라 통과했다 떨어졌다 한다. 3.4 m 에서 14 점은 호 길이 0.25 m
+    지만 8 m 에서는 0.58 m 다 — 50 cm 박스가 멀다는 이유만으로 탈락한다.
+    팽창을 0.25 → 0.10 으로 내리면서 이 가드가 덮는 띠를 0.35 로 넓혔으니,
+    그 안에 들어오는 실장애물이 늘어난 만큼 이 왜곡도 같이 커진다.
+
+    그래서 `near_wall_min_span_m` 를 그 거리에서 채우는 데 필요한 점 수를
+    상한으로 둔다. 폭 조건과 같은 것을 요구하는 셈이라 판단 기준이 하나로
+    모이고, 고정값보다 **느슨해질 때만** 적용되므로 가까운 거리의 잔차
+    억제력은 그대로다.
+    """
+    step = max(1e-6, range_m * max(1e-9, angle_increment))
+    needed = int(math.ceil(min_span_m / step))
+    return max(4, min(int(fixed_min), needed))
 
 
 class StaticMap:
@@ -548,7 +586,13 @@ class StaticObstacleNode(Node):
                 for c, wd in zip(clusters, wdist)
                 if wd >= self._wall_clearance_m
                 or (
-                    c.n_points >= self._near_wall_min_points
+                    c.n_points
+                    >= near_wall_point_gate(
+                        self._near_wall_min_points,
+                        self._near_wall_min_span_m,
+                        math.hypot(c.center_x, c.center_y),
+                        angle_inc,
+                    )
                     and c.span_m >= self._near_wall_min_span_m
                 )
             ]

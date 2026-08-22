@@ -146,6 +146,20 @@ CFG = {
     "corridor_want_time_s": 0.5,
     "corridor_want_min_m": 1.5,
     "corridor_want_max_m": 3.0,
+    # 갭 **선택** 단계에서도 차폭을 본다.
+    #
+    # 위 코리도 검사는 이미 고른 갭 **안에서만** 각도를 옮긴다. 그래서 고른
+    # 갭 자체가 차폭이 안 들어가는 통로면 빠져나갈 길이 없다 — 실측
+    # (20260822) 에서 4.0 m/s 로 4.1 m 앞 박스를 만난 차가 -30° 를 겨눴는데
+    # 그 방향 여유가 0.57 m 였다. 각도로만 고르면 "넓어 보이는데 못 지나가는"
+    # 갭이 이긴다.
+    #
+    # 그래서 후보 갭마다 최선의 여유를 재서, 안 들어가는 갭은 후보에서 뺀다.
+    # 전부 안 들어가면 예전대로 둔다 — 못 지나갈 때 판단을 바꿔 봐야 나아질
+    # 게 없고, 그때는 감속과 AEB 몫이다.
+    "gap_fit_check_enable": True,
+    "gap_fit_samples": 5,        # 갭당 훑을 각도 수 (양 끝 포함)
+    "gap_fit_min_m": 1.0,        # 이만큼도 안 뚫렸으면 후보에서 뺀다
     # 목표점 거리 = clamp(ego_speed * lead_time, min, max) [m, 레이저 프레임]
     "target_lead_time_s": 0.70,
     "target_min_m": 1.0,
@@ -316,6 +330,11 @@ class FGMNode(Node):
         self.corridor_want_min_m = max(
             0.2, float(self.get_parameter("corridor_want_min_m").value)
         )
+        self.gap_fit_check_enable = bool(
+            self.get_parameter("gap_fit_check_enable").value
+        )
+        self.gap_fit_samples = max(2, int(self.get_parameter("gap_fit_samples").value))
+        self.gap_fit_min_m = max(0.0, float(self.get_parameter("gap_fit_min_m").value))
         self.corridor_want_max_m = max(
             self.corridor_want_min_m,
             float(self.get_parameter("corridor_want_max_m").value),
@@ -361,6 +380,7 @@ class FGMNode(Node):
         self._ego_speed = 0.0
         self._last_scan_ns: int | None = None
         self._last_corridor_warn_ns = 0
+        self._last_gap_fit_counts = (0, 0)
         self._prefer_angle = 0.0
         self._prefer_cone = 0.0
         self._prefer_ns = 0
@@ -482,11 +502,12 @@ class FGMNode(Node):
         if self._fgm_enabled != was:
             self._set_cpu_boost(self._fgm_enabled)
         if was and not self._fgm_enabled:
-            # 목표 스무딩만 리셋 — 갭 마커/히스테리시스는 유지
+            # 목표 스무딩만 리셋하고, Foxglove에 남은 마지막 갭 마커는
+            # 투명 마커로 즉시 덮어쓴다. 캐시도 비워 heartbeat가 OFF 상태에서
+            # 이전 마커를 다시 살리지 못하게 한다.
             self._reset_fgm_filter_state(keep_gap_hysteresis=True)
-            # DELETE 를 내면 Foxglove 가 같은 ns/id 의 다음 ADD 를
-            # 무시하는 경우가 있다. 마지막 V 는 하트비트가 lifetime 으로
-            # 자연스럽게 사라지게 둔다.
+            self._last_gap_marker = None
+            self._publish_gap_marker_delete()
 
     def _set_cpu_boost(self, enabled: bool) -> None:
         """FGM enable 시 패스 코어 1순위(nice -20). OFF면 기본(nice 5)으로 복귀."""
@@ -561,7 +582,9 @@ class FGMNode(Node):
             self.gap_markers_pub.publish(arr)
 
     def _heartbeat_gap_marker(self) -> None:
-        """마지막 V 를 다시 내서 토픽·Foxglove 채널을 유지한다."""
+        """FGM ON일 때만 마지막 V를 다시 내서 Foxglove 채널을 유지한다."""
+        if not self._fgm_enabled:
+            return
         if self._last_gap_marker is None:
             return
         if self.gap_marker_pub is None and self.gap_markers_pub is None:
@@ -691,14 +714,29 @@ class FGMNode(Node):
         return float(nx), float(ny)
 
     def _warn_corridor_blocked(self, angle: float, clear: float) -> None:
-        """차폭이 안 들어가는 상황 경고 (1초에 한 번). 정지는 AEB 몫."""
+        """차폭이 안 들어가는 상황 경고 (1초에 한 번). 정지는 AEB 몫.
+
+        후보 갭이 몇 개였고 그중 몇 개가 차폭을 통과했는지 같이 찍는다. 이게
+        없으면 "고를 게 없었다" 와 "고를 수 있었는데 잘못 골랐다" 가 구분이
+        안 되고, 둘은 손댈 곳이 정반대다 — 전자는 감속·AEB 문제고 후자만
+        갭 선택 문제다. 적합성 필터는 후보가 하나뿐이거나 전부 떨어지면
+        일부러 손대지 않으므로, 그 두 경우가 여기 그대로 올라온다.
+        """
         now = self.get_clock().now().nanoseconds
         if now - self._last_corridor_warn_ns < 1_000_000_000:
             return
         self._last_corridor_warn_ns = now
+        n_all, n_fit = self._last_gap_fit_counts
+        if n_fit == 0:
+            why = f"후보 {n_all}개 전부 안 들어감 — 지나갈 길이 없음"
+        elif n_all < 2:
+            why = "후보가 1개뿐이라 거를 수 없었음"
+        else:
+            why = f"후보 {n_all}개 중 {n_fit}개는 들어갔는데 그걸 못 고름"
         self.get_logger().warn(
             f"gap 은 열렸지만 차폭이 안 들어감 — aim={math.degrees(angle):+.0f}° "
-            f"clear={clear:.2f}m < {self.target_min_m:.2f}m. 목표점을 당겨 찍음"
+            f"clear={clear:.2f}m < {self.target_min_m:.2f}m. 목표점을 당겨 찍음. "
+            f"v={abs(self._ego_speed):.1f} 콘=±{math.degrees(self._fov_rad):.0f}° {why}"
         )
 
     def _corridor_clear_distance(
@@ -722,6 +760,100 @@ class FGMNode(Node):
         if not np.any(blocking):
             return self.preprocess_dist
         return max(0.0, float(along[blocking].min()) - self.corridor_stop_margin)
+
+    def _aim_range(
+        self, gap_start_angle: float, gap_end_angle: float, prefer, aim_ref: float
+    ) -> tuple[float, float]:
+        """갭에서 **실제로 조준할 수 있는** 각도 범위.
+
+        갭 그대로가 아니다. 가장자리 여유(`gap_edge_inset_rad`)를 물리고,
+        탈출 기준 콘과 속도 연동 FOV 로 또 자른다. 갭 적합성 판정도 이 범위로
+        해야 한다 — 원래 갭 폭으로 재면 "합격시킨 각도가 정작 못 쓰이는 각도"
+        가 되어, 걸러 놓고도 같은 곳에서 막힌다.
+
+        속도 제한은 **여기서만** 건다. 스캔을 좁히면 갭 탐색이 눈을 잃어서,
+        정작 넓게 열린 쪽이 시야 밖이면 반대쪽 좁은 갭을 고른다 — 그게
+        좌우로 방황하다 장애물 앞에 서는 동작이다. 갭은 넓게 보고, 그쪽으로
+        트는 각만 낼 수 있는 만큼으로 줄인다.
+        """
+        lo = min(gap_start_angle, gap_end_angle)
+        hi = max(gap_start_angle, gap_end_angle)
+        inset = self.gap_edge_inset_rad
+        if hi - lo > 2.0 * inset:
+            lo += inset
+            hi -= inset
+        else:
+            lo = hi = 0.5 * (lo + hi)
+        if prefer is not None:
+            lo, hi = self._clamp_to_cone(lo, hi, aim_ref, prefer[1])
+        if self._fov_rad < self.fov_angle:
+            lo, hi = self._clamp_to_cone(lo, hi, 0.0, self._fov_rad)
+        return lo, hi
+
+    def _gap_best_clear_m(
+        self,
+        geom_ranges: np.ndarray,
+        wrapped: np.ndarray,
+        lo: float,
+        hi: float,
+        stop_at: float,
+    ) -> float:
+        """이 각도 범위에서 낼 수 있는 **최선의** 코리도 여유거리 [m].
+
+        전부 훑을 필요는 없다. `stop_at` 을 넘기는 각도가 하나라도 나오면
+        그 갭은 합격이므로 거기서 끊는다. 보통 첫 한두 번에 끝난다.
+        """
+        best = 0.0
+        for a in np.linspace(lo, hi, self.gap_fit_samples):
+            best = max(
+                best, self._corridor_clear_distance(geom_ranges, wrapped, float(a))
+            )
+            if best >= stop_at:
+                break
+        return best
+
+    def _gaps_that_fit(
+        self,
+        gaps: list,
+        geom_ranges: np.ndarray,
+        wrapped: np.ndarray,
+        work_angles: np.ndarray,
+        prefer,
+        aim_ref: float,
+    ) -> list:
+        """차폭이 실제로 들어가는 갭만 남긴다.
+
+        갭 선택은 각도 폭으로만 이뤄져서 "각도는 넓은데 차폭은 안 들어가는"
+        통로를 이긴 놈으로 뽑을 수 있다. 그 뒤의 코리도 검사는 이미 고른
+        갭 **안에서** 각도를 옮길 뿐이라 되돌리지 못한다.
+
+        판정 범위는 `_aim_range` 다. 갭 원래 폭으로 재면 조준 단계에서 잘려
+        나갈 각도로 합격시키게 되어, 걸러 놓고도 같은 곳에서 막힌다.
+
+        후보가 하나뿐이면 걸러 봐야 고를 게 없으므로 그냥 둔다. 전부
+        떨어져도 원래 목록을 돌려준다 — 못 지나가는 상황에서 판단을 바꾼다고
+        나아지지 않고, 그때는 감속과 AEB 가 받는다.
+        """
+        if not self.gap_fit_check_enable or len(gaps) < 2:
+            self._last_gap_fit_counts = (len(gaps), len(gaps))
+            return gaps
+        fits = []
+        for g in gaps:
+            lo, hi = self._aim_range(
+                float(work_angles[int(g[0])]),
+                float(work_angles[int(g[-1])]),
+                prefer,
+                aim_ref,
+            )
+            if (
+                self._gap_best_clear_m(
+                    geom_ranges, wrapped, lo, hi, self.gap_fit_min_m
+                )
+                >= self.gap_fit_min_m
+            ):
+                fits.append(g)
+        self._last_gap_fit_counts = (len(gaps), len(fits))
+        return fits or gaps
 
     def _corridor_want_m(self) -> float:
         """보상이 포화되는 여유거리 [m]. 여기를 넘으면 정면 선호가 이긴다.
@@ -872,6 +1004,10 @@ class FGMNode(Node):
         aim_ref = prefer[0] if prefer is not None else 0.0
         self._log_prefer(prefer is not None, aim_ref, prefer[1] if prefer else 0.0)
 
+        gaps = self._gaps_that_fit(
+            gaps, geom_ranges, wrapped, work_angles, prefer, aim_ref
+        )
+
         self.min_gap_bins = max(2, int(self.min_gap_width_rad / abs(angle_inc)))
         max_len = max(len(g) for g in gaps)
         aim_idx = int(np.argmin(np.abs(_wrap_pi_np(work_angles - aim_ref))))
@@ -920,22 +1056,7 @@ class FGMNode(Node):
         # 갭 "중심"이 아니라 갭 안에서 정면(0°)에 가장 가까운 각도를 노린다.
         # 버블이 이미 차폭+여유를 먹고 있으므로 가장자리에서 inset 만 들어가면
         # 장애물을 확실히 비껴가면서도 필요 이상으로 크게 틀지 않는다.
-        lo = min(gap_start_angle, gap_end_angle)
-        hi = max(gap_start_angle, gap_end_angle)
-        inset = self.gap_edge_inset_rad
-        if hi - lo > 2.0 * inset:
-            lo += inset
-            hi -= inset
-        else:
-            lo = hi = 0.5 * (lo + hi)
-        if prefer is not None:
-            lo, hi = self._clamp_to_cone(lo, hi, aim_ref, prefer[1])
-        # 속도 제한은 **여기서만** 건다. 스캔을 좁히면 갭 탐색이 눈을 잃어서,
-        # 정작 넓게 열린 쪽이 시야 밖이면 반대쪽 좁은 갭을 고른다 — 그게
-        # 좌우로 방황하다 장애물 앞에 서는 동작이다. 갭은 넓게 보고, 그쪽으로
-        # 트는 각만 낼 수 있는 만큼으로 줄인다.
-        if self._fov_rad < self.fov_angle:
-            lo, hi = self._clamp_to_cone(lo, hi, 0.0, self._fov_rad)
+        lo, hi = self._aim_range(gap_start_angle, gap_end_angle, prefer, aim_ref)
         eff_angle = min(hi, max(lo, aim_ref))
 
         # 목표점을 속도에 비례해 앞으로: 고속에서 0.5 m 앞은 조향이 즉시 되감긴다

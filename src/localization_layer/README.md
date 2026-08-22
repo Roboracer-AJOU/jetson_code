@@ -7,6 +7,8 @@ ros2 launch localization_layer cartographer_mapping_launch.py
 
 ros2 launch localization_layer cartographer_localization_launch.py
 
+ros2 launch localization_layer amcl_localization_launch.py
+
 ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765
 
 ros2 launch path_following path_follow_static_dynamic_avoid_launch.py
@@ -508,6 +510,64 @@ POSE_GRAPH.max_num_final_iterations = 4
 2. 한 번에 하나씩만 바꾸고, 최소 여러 번 반복 주행 테스트 후 결론 낼 것
 3. 바꾼 이유와 결과를 반드시 이 파일에 새 "수정 N" 항목으로 남길 것
 4. 이 조합으로 안 되면, 최소한 **되돌아올 수 있는 값이 바로 이 섹션**이라는 걸 기억할 것
+
+---
+
+## 수정 15 — 2026-08-22 (S자 / 90° 코너 가끔 밀림 미세 조정)
+
+**증상**: 전체적으로 매우 안정적인데 S자·90° **고속 회전(yaw rate 큼)** 구간에서 가끔 조금 틀어짐.
+
+**원인 추정** (저속 apex 아님 — 차량 yaw rate가 빠른 경우):
+- `angular_search_window`가 고속 회전+CPU 지연 대비 좁음 (40Hz, ω~4rad/s → 스캔당 ~6°)
+- `rotation_delta_cost_weight` 높으면 prior 회전에 붙어 라이다 yaw 보정 지연
+- `max_range` 넓으면 S자에서 평행 벽 오매칭
+
+**수정**: `cartographer_2d_localization.lua` + `localization_launch_common.py`
+
+| 파라미터 | 이전 | 이후 |
+|---|---|---|
+| `max_range` | 25.0 | **18.0** |
+| `angular_search_window` | 12° | **18°** |
+| `rotation_delta_cost_weight` | (28 상속) | **10** |
+| `translation_delta_cost_weight` | 18 | **15** |
+| `ceres rotation_weight` | 55 | **65** |
+| `motion_filter.max_angle_radians` | (없음) | **1.5°** |
+| `optimize_every_n_nodes` | 6 | **3** |
+| `motion_filter` time / dist | 0.03s / 0.04m | **0.025s / 0.03m** |
+| `translation_delta_cost_weight` | 18 | **12** |
+| `ceres occupied / translation` | 24 / 14 | **28 / 11** |
+| `vesc_wheel_odom publish_on_imu` | false (50Hz) | **true (~100Hz)** |
+| pose graph `fast_correlative angular` | 10° | **14°** |
+| `min_speed_for_yaw_mps` | 0.08 | **0.03** |
+
+**의도적으로 안 건드린 것**: `linear_search_window=0.22`, `odometry_rotation_weight=1e4` (README 실측)
+
+**되돌리는 법**: 위 표 "이전" 값으로 `cartographer_2d_localization.lua` 복구.
+
+---
+
+## 수정 16 — 2026-08-22 (CPU 과부하 + 코너 드리프트 재균형)
+
+**증상**: 수정15(즉시 보정) 이후 CPU 부족 + 코너에서 여전히 가끔 밀림.
+
+**분석**: `optimize_every_n_nodes=3`, `motion_filter` 과민, `angular=18°`, `background_threads=4`
+→ pose graph·correlative 연산 폭증. 코너 보정은 **local SLAM**이 담당해야 PG가 아님.
+
+**수정**: `cartographer_2d_localization.lua` — CPU↓, 코너는 local 매칭 유지
+
+| 파라미터 | 수정15 | 수정16 |
+|---|---|---|
+| `num_background_threads` | 4 | **2** |
+| `optimize_every_n_nodes` | 3 | **8** |
+| `motion_filter` | 0.025s/0.03m | **0.03s/0.04m** |
+| `angular_search_window` | 18° | **16°** |
+| `voxel_filter_size` | 0.08 | **0.10** |
+| `sampling_ratio` | 0.35 | **0.22** |
+| `ceres max_iterations` | (기본) | **8** |
+| `max_range` | 18 | **18** (유지) |
+| `rotation_delta_cost_weight` | 10 | **11** |
+
+**CPU 더 필요하면**: `lidar_scan_frequency:=35.0` (launch 인자, 장애물 노드와 별도 터미널이면 OK)
 
 ---
 

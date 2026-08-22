@@ -366,22 +366,56 @@ def test_unsteerable_path_is_abandoned_even_at_crawling_speed():
             assert cap >= 1.5, f"d0={d0}: {cap:.1f} m/s 로 기어간다 — 포기했어야 한다"
 
 
+def _drivable_offset(n, s0: float, d0: float) -> bool:
+    """이탈 d0 인 자리에서 기준선과 나란히 도는 것 자체가 가능한가.
+
+    코너 **안쪽** 으로 벗어나면 오프셋 곡선의 반경이 그만큼 줄어든다
+    (κ_offset ≈ κ/σ, σ = 1 − d·κ). 그게 조향 한계를 이미 넘으면 어떤
+    복귀 경로도 못 만든다 — 복귀가 급해서가 아니라 **그 자리에 그 속도로
+    있을 수가 없다.** 계획기의 포기율을 잴 때 이런 자리를 같이 세면
+    트랙 형상을 계획기 탓으로 돌리게 된다.
+    """
+    kap, _ = n._kappa_at_s(s0)
+    sigma = 1.0 - d0 * kap
+    if sigma <= n._REJOIN_SIGMA_FLOOR:
+        return False
+    return abs(kap / sigma) <= n.rejoin_max_path_curvature
+
+
 def test_normal_deviations_are_not_abandoned_around_the_track():
     """흔한 이탈량에서는 트랙 어디서든 복귀가 성립해야 한다.
 
     포기가 잦으면 override 가 자주 내려가 CSV 로 튀는 전환이 반복된다.
+
+    셈에서 빼는 건 **애초에 못 서 있는 자리** 뿐이다 (`_drivable_offset`).
+    이 레이스라인에는 반경 1.4 m 코너가 있어서, 안쪽으로 1 m 벗어난 자리는
+    오프셋 반경이 0.4 m 다 — 최소반경 0.84 m 로는 못 그린다.
     """
     n = _Corner()
     step = max(1, n._n // 60)
-    total = fails = 0
+    total = fails = skipped = 0
     for i in range(0, n._n, step):
         s0 = i * n._total_l / n._n
         for sgn in (1.0, -1.0):
+            d0 = 1.0 * sgn
+            if not _drivable_offset(n, s0, d0):
+                skipped += 1
+                continue
             total += 1
-            _, _, kappa, _ = n._plan_rejoin(s0, 1.0 * sgn, 0.0, 0.0, 6.0)
+            _, _, kappa, _ = n._plan_rejoin(s0, d0, 0.0, 0.0, 6.0)
             if not math.isfinite(kappa):
                 fails += 1
+    assert total > 100, f"너무 많이 걸렀다 ({skipped} 제외) — 필터가 과하다"
     assert fails / total < 0.05, f"{fails}/{total} 포기 — 너무 자주 접힌다"
+
+
+def test_the_skip_filter_only_removes_impossible_places():
+    """위 필터가 멀쩡한 자리까지 걸러 내면 테스트가 무의미해진다."""
+    n = _Corner()
+    assert _drivable_offset(n, 0.0, 0.0), "라인 위는 언제나 가능해야 한다"
+    s_t, sgn = n.tightest_s()
+    assert not _drivable_offset(n, s_t, 1.0 * sgn), "최급 코너 안쪽 1 m 는 불가능"
+    assert _drivable_offset(n, s_t, -1.0 * sgn), "같은 코너 바깥쪽은 가능"
 
 
 def test_corner_rejoin_speed_cap_is_usable():
@@ -671,6 +705,9 @@ def test_rejoin_path_is_never_rebuilt():
         _rejoin_travel_m = 0.0
         _rejoin_last_xy = None
         _rejoin_moving_ns = 0
+        _rejoin_is_alignment = False
+
+        _alignment_done = LocalPlannerNode._alignment_done
 
         def get_clock(self):
             return _Clock()

@@ -33,6 +33,22 @@ TH = CFG["avoid_cruise_high_speed_th"]
 # ------------------------------------------------------- (1) 회피 순항속도
 
 
+REGRAB = CFG["avoid_cruise_regrab_sec"]
+
+
+class _Clock:
+    """`_avoid_cruise_target` 이 되쓰기 창을 재는 데만 쓴다."""
+
+    def __init__(self):
+        self.nanoseconds = 0
+
+    def now(self):
+        return self
+
+    def advance(self, sec):
+        self.nanoseconds += int(sec * 1e9)
+
+
 class _Node:
     _avoid_speed_capped = LocalPlannerNode._avoid_speed_capped
     _avoid_cruise_target = LocalPlannerNode._avoid_cruise_target
@@ -42,9 +58,16 @@ class _Node:
         self._obstacle_on = obstacle_on
         self._ego_speed_mps = v
         self._avoid_cruise_latched = None
+        self._avoid_cruise_prev = None
+        self._avoid_cruise_release_ns = 0
+        self.avoid_cruise_regrab_ns = int(kw.get("regrab", REGRAB) * 1e9)
         self.avoid_cruise_speed_high_mps = kw.get("high", HIGH)
         self.avoid_cruise_speed_low_mps = kw.get("low", LOW)
         self.avoid_cruise_high_speed_th = kw.get("th", TH)
+        self.clock = _Clock()
+
+    def get_clock(self):
+        return self.clock
 
 
 def test_the_defaults_are_the_speeds_we_asked_for():
@@ -100,13 +123,67 @@ def test_the_whole_episode_holds_one_speed():
 
 
 def test_the_next_avoidance_gets_its_own_decision():
-    """해제됐으면 다음 회피는 그때 속도로 다시 고른다."""
+    """해제되고 한참 지났으면 다음 회피는 그때 속도로 다시 고른다."""
     n = _Node("AVOID", v=7.0)
     assert n._avoid_cruise_target() == HIGH
     n.mode = "GLOBAL"
     assert n._avoid_cruise_target() == 0.0
+    n.clock.advance(REGRAB + 0.5)
     n.mode, n._ego_speed_mps = "AVOID", 2.0
     assert n._avoid_cruise_target() == LOW
+
+
+# --------------------------------- 짧게 끊겼다 다시 켜지면 되쓴다
+#
+# 래치만으로는 부족하다. 접근 중(모드는 아직 GLOBAL) 검출이 한 프레임
+# 깜빡이면 래치가 풀리고, 다음 프레임에 **이미 줄어든 속도로** 다시 고르게
+# 되어 3.0 이 2.0 으로 떨어진다. 같은 장애물 하나를 피하는 중이다.
+
+
+def test_a_dropped_frame_does_not_re_decide_the_target():
+    n = _Node("GLOBAL", obstacle_on=True, v=6.0)
+    assert n._avoid_cruise_target() == HIGH
+
+    n._ego_speed_mps = 3.5  # 목표를 향해 감속하는 중 = 이제 문턱 아래다
+    n.clock.advance(0.05)
+    n._obstacle_on = False  # 한 프레임 유실
+    assert n._avoid_cruise_target() == 0.0
+    n.clock.advance(0.05)
+    n._obstacle_on = True
+    assert n._avoid_cruise_target() == HIGH, "되쓰지 않으면 2.0 으로 떨어진다"
+
+
+def test_mode_bouncing_to_global_does_not_re_decide_either():
+    """실측으로 나던 AVOID↔GLOBAL 진동에서도 목표는 그대로여야 한다."""
+    n = _Node("AVOID", v=6.0)
+    assert n._avoid_cruise_target() == HIGH
+    n._ego_speed_mps = 3.0
+    for _ in range(3):
+        n.clock.advance(0.05)
+        n.mode = "GLOBAL"
+        n._avoid_cruise_target()
+        n.clock.advance(0.05)
+        n.mode = "AVOID"
+        assert n._avoid_cruise_target() == HIGH
+
+
+def test_the_regrab_window_expires():
+    """진짜로 끝난 회피의 값을 무한정 들고 있으면 안 된다."""
+    n = _Node("AVOID", v=7.0)
+    assert n._avoid_cruise_target() == HIGH
+    n.mode = "GLOBAL"
+    n._avoid_cruise_target()
+    n.clock.advance(REGRAB + 0.01)
+    n.mode, n._ego_speed_mps = "AVOID", 2.0
+    assert n._avoid_cruise_target() == LOW
+
+
+def test_releasing_is_immediate_so_csv_speed_comes_back():
+    """푸는 건 늦추지 않는다 — 늦추면 글로벌 복귀 후 속도 회복이 늦다."""
+    n = _Node("AVOID", v=7.0)
+    n._avoid_cruise_target()
+    n.mode = "GLOBAL"
+    assert n._avoid_cruise_target() == 0.0, "같은 프레임에 바로 풀려야 한다"
 
 
 def test_zero_turns_it_off():

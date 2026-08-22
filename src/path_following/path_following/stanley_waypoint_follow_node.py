@@ -50,7 +50,7 @@ CFG = {
     # use_drive_speed_command=True 면 이 값을 그대로 추종한다.
     # v 열이 없는 구형 CSV 면 speed_fallback_mps 로 전 구간 정속 주행.
     "speed_from_csv": True,
-    "speed_fallback_mps": 0.0,   # 0 = 정지 (안전측). 정속 실험은 여기에 값
+    "speed_fallback_mps": 3.0,   # 0 = 정지 (안전측). 정속 실험은 여기에 값
     "speed_scale": 1.0,          # 실차에서 급하게 줄일 때. CSV 재생성 없이 배율
     "speed_max_mps": 0.0,        # 하드 상한. 0 = 제한 없음
     # 앞으로 이 거리만큼의 최소 속도를 취해 제어·측위 지연을 흡수. 0 = 끔.
@@ -180,7 +180,7 @@ CFG = {
     "feedback_lateral_accel_mps2": 4.0,
     # 곡률 피드포워드: δ = δ_ff(κ) + Stanley. 직선용 stanley_k 는 유지.
     "enable_steer_ff": True,
-    "ff_gain": 1.3,              # δ_ff = ff_gain * ff_sign * atan(L·κ)
+    "ff_gain": 2.3,              # δ_ff = ff_gain * ff_sign * atan(L·κ)
     # 속도별 FF 게인 스케줄. ff_gain 하나로 고정하면 저속 코너에서 과조향이
     # 난다 — atan(L·κ) 는 속도와 무관한데 저속에서는 그만큼 꺾을 필요가 없다.
     # 두 배열은 같은 길이여야 하고 속도는 오름차순이어야 한다. 구간 사이는
@@ -218,7 +218,7 @@ CFG = {
     # 그래서 "가속 중" 이라는 조건에서만 켜지는 별도 항으로 분리했다.
     # 정속·감속 구간에서는 u=0 이고 아래 배율이 전부 1.0 이라 기존 거동과 같다.
     # 되돌리려면 accel_hold_enable=False 하나만 끄면 된다.
-    "accel_hold_enable": True,
+    "accel_hold_enable": False,
     # 문턱을 절대값으로 박으면 안 된다. speed_scale·v_ref 를 낮춰 프로파일이
     # 통째로 느려지면 종가속도 같이 줄어서 문턱을 영영 못 넘는다. 실제로
     # v[1.06~3.00] 프로파일의 최대 종가속은 0.99 m/s² 라, 아래 절대 문턱

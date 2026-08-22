@@ -93,7 +93,7 @@ except ImportError as exc:  # pragma: no cover
 # USER TUNING — 맵 바꿀 때 여기만 수정
 # ============================================================
 CFG = {
-    "map_name": "cartographer_map_20260820_214849_rosmap.yaml",
+    "map_name": "cartographer_map_20260822_164229_rosmap.yaml",
     "map_dir": CENTERLINE_CFG["map_dir"],
     "centerline_csv": os.path.join(script_dir, "..", "config", "centerline.csv"),
     "out_csv": os.path.join(script_dir, "..", "config", "raceline.csv"),

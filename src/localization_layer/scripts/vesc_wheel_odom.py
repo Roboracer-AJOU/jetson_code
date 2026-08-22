@@ -5,7 +5,7 @@ Speed feedback: /vehicle/speed_mps (Float64, m/s from VESC ERPM via control_node
 Yaw rate feedback: /imu/data (sensor_msgs/Imu, angular_velocity.<imu_yaw_axis>)
        조향각 기반 yaw 추정(서보각→bicycle model)은 오차가 커서 제거함 — IMU 실측으로 대체.
 
-Publishes /odom only (no TF) so Cartographer can provide_odom_frame.
+Publishes /odom; optional odom->base_link TF when publish_tf=true (AMCL stack).
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Float64
+from tf2_ros import TransformBroadcaster
+from geometry_msgs.msg import TransformStamped
 
 
 def _yaw_to_quat(yaw: float) -> Quaternion:
@@ -66,6 +68,10 @@ class VescWheelOdom(Node):
         # 발행 주기일 뿐 적분 주기가 아니다. 적분은 _on_imu에서 IMU rate(~100Hz)로
         # 돌고, VESC 속도 피드백 상한도 50Hz라 발행은 50Hz면 충분하다.
         self.declare_parameter('publish_hz', 50.0)
+        self.declare_parameter('publish_tf', False)
+        # AMCL: scan stamp 에 맞는 odom->base_link TF 를 IMU rate(~100Hz)로 내보냄.
+        # 50Hz 타이머만 쓰면 회전 중 scan 투영이 틀어져 사방으로 밀린다.
+        self.declare_parameter('publish_on_imu', False)
 
         self._imu_yaw_axis = self.get_parameter(
             'imu_yaw_axis'
@@ -98,17 +104,23 @@ class VescWheelOdom(Node):
         imu_topic = self.get_parameter('imu_topic').get_parameter_value().string_value
         odom_topic = self.get_parameter('odom_topic').get_parameter_value().string_value
 
+        self._publish_tf = bool(self.get_parameter('publish_tf').value)
+        self._publish_on_imu = bool(self.get_parameter('publish_on_imu').value)
+
         self._odom_pub = self.create_publisher(Odometry, odom_topic, 10)
+        self._tf_broadcaster = TransformBroadcaster(self) if self._publish_tf else None
         self.create_subscription(Float64, speed_topic, self._on_speed, 10)
         self.create_subscription(Imu, imu_topic, self._on_imu, 10)
         self.create_timer(1.0 / hz, self._on_timer)
 
+        tf_note = ' + odom->base_link TF' if self._publish_tf else ' (no TF)'
+        imu_pub_note = ' imu-rate publish' if self._publish_on_imu else ''
         self.get_logger().info(
             f'VESC wheel odom: speed_fb={speed_topic}, imu_fb={imu_topic} '
             f'(yaw_axis={self._imu_yaw_axis}, yaw_sign={self._imu_yaw_sign:.0f}, '
             f'yaw_source={self._yaw_source}), '
             f'speed_scale={self._speed_scale:.3f}, '
-            f'yaw_filter_tau={self._yaw_tau:.2f}s, out={odom_topic} @ {hz:.0f}Hz (no TF)'
+            f'yaw_filter_tau={self._yaw_tau:.2f}s, out={odom_topic} @ {hz:.0f}Hz{tf_note}{imu_pub_note}'
         )
 
     def _on_speed(self, msg: Float64) -> None:
@@ -163,6 +175,8 @@ class VescWheelOdom(Node):
                 self._yaw_raw += (dt / self._yaw_fusion_tau) * err
 
         self._integrate(dt)
+        if self._publish_on_imu:
+            self._publish_state(allow_same_stamp=False)
 
     def _integrate(self, dt: float) -> None:
         """IMU 한 스텝만큼 헤딩 필터와 위치를 전진시킨다. dt는 IMU stamp 차이."""
@@ -187,16 +201,13 @@ class VescWheelOdom(Node):
         self._x += v * math.cos(yaw_mid) * dt
         self._y += v * math.sin(yaw_mid) * dt
 
-    def _on_timer(self) -> None:
-        # 적분은 전부 _on_imu에서 끝났다. 여기서는 현재 상태를 그 상태가 실제로
-        # 유효한 시각(=마지막 IMU stamp)으로 찍어 내보내기만 한다.
+    def _publish_state(self, *, allow_same_stamp: bool) -> None:
         if self._last_imu_stamp is None:
             return
         stamp_ns = self._last_imu_stamp.nanoseconds
-        # IMU가 끊기면 같은 stamp를 반복 발행하게 되는데, Cartographer의
-        # PoseExtrapolator는 odom stamp가 단조증가하지 않으면 CHECK로 죽는다.
-        if self._last_pub_stamp_ns is not None and stamp_ns <= self._last_pub_stamp_ns:
-            return
+        if not allow_same_stamp:
+            if self._last_pub_stamp_ns is not None and stamp_ns <= self._last_pub_stamp_ns:
+                return
         self._last_pub_stamp_ns = stamp_ns
 
         msg = Odometry()
@@ -209,7 +220,6 @@ class VescWheelOdom(Node):
         msg.twist.twist.linear.x = self._v
         msg.twist.twist.angular.z = self._omega_filtered
 
-        # Modest covariance: trust enough for Cartographer prior, not more than LiDAR.
         msg.pose.covariance[0] = 0.05
         msg.pose.covariance[7] = 0.05
         msg.pose.covariance[35] = 0.1
@@ -217,6 +227,22 @@ class VescWheelOdom(Node):
         msg.twist.covariance[35] = 0.2
 
         self._odom_pub.publish(msg)
+
+        if self._tf_broadcaster is not None:
+            tf = TransformStamped()
+            tf.header.stamp = msg.header.stamp
+            tf.header.frame_id = self._odom_frame
+            tf.child_frame_id = self._base_frame
+            tf.transform.translation.x = self._x
+            tf.transform.translation.y = self._y
+            tf.transform.translation.z = 0.0
+            tf.transform.rotation = msg.pose.pose.orientation
+            self._tf_broadcaster.sendTransform(tf)
+
+    def _on_timer(self) -> None:
+        if self._publish_on_imu:
+            return
+        self._publish_state(allow_same_stamp=False)
 
 
 def main(args=None) -> None:

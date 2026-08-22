@@ -1,5 +1,6 @@
 """Shared helpers for localization_layer launch files."""
 
+import math
 import os
 import sys
 
@@ -261,38 +262,10 @@ def build_localization_cartographer_nodes(context):
 
     nodes = [
         LogInfo(msg=(
-            'Cartographer localization: LiDAR main (/scan) + wheel odom (/odom, '
+            'Cartographer localization: LiDAR main (/scan) + wheel odom (/odom @ IMU rate, '
             'speed=VESC + yaw=IMU gyro). control_node가 /vehicle/speed_mps를 내야 함.'
         )),
-        Node(
-            package='localization_layer',
-            executable='vesc_wheel_odom.py',
-            name='vesc_wheel_odom',
-            output='screen',
-            prefix=_LOCAL_CPU,
-            parameters=[{
-                'speed_topic': '/vehicle/speed_mps',
-                'imu_topic': imu_topic_str,
-                # gz/gy 중 어느 축이 실제 yaw인지 실측 확인 후 필요하면 'y'로 변경.
-                'imu_yaw_axis': 'z',
-                # /imu/data 는 ROS 축(+Z 위). 왼쪽 회전이 +yaw.
-                'imu_yaw_sign': 1.0,
-                # 모터/VESC 근처 지자기 간섭으로 EBIMU orientation 자체가 정지 중에도
-                # 계속 도는 게 실측 확인됨(fused였을 때 odom이 제자리에서 계속 회전) →
-                # 지자기 보정 경로를 끄고 순수 자이로 적분만 사용.
-                'yaw_source': 'gyro',
-                'yaw_fusion_tau_sec': 5.0,
-                'odom_topic': odom_topic_str,
-                'min_speed_for_yaw_mps': 0.08,
-                'speed_scale': 1.0,
-                # 1차 지연이라 정상선회 중 헤딩 지연 = tau * omega. 0.1s면 코너에서
-                # 10~20도 밀린 헤딩으로 병진이 적분됨. gyro 적분값은 이미 깨끗해서 끔.
-                'yaw_filter_tau_sec': 0.0,
-                # 발행 주기일 뿐 적분 주기가 아니다. 적분은 _on_imu에서 IMU stamp
-                # 기준 ~100Hz로 돌고, 여기서는 그 상태를 발행만 한다.
-                'publish_hz': 50.0,
-            }],
-        ),
+        build_vesc_wheel_odom_node(context, publish_tf=False, imu_rate_odom=True),
         Node(
             package='cartographer_ros',
             executable='cartographer_node',
@@ -386,3 +359,239 @@ def localization_stack_with_map(context, cartographer_delay_sec: float):
 
 def delayed_cartographer_stack(context, delay_sec: float):
     return localization_stack_with_map(context, delay_sec)
+
+
+def _optional_float(value) -> float:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ('', 'nan', 'none', 'null'):
+            return float('nan')
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float('nan')
+
+
+def load_mapping_origin_initial_pose(pbstream_path: str) -> dict | None:
+    """Load map-frame initial pose from <pbstream_stem>_origin.yaml."""
+    stem = os.path.splitext(pbstream_path)[0]
+    origin_yaml = f'{stem}_origin.yaml'
+    return load_initial_pose_from_origin_yaml(origin_yaml)
+
+
+def resolve_origin_yaml_from_ros_map(map_yaml_path: str) -> str | None:
+    """Find matching *_origin.yaml for a Cartographer ros map yaml."""
+    if map_yaml_path.endswith('_rosmap.yaml'):
+        origin_yaml = map_yaml_path[: -len('_rosmap.yaml')] + '_origin.yaml'
+        if os.path.isfile(origin_yaml):
+            return origin_yaml
+
+    stem = os.path.splitext(map_yaml_path)[0]
+    origin_yaml = f'{stem}_origin.yaml'
+    if os.path.isfile(origin_yaml):
+        return origin_yaml
+    return None
+
+
+def load_initial_pose_from_origin_yaml(origin_yaml_path: str) -> dict | None:
+    if not os.path.isfile(origin_yaml_path):
+        return None
+    try:
+        import yaml
+
+        with open(origin_yaml_path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+        pose = data.get('initial_pose')
+        if not isinstance(pose, dict):
+            return None
+        return {
+            'x': float(pose.get('x', 0.0)),
+            'y': float(pose.get('y', 0.0)),
+            'z': float(pose.get('z', 0.0)),
+            'yaw': float(pose.get('yaw', 0.0)),
+        }
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def build_static_map_publisher_nodes_from_yaml(context):
+    map_yaml = LaunchConfiguration('map_yaml_filename').perform(context)
+    if not map_yaml or not os.path.isfile(map_yaml):
+        raise RuntimeError(
+            f'ROS map yaml not found: {map_yaml}. '
+            'Use map_yaml_filename:=/home/nvidia/f1tenth_ajou/maps/<map>_rosmap.yaml'
+        )
+
+    return [
+        LogInfo(msg=f'=== AMCL: publishing saved map on /map ({map_yaml}) ==='),
+        Node(
+            package='localization_layer',
+            executable='static_map_publisher.py',
+            name='static_map_publisher',
+            output='screen',
+            prefix=_LOCAL_CPU,
+            parameters=[{
+                'yaml_filename': map_yaml,
+                'topic': '/map',
+                'publish_period_sec': 1.0,
+            }],
+        ),
+    ]
+
+
+def resolve_amcl_initial_pose(context) -> dict:
+    """Build AMCL initial_pose params from launch args and saved mapping origin."""
+    map_yaml = LaunchConfiguration('map_yaml_filename').perform(context)
+    wait_for_rviz = is_enabled(
+        LaunchConfiguration('wait_for_rviz_initial_pose').perform(context)
+    )
+    use_saved_mapping_origin = is_enabled(
+        LaunchConfiguration('use_saved_mapping_origin').perform(context)
+    )
+    manual_x = _optional_float(LaunchConfiguration('initial_pose_x').perform(context))
+    manual_y = _optional_float(LaunchConfiguration('initial_pose_y').perform(context))
+    manual_yaw = _optional_float(LaunchConfiguration('initial_pose_yaw').perform(context))
+
+    if wait_for_rviz:
+        return {'set_initial_pose': False}
+
+    if all(not math.isnan(v) for v in (manual_x, manual_y, manual_yaw)):
+        return {
+            'set_initial_pose': True,
+            'initial_pose': {
+                'x': manual_x,
+                'y': manual_y,
+                'z': 0.0,
+                'yaw': manual_yaw,
+            },
+        }
+
+    if use_saved_mapping_origin:
+        origin_yaml = resolve_origin_yaml_from_ros_map(map_yaml)
+        origin_pose = (
+            load_initial_pose_from_origin_yaml(origin_yaml)
+            if origin_yaml is not None
+            else None
+        )
+        if origin_pose is not None:
+            return {
+                'set_initial_pose': True,
+                'initial_pose': origin_pose,
+            }
+
+    return {'set_initial_pose': False}
+
+
+def build_vesc_wheel_odom_node(context, *, publish_tf: bool, imu_rate_odom: bool = False):
+    imu_topic_str = LaunchConfiguration('imu_topic').perform(context)
+    odom_topic_str = LaunchConfiguration('odom_topic').perform(context)
+    min_speed_for_yaw = 0.0 if publish_tf else 0.03
+    publish_on_imu = publish_tf or imu_rate_odom
+    return Node(
+        package='localization_layer',
+        executable='vesc_wheel_odom.py',
+        name='vesc_wheel_odom',
+        output='screen',
+        prefix=_LOCAL_CPU,
+        parameters=[{
+            'speed_topic': '/vehicle/speed_mps',
+            'imu_topic': imu_topic_str,
+            'imu_yaw_axis': 'z',
+            'imu_yaw_sign': 1.0,
+            'yaw_source': 'gyro',
+            'yaw_fusion_tau_sec': 5.0,
+            'odom_topic': odom_topic_str,
+            'min_speed_for_yaw_mps': min_speed_for_yaw,
+            'speed_scale': 1.0,
+            'yaw_filter_tau_sec': 0.0,
+            'publish_hz': 50.0,
+            'publish_tf': publish_tf,
+            'publish_on_imu': publish_on_imu,
+        }],
+    )
+
+
+def build_amcl_localization_nodes(context):
+    localization_dir = get_package_share_directory('localization_layer')
+    amcl_params = os.path.join(localization_dir, 'config', 'amcl_params.yaml')
+    scan_topic = LaunchConfiguration('scan_topic').perform(context)
+    amcl_scan_max_range = float(
+        LaunchConfiguration('amcl_scan_max_range_m').perform(context)
+    )
+    initial_pose_params = resolve_amcl_initial_pose(context)
+
+    if initial_pose_params.get('set_initial_pose'):
+        pose = initial_pose_params['initial_pose']
+        initial_pose_msg = (
+            f"x={pose['x']:.3f}, y={pose['y']:.3f}, yaw={pose['yaw']:.3f}"
+        )
+    elif is_enabled(
+        LaunchConfiguration('wait_for_rviz_initial_pose').perform(context)
+    ):
+        initial_pose_msg = 'waiting for RViz /initialpose'
+    else:
+        initial_pose_msg = 'not set (use RViz 2D Pose Estimate)'
+
+    return [
+        LogInfo(msg=(
+            'AMCL localization: saved /map + filtered scan + wheel odom (/odom, '
+            'publish_tf=true, imu-rate). control_node가 /vehicle/speed_mps를 내야 함.'
+        )),
+        LogInfo(msg=(
+            f'AMCL scan window: {amcl_scan_max_range:.1f}m '
+            f'(/{scan_topic.lstrip("/")} -> /scan_amcl)'
+        )),
+        LogInfo(msg=f'AMCL initial pose: {initial_pose_msg}'),
+        build_vesc_wheel_odom_node(context, publish_tf=True),
+        Node(
+            package='localization_layer',
+            executable='scan_range_filter.py',
+            name='scan_range_filter',
+            output='screen',
+            prefix=_LOCAL_CPU,
+            parameters=[{
+                'input_topic': scan_topic,
+                'output_topic': '/scan_amcl',
+                'max_range_m': amcl_scan_max_range,
+                'min_range_m': 0.12,
+            }],
+        ),
+        Node(
+            package='nav2_amcl',
+            executable='amcl',
+            name='amcl',
+            output='screen',
+            prefix=_LOCAL_CPU,
+            parameters=[
+                amcl_params,
+                initial_pose_params,
+                {'laser_max_range': amcl_scan_max_range},
+            ],
+        ),
+        Node(
+            package='nav2_lifecycle_manager',
+            executable='lifecycle_manager',
+            name='lifecycle_manager_localization',
+            output='screen',
+            prefix=_LOCAL_CPU,
+            parameters=[{
+                'autostart': True,
+                'node_names': ['amcl'],
+            }],
+        ),
+    ]
+
+
+def amcl_stack_with_map(context, startup_delay_sec: float):
+    """Publish /map immediately; start AMCL stack after sensor warmup delay."""
+    return [
+        *build_static_map_publisher_nodes_from_yaml(context),
+        TimerAction(
+            period=startup_delay_sec,
+            actions=build_amcl_localization_nodes(context),
+        ),
+    ]
+
+
+def delayed_amcl_stack(context, delay_sec: float):
+    return amcl_stack_with_map(context, delay_sec)
