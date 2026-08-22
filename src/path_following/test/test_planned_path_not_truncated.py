@@ -48,9 +48,11 @@ class _Checker:
     _path_fully_clear = LocalPlannerNode._path_fully_clear
     _truncate_path_at_collision = LocalPlannerNode._truncate_path_at_collision
     _wall_stop_distance_m = LocalPlannerNode._wall_stop_distance_m
+    _clearance_floor_at = LocalPlannerNode._clearance_floor_at
 
     def __init__(self, speed_mps: float = 0.0):
         self._inflated_map = InflatedMap(_Grid(), inflation_m=0.15)
+        self.path_check_inflation_m = 0.15
         self.path_check_enable = True
         self.path_check_backoff_m = 0.0
         self.path_check_min_length_m = 0.6

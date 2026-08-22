@@ -1673,6 +1673,32 @@ class LocalPlannerNode(Node):
             disks.append((mx, my, float(dyn[k + 5]) + grow))
         return disks
 
+    def _clearance_floor_at(self, xy) -> float:
+        """경로 검사에 쓸 통과 기준 여유 [m]. 차가 선 자리를 넘겨받는다.
+
+        팽창반경(0.254 m)은 물리적 벽이 아니라 **여유 예산** 이다. 차 반폭은
+        0.15 m 라, 여유 0.20 m 인 자리는 마진이 얇을 뿐 지나갈 수는 있다.
+        그런데 검사는 이 둘을 한 덩어리로 묶어 "못 간다" 로 답해 왔다.
+
+        실측(20260822)에서 이게 터졌다. 레이스라인은 벽에서 최소 0.316 m,
+        중앙값 0.622 m 떨어져 있는데, 여기서 **0.2 m 만 비켜도 트랙의 25 %,
+        0.35 m 면 47 % 가 팽창대 안** 이다. 회피로 30 cm 옆에 나간 차는 절반의
+        확률로 이미 "막힌" 자리에 서 있고, 그러면 그 자리에서 출발하는 모든
+        경로가 1번째 점에서 기각된다. 재합류가 7 번 연속 이렇게 죽었다.
+
+        거부해 봐야 차는 그 자리를 벗어나지 못한다. 오히려 재합류 경로가
+        **그 팽창대에서 빠져나가는 길** 이라 거부가 정확히 반대로 작동한다.
+
+        그래서 기준을 "지금 서 있는 자리만큼" 으로 내린다. 단 차폭 밑으로는
+        절대 안 내려간다 — 거긴 마진이 얇은 게 아니라 실제로 못 들어간다.
+        라인 위(여유 0.6 m)에 있으면 기준은 팽창반경 그대로다. 좁은 데
+        들어와 있을 때만 풀린다.
+        """
+        if self._inflated_map is None:
+            return self.path_check_inflation_m
+        here = self._inflated_map.clearance_at(float(xy[0]), float(xy[1]))
+        return max(vg.HALF_WIDTH_M, min(self.path_check_inflation_m, here))
+
     def _truncate_path_at_collision(
         self, path: Path, tf_lm, min_length_m: float | None = None
     ) -> tuple[Path, bool]:
@@ -1704,6 +1730,7 @@ class LocalPlannerNode(Node):
             self._inflated_map,
             self._obstacle_disks_map(tf_lm),
             start_index=1,
+            min_clearance_m=self._clearance_floor_at(pts[0]),
         )
         self._last_path_cut = cut
         if cut >= len(pts):
@@ -1796,7 +1823,11 @@ class LocalPlannerNode(Node):
             return True
         pts = [(p.pose.position.x, p.pose.position.y) for p in path.poses]
         cut = first_blocked_index(
-            pts, self._inflated_map, self._obstacle_disks_map(tf_lm), start_index=1
+            pts,
+            self._inflated_map,
+            self._obstacle_disks_map(tf_lm),
+            start_index=1,
+            min_clearance_m=self._clearance_floor_at(pts[0]),
         )
         self._last_path_cut = cut
         return cut >= len(pts)
@@ -1819,7 +1850,13 @@ class LocalPlannerNode(Node):
         detail = ""
         if diag is not None:
             pts, cut, length, min_len, tf_lm = diag
-            wall_cut = first_blocked_index(pts, self._inflated_map, None, start_index=1)
+            wall_cut = first_blocked_index(
+                pts,
+                self._inflated_map,
+                None,
+                start_index=1,
+                min_clearance_m=self._clearance_floor_at(pts[0]),
+            )
             disk_cut = first_blocked_index(
                 pts, None, self._obstacle_disks_map(tf_lm), start_index=1
             )
@@ -3261,7 +3298,10 @@ class LocalPlannerNode(Node):
         )
         if not usable or len(out.poses) < 2:
             self._warn_rejoin_given_up(
-                d0, d0p, f"경로가 {self._last_path_cut}번째 점에서 막힘"
+                d0,
+                d0p,
+                f"경로가 {self._last_path_cut}번째 점에서 막힘"
+                f" ({self._blocked_cause_str()})",
             )
             return None
 
@@ -3271,6 +3311,27 @@ class LocalPlannerNode(Node):
                 f"v_ego={self._ego_speed_mps:.2f}m/s, samples={len(out.poses)}"
             )
         return out
+
+    def _blocked_cause_str(self) -> str:
+        """마지막 경로 기각이 벽 때문인지 장애물 때문인지. 고칠 데가 정반대다."""
+        diag = getattr(self, "_blocked_diag", None)
+        if diag is None:
+            return "원인 미상"
+        pts, _, _, _, tf_lm = diag
+        floor = self._clearance_floor_at(pts[0])
+        wall = first_blocked_index(
+            pts, self._inflated_map, None, start_index=1, min_clearance_m=floor
+        )
+        disk = first_blocked_index(
+            pts, None, self._obstacle_disks_map(tf_lm), start_index=1
+        )
+        here = (
+            self._inflated_map.clearance_at(float(pts[0][0]), float(pts[0][1]))
+            if self._inflated_map is not None
+            else float("nan")
+        )
+        who = "벽" if wall <= disk else "장애물"
+        return f"원인={who}, 벽 {wall}/장애물 {disk}, 현위치 여유 {here:.2f} m"
 
     def _warn_rejoin_given_up(self, d0: float, d0p: float, why: str) -> None:
         """재합류를 못 만들어 CSV 로 넘긴다 (1초에 한 번).

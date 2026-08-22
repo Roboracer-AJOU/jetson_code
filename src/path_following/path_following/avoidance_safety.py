@@ -109,6 +109,7 @@ def first_blocked_index(
     inflated_map: InflatedMap | None,
     obstacle_disks=None,
     start_index: int = 0,
+    min_clearance_m: float | None = None,
 ) -> int:
     """경로에서 처음으로 못 가는 점의 인덱스. 전부 통과면 len(points).
 
@@ -117,11 +118,27 @@ def first_blocked_index(
     start_index: 검사 시작점. 차량 현재 위치(0번)는 보통 건너뛴다 — 이미
         거기 서 있는데 "막혔다" 고 해봐야 할 수 있는 게 없고, 위치 오차로
         벽에 붙어 보이면 회피를 영영 포기하게 된다.
+    min_clearance_m: 통과 기준 여유 [m]. None 이면 팽창반경.
+
+        `start_index` 의 논리를 영역으로 넓히는 손잡이다. 0번만 봐주는 건
+        점 하나(≈5 cm)만 봐주는 것이라, 차가 이미 좁은 데 들어와 있으면
+        1번 점에서 똑같이 막힌다 — 실측에서 재합류가 이렇게 계속 기각됐다.
+        호출부가 "차가 지금 서 있는 자리만큼" 을 기준으로 내려 주면, 그
+        자리에서 빠져나가는 경로를 시작점이 좁다는 이유로 거부하지 않는다.
     """
     disks = obstacle_disks or []
+    thr = (
+        None
+        if inflated_map is None
+        else (
+            inflated_map.inflation_m
+            if min_clearance_m is None
+            else float(min_clearance_m)
+        )
+    )
     for idx in range(max(0, start_index), len(points)):
         px, py = points[idx]
-        if inflated_map is not None and inflated_map.blocked(px, py):
+        if thr is not None and inflated_map.clearance_at(px, py) < thr:
             return idx
         for ox, oy, orad in disks:
             if (px - ox) ** 2 + (py - oy) ** 2 < orad * orad:
