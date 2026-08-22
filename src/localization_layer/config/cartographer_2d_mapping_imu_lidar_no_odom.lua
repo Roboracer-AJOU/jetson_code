@@ -40,21 +40,24 @@ TRAJECTORY_BUILDER_2D.max_range = 22.
 TRAJECTORY_BUILDER_2D.voxel_filter_size = 0.10
 
 TRAJECTORY_BUILDER_2D.use_online_correlative_scan_matching = true
--- 직선 복도: 옆벽은 종방향으로 비슷해서 창이 넓으면 점수 높은 뒤쪽에 붙음.
--- 스캔 간 이동은 odom+IMU 예측, 창은 예측 잔차(수 cm)만 커버하면 됨.
-TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 0.06
+-- 직선 복도: 옆벽은 종방향으로 비슷해서 정합 시 뒤쪽 후보가 선택되면
+-- 직선 길이가 누적적으로 짧아짐(압축). 창은 odom 예측 잔차(±3~4cm)만.
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 0.04
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window = math.rad(8.)
-TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.translation_delta_cost_weight = 24.
+-- 예측보다 뒤로 붙는 후보(직선 압축)에 강한 페널티. 30+ 는 한 박자 늦게 따라감.
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.translation_delta_cost_weight = 26.
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.rotation_delta_cost_weight = 28.0
 
--- translation_weight↑: 직선 종방향은 wheel odom+IMU를 더 믿고 라이다 슬라이딩↓
-TRAJECTORY_BUILDER_2D.ceres_scan_matcher.occupied_space_weight = 20.
-TRAJECTORY_BUILDER_2D.ceres_scan_matcher.translation_weight = 22.
+-- occupied↓ + translation↑: degenerate 직선에서 라이다가 종방향을 줄이지 못하게.
+-- arc length는 wheel odom+IMU 예측을 우선 유지.
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.occupied_space_weight = 16.
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.translation_weight = 32.
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.rotation_weight = 60.
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.ceres_solver_options.max_num_iterations = 10
 
 TRAJECTORY_BUILDER_2D.motion_filter.max_time_seconds = 0.05
-TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.05
-TRAJECTORY_BUILDER_2D.submaps.num_range_data = 60
+TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.04
+-- 서브맵 경계가 많을수록 직선 중 inter-submap 정합으로 길이가 줄어들기 쉬움.
+TRAJECTORY_BUILDER_2D.submaps.num_range_data = 90
 
 return options

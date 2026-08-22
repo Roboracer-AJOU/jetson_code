@@ -2,25 +2,25 @@
 -- 파일 이름만 pose_graph_mapping.lua — include 경로를 유지하기 위함.
 
 POSE_GRAPH = {
-  -- 직선 가속 중 자주 optimize하면 복도 constraint가 종방향을 한 번에 당김.
-  optimize_every_n_nodes = 100,
+  -- 직선에서 optimize가 돌 때 루프 constraint가 구간 길이를 한 번에 줄임.
+  optimize_every_n_nodes = 150,
   constraint_builder = {
-    sampling_ratio = 0.03,
-    max_constraint_distance = 12.,
-    min_score = 0.70,
+    sampling_ratio = 0.02,
+    max_constraint_distance = 10.,
+    min_score = 0.73,
     global_localization_min_score = 0.82,
-    loop_closure_translation_weight = 8e3,
+    loop_closure_translation_weight = 5e3,
     loop_closure_rotation_weight = 1e5,
     log_matches = false,
     fast_correlative_scan_matcher = {
-      -- 1.2m면 직선 구간에서 평행벽 루프가 뒤쪽으로 끌어당김.
-      linear_search_window = 0.6,
-      angular_search_window = math.rad(12.),
+      -- 같은 직선 벽끼리 루프가 붙으면 직선 전체가 짧아짐 → 탐색 폭 최소화.
+      linear_search_window = 0.35,
+      angular_search_window = math.rad(8.),
       branch_and_bound_depth = 7,
     },
     ceres_scan_matcher = {
-      occupied_space_weight = 20.,
-      translation_weight = 10.,
+      occupied_space_weight = 16.,
+      translation_weight = 24.,
       rotation_weight = 10.,
       ceres_solver_options = {
         use_nonmonotonic_steps = true,
@@ -50,7 +50,8 @@ POSE_GRAPH = {
       },
     },
   },
-  matcher_translation_weight = 5e2,
+  -- inter-submap 매칭 constraint가 직선을 당기는 힘↓
+  matcher_translation_weight = 3e2,
   matcher_rotation_weight = 1.6e3,
   optimization_problem = {
     huber_scale = 1e1,
@@ -58,8 +59,8 @@ POSE_GRAPH = {
     rotation_weight = 1.6e4,
     local_slam_pose_translation_weight = 1e5,
     local_slam_pose_rotation_weight = 1e5,
-    -- 직선 종방향: odom을 보조로 더 믿되 3e4+는 2바퀴 스케일 보정을 막음.
-    odometry_translation_weight = 2e4,
+    -- odom arc length 유지. 3e4+ 는 2바퀴 스케일 보정 불가.
+    odometry_translation_weight = 1.8e4,
     odometry_rotation_weight = 5e3,
     fixed_frame_pose_translation_weight = 1e1,
     fixed_frame_pose_rotation_weight = 1e2,

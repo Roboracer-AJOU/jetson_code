@@ -53,7 +53,7 @@ CFG = {
     # ===== 맵 바꿀 때 여기만 수정 =====
     # integrated_obstacle_node·로컬라이제이션 pbstream·CSV 와 같은 맵이어야 한다.
     # 이전 값은 이틀 전 맵이라 세 곳과 전부 어긋나 있었다.
-    "map_name": "cartographer_map_20260822_164229_rosmap.yaml",  # 이전 20260816_234629
+    "map_name": "cartographer_map_20260822_193736_rosmap.yaml",  # 이전 20260816_234629
     "map_dir": _DEFAULT_MAP_DIR,  # 보통 그대로
     # =================================
     "laser_frame": "laser",  # 실차 (시뮬: ego_racecar/laser)
