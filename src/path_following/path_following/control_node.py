@@ -1504,6 +1504,8 @@ class VehicleControlNode(Node):
             if vesc_fresh
             else " duty_vesc=—"
         )
+        # VESC 가 0.1 V 단위로 주므로 소수 한 자리가 곧 분해능이다.
+        batt = f"{self._input_voltage:.1f}V" if vesc_fresh else "—"
         if (
             self.esp32_target_angle_deg is not None
             and self.esp32_servo_command_deg is not None
@@ -1530,7 +1532,7 @@ class VehicleControlNode(Node):
             f"STATUS | {self._control_mode} | "
             f"duty={self.current_duty:+.3f}{duty_vesc} | "
             f"{speed_part} m/s | "
-            f"erpm={self._erpm:.0f} CH5={self._rc_ch5} | "
+            f"erpm={self._erpm:.0f} batt={batt} CH5={self._rc_ch5} | "
             f"{esp32_steering}"
         )
 
