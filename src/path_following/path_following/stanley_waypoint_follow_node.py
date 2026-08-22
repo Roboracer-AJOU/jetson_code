@@ -22,6 +22,7 @@ from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from path_following import vehicle_geometry as vg
+from path_following.viz_gate import has_listener
 from path_following.track_sliding import (
     DEFAULT_REVERSE_TRACK,
     LoopTrackSliding,
@@ -613,6 +614,15 @@ class StanleyWaypointFollowNode(Node):
             self.cte_pub = None
             self.heading_error_pub = None
             self.path_curvature_pub = None
+
+        # 발행 순서 = _publish_control_diagnostics 가 넘기는 값 순서
+        self._diag_pubs = (
+            self.raw_steer_cmd_pub,
+            self.filtered_steer_cmd_pub,
+            self.cte_pub,
+            self.heading_error_pub,
+            self.path_curvature_pub,
+        )
 
         self.tracked_path_pub = None
         if self.publish_tracked_path:
@@ -1502,16 +1512,13 @@ class StanleyWaypointFollowNode(Node):
             filtered_norm = 0.0
 
         msg = Float64()
-        msg.data = float(raw_norm)
-        self.raw_steer_cmd_pub.publish(msg)
-        msg.data = float(filtered_norm)
-        self.filtered_steer_cmd_pub.publish(msg)
-        msg.data = float(cte)
-        self.cte_pub.publish(msg)
-        msg.data = float(heading_err)
-        self.heading_error_pub.publish(msg)
-        msg.data = float(kappa_used)
-        self.path_curvature_pub.publish(msg)
+        for pub, value in zip(
+            self._diag_pubs, (raw_norm, filtered_norm, cte, heading_err, kappa_used)
+        ):
+            if not has_listener(pub):
+                continue
+            msg.data = float(value)
+            pub.publish(msg)
 
     def _publish_stanley_debug(
         self,
@@ -1552,7 +1559,7 @@ class StanleyWaypointFollowNode(Node):
         19 번 이후는 뒤에 덧붙인 항목이다. 소비자(csv_logger_node)는 앞에서부터
         필요한 만큼만 잘라 쓰므로 기존 구독자를 깨지 않는다.
         """
-        if self.stanley_debug_pub is None:
+        if not has_listener(self.stanley_debug_pub):
             return
         total_before_sat = ff_term + stanley_fb_sum
         msg = Float64MultiArray()
@@ -1775,7 +1782,7 @@ class StanleyWaypointFollowNode(Node):
         self.drive_pub.publish(msg)
 
     def _publish_tracked_path(self) -> None:
-        if self.tracked_path_pub is None or len(self._path_poses) < 2:
+        if len(self._path_poses) < 2 or not has_listener(self.tracked_path_pub):
             return
 
         # PoseStamped 를 매 틱 새로 만들면 140점 Path 하나에 2.6 ms 다 (실측).

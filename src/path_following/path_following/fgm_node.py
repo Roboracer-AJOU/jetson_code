@@ -28,6 +28,7 @@ from std_msgs.msg import Bool, Float32MultiArray, Float64
 from visualization_msgs.msg import Marker, MarkerArray
 
 from path_following import vehicle_geometry as vg
+from path_following.viz_gate import has_listener
 
 _FGM_BOOST_FLAG = Path("/tmp/f1tenth_fgm_boost")
 _CPU_POLICY = Path("/home/nvidia/f1tenth_ajou/scripts/apply_cpu_policy.sh")
@@ -592,13 +593,11 @@ class FGMNode(Node):
             return
         if self._last_gap_marker is None:
             return
-        if self.gap_marker_pub is None and self.gap_markers_pub is None:
-            return
         m = self._last_gap_marker
         m.header.stamp = self.get_clock().now().to_msg()
-        if self.gap_marker_pub is not None:
+        if has_listener(self.gap_marker_pub):
             self.gap_marker_pub.publish(m)
-        if self.gap_markers_pub is not None:
+        if has_listener(self.gap_markers_pub):
             arr = MarkerArray()
             arr.markers.append(m)
             self.gap_markers_pub.publish(arr)
@@ -1093,7 +1092,7 @@ class FGMNode(Node):
                 viz_stamp,
             )
 
-        if self.publish_debug_scan and self.debug_scan_pub is not None:
+        if has_listener(self.debug_scan_pub):
             debug_msg = LaserScan()
             debug_msg.header = scan_msg.header
             debug_msg.angle_min = scan_msg.angle_min
@@ -1168,7 +1167,9 @@ class FGMNode(Node):
         stamp_msg,
     ) -> None:
         """선택 갭 양끝 V자 (정면 기준 wrap 각도)."""
-        if self.gap_marker_pub is None and self.gap_markers_pub is None:
+        if not (
+            has_listener(self.gap_marker_pub) or has_listener(self.gap_markers_pub)
+        ):
             return
         marker = Marker()
         marker.header.stamp = stamp_msg
@@ -1221,9 +1222,9 @@ class FGMNode(Node):
         marker.points.append(p_origin)
         marker.points.append(p_end)
         self._last_gap_marker = marker
-        if self.gap_marker_pub is not None:
+        if has_listener(self.gap_marker_pub):
             self.gap_marker_pub.publish(marker)
-        if self.gap_markers_pub is not None:
+        if has_listener(self.gap_markers_pub):
             arr = MarkerArray()
             arr.markers.append(marker)
             self.gap_markers_pub.publish(arr)

@@ -38,6 +38,7 @@ from std_msgs.msg import Bool, Float64, String
 
 from path_following import vehicle_geometry as vg
 from path_following.avoidance_safety import InflatedMap
+from path_following.viz_gate import has_listener
 
 
 # ============================================================
@@ -764,7 +765,7 @@ class EmergencyBrakeNode(Node):
                 self._active = False
                 self._stopped_since = 0.0
             self.brake_pub.publish(Bool(data=False))
-            self.ttc_pub.publish(Float64(data=(ttc if math.isfinite(ttc) else -1.0)))
+            self._publish_ttc(ttc)
             self.reverse_pub.publish(Bool(data=True))
             return
 
@@ -819,8 +820,14 @@ class EmergencyBrakeNode(Node):
                 )
 
         self.brake_pub.publish(Bool(data=self._active))
-        self.ttc_pub.publish(Float64(data=(ttc if math.isfinite(ttc) else -1.0)))
+        self._publish_ttc(ttc)
         self.reverse_pub.publish(Bool(data=False))
+
+    def _publish_ttc(self, ttc: float) -> None:
+        """TTC 텔레메트리. 듣는 데가 없으면 내지 않는다 (Foxglove 전용)."""
+        if not has_listener(self.ttc_pub):
+            return
+        self.ttc_pub.publish(Float64(data=(ttc if math.isfinite(ttc) else -1.0)))
 
 
 def main(args=None):

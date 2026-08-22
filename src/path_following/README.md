@@ -2665,6 +2665,106 @@ FGM 코리도 검사는 스캔당 수십 번 도는데 (갭 적합성 × 갭 수
 
 ---
 
+## 13. CPU 최적화 2차 — 아무도 안 듣는 발행 지우기 (20260822)
+
+1차(12장)는 우리 코드의 계산과 메시지 **조립** 을 줄였다. 그 뒤 실차에서 노드별로
+다시 재 보니 숫자가 여전히 컸고, 이번엔 원인이 다른 데 있었다.
+
+```bash
+python3 debug/cpu_by_node.py 20          # 노드별 (런치가 떠 있어야 한다)
+python3 debug/cpu_by_thread.py local_planner 12   # 노드 안에서 스레드별
+python3 debug/bench_executor.py full     # 콜백을 비운 노드의 rclpy 오버헤드
+python3 debug/topic_consumers.py         # 토픽을 누가 듣는지
+python3 debug/bench_path_publish.py      # 큰 Path 를 내보내는 비용
+python3 debug/check_sub_count.py         # 구독자 수 조회를 믿어도 되나
+```
+
+### 실측이 말한 것
+
+차를 **세워 둔 채** (회피도 없고 장애물도 없다) 잰 값이다.
+
+| 노드 | CPU% | 메인스레드(파이썬) | 그 외(DDS) |
+|------|------|--------------------|------------|
+| `local_planner_node` | 41.9 | 41.0 | 2.5 |
+| `stanley_waypoint_follow_node` | 39.6 | 39.5 | 2.2 |
+| `emergency_brake_node` | 31.5 | 30.9 | 2.2 |
+| `integrated_obstacle_node` | 27.0 | — | — |
+| `fgm_node` | 20.1 | — | — |
+
+스레드가 노드당 13개라 DDS 전송이 범인일 줄 알았는데 **94 % 가 메인스레드**,
+즉 파이썬이었다. 그런데 12장에서 최적화한 함수들을 다 더해도 41 % 가 안 나온다.
+
+그래서 **콜백을 전부 빈 함수로 둔 노드** 를 같은 구독 구성으로 띄워 봤다
+(`bench_executor.py`). 하는 일이 아무것도 없는데 **23.1 %** 였다.
+
+| 구성 | CPU% | 차이가 말하는 것 |
+|------|------|------------------|
+| 구독 6 + TF + 퍼블리셔 10 + 타이머 2 | 23.1 | — |
+| TF 리스너 뺌 | 14.4 | TF 리스너 하나가 **8.7 %p** |
+| 퍼블리셔 10개 뺌 | 19.8 | 퍼블리셔는 **가만히 있어도** 개당 0.33 %p |
+| 타이머만 | 3.2 | 구독 6개가 11 %p |
+
+rclpy 실행기는 깨어날 때마다 대기셋을 처음부터 다시 짠다. `/tf` 가 127 Hz 라
+초당 400 번 가까이 깨우고, 그때마다 엔티티 전부를 다시 등록한다. 즉 **남은
+비용은 계산이 아니라 엔티티 수와 깨우는 횟수** 였다.
+
+### 진짜 낭비: 구독자가 0 이어도 직렬화를 다 한다
+
+`topic_consumers.py` 로 소비자를 훑으니 path_following 이 내는 24개 중 **13개는
+Foxglove 전용** 이었다. 그리고 rclpy 는 듣는 데가 없어도 파이썬 메시지를 C 로
+옮기는 일을 끝까지 한다.
+
+| | 구독자 0 일 때 발행 비용 |
+|---|---|
+| `Float64` | 11 µs |
+| `Path` 140점 (`/waypoint_tracked_path`) | 0.9 ~ 1.7 ms |
+| `Path` 750점 (`/raceline_csv_path`) | 5.6 ~ 6.2 ms |
+| `get_subscription_count()` | **1.8 µs** |
+
+레이스 중에는 Foxglove 를 닫아 두는데, 그동안 Stanley 는 33 Hz 로 아무도 안 보는
+140점 경로를 계속 직렬화하고 있었다. 검사 한 번이 발행의 1/700 이라 물어보고
+거르는 쪽이 언제나 싸다.
+
+### 고친 방식
+
+`path_following/viz_gate.py` 의 `has_listener(pub)` 하나로, **시각화 전용 토픽만**
+"듣는 데가 있을 때만" 내보낸다.
+
+| 노드 | 게이트 건 토픽 |
+|------|----------------|
+| `stanley_waypoint_follow_node` | `/waypoint_tracked_path`, `/stanley/debug`, `/control/*` 5개 |
+| `local_planner_node` | `/raceline_csv_path`, `/planner/speed_condition`, `/planner/speed_reason` |
+| `emergency_brake_node` | `/emergency_brake/ttc` |
+| `fgm_node` | `/fgm_gap_marker`, `/fgm_gap_markers`, `/fgm_debug_scan` |
+| `integrated_obstacle_node` | `/visualization_marker_array` |
+
+**제어 경로에는 걸지 않았다.** `/drive`, `/local_path`, `/emergency_brake`,
+`/planner/speed_scale`, `/planner/mode`, `/planner_path_override_active`,
+`/planner/local_path_planned`, `/planner/fgm_enable`, `/planner/fgm_prefer_angle`,
+`/fgm_target`, `/aeb/escape_reverse` 는 그대로다. 구독자가 붙기 직전에 한 장을
+건너뛰면 상태를 나르는 토픽은 거동이 달라진다.
+`test_viz_gate.py::test_the_control_path_topics_have_no_gate` 가 소스를 읽어
+이걸 강제한다 — 나중에 누가 게이트를 넓히면 시험이 먼저 깨진다.
+
+Foxglove 패널을 열면 25 ms 만에 다시 나가고, 닫으면 27 ms 만에 멎는다
+(`check_sub_count.py`). 33 Hz 기준 한 프레임이라 화면에서는 티가 안 난다.
+`get_subscription_count()` 는 퍼블리셔 **자신이 매칭한 상대** 를 세는 값이라,
+외부 노드에서 `get_subscriptions_info_by_topic` 을 부를 때 같은 디스커버리
+지연을 타지 않는다.
+
+### 이번에도 안 건드린 것
+
+**TF 리스너 (노드당 8.7 %p, 4개 노드면 약 35 %).** `/tf` 가 127 Hz 로 오는데
+소비자는 33~40 Hz 로만 조회한다. 발행 쪽 주기를 낮추면 네 노드가 같이 싸지지만,
+그건 측위·제어가 보는 자세의 신선도를 깎는 일이다. 6 m/s 에서 10 ms 는 6 cm 라
+"주행에 영향 없음" 조건을 못 지킨다.
+
+**퍼블리셔 존재 비용 (개당 0.33 %p).** 시각화 퍼블리셔 13개를 아예 안 만들면
+4 %p 가 더 빠진다. 파라미터로 끄게 할 수는 있지만, 그러면 Foxglove 를 켜려고
+런치를 다시 띄워야 한다. 게이트는 실행 중에 알아서 붙었다 떨어지므로 그쪽을 골랐다.
+
+---
+
 ## 10. 튜닝 요약 (현재 CFG 기본값)
 
 | 노드 | 주요 파라미터 |

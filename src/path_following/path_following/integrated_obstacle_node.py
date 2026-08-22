@@ -33,6 +33,7 @@ from path_following.static_obstacle_node import (
 )
 from path_following.track_kf import ConstantVelocityKF
 from path_following.track_sliding import param_bool
+from path_following.viz_gate import has_listener
 
 _DEFAULT_MAP_DIR = "/home/nvidia/f1tenth_ajou/maps"
 
@@ -735,7 +736,7 @@ class IntegratedObstacleNode(Node):
         return pool[k]
 
     def _publish_empty(self) -> None:
-        if self.marker_pub is not None:
+        if has_listener(self.marker_pub):
             delete = MarkerArray()
             m = Marker()
             m.action = Marker.DELETEALL
@@ -775,7 +776,7 @@ class IntegratedObstacleNode(Node):
         # 개당 70 µs 라 트랙 몇 개만 돼도 무시 못 할 값이 된다. 객체는 풀에
         # 두고 값만 갈아 끼운다 — 발행 후 붙들고 있는 곳이 없어 안전하다.
         markers = None
-        if self.marker_pub is not None:
+        if has_listener(self.marker_pub):
             markers = [self._delete_all_marker]
         now_msg = self.get_clock().now().to_msg()
 

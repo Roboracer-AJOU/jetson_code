@@ -61,6 +61,7 @@ from path_following.track_sliding import (
     param_bool,
     resolve_csv_path,
 )
+from path_following.viz_gate import has_listener
 from .avoidance_safety import (
     AvoidSpeedParams,
     InflatedMap,
@@ -2349,8 +2350,11 @@ class LocalPlannerNode(Node):
         sc = min(sc, self._planner_speed_scale())
 
         self.pub_planner_speed_scale.publish(Float64(data=sc))
-        self.pub_planner_speed_condition.publish(UInt8(data=cd))
-        self.pub_speed_reason.publish(String(data=self._last_avoid_reason or "none"))
+        # 아래 둘은 소비자가 Foxglove 뿐이다 (speed_scale 은 Stanley 가 듣는다).
+        if has_listener(self.pub_planner_speed_condition):
+            self.pub_planner_speed_condition.publish(UInt8(data=cd))
+        if has_listener(self.pub_speed_reason):
+            self.pub_speed_reason.publish(String(data=self._last_avoid_reason or "none"))
 
     def _republish_planner_speed(self) -> None:
         self._publish_planner_speed_out()
@@ -2372,7 +2376,7 @@ class LocalPlannerNode(Node):
         self._last_fgm_recv_ns = self.get_clock().now().nanoseconds
 
     def _publish_csv_track_viz(self) -> None:
-        if self.pub_csv_track is None or len(self.points) < 2:
+        if len(self.points) < 2 or not has_listener(self.pub_csv_track):
             return
         # 이 경로는 **한 번도 안 바뀐다** — CSV 를 그대로 그린 것이다. 그런데
         # 750점을 매번 새로 조립하면 발행 한 번에 14 ms 다 (실측). 2 Hz 라도
